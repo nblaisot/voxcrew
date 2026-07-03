@@ -7,13 +7,20 @@ import com.nblaisot.voxcrew.audio.OpenMicTransmissionPolicy
 import com.nblaisot.voxcrew.audio.PushToTalkTransmissionPolicy
 import com.nblaisot.voxcrew.audio.TransmissionMode
 import com.nblaisot.voxcrew.audio.TransmissionPolicy
+import com.nblaisot.voxcrew.connectivity.model.GenerationId
+import com.nblaisot.voxcrew.connectivity.model.SessionDescriptor
+import com.nblaisot.voxcrew.connectivity.model.TransportMode
+import com.nblaisot.voxcrew.connectivity.orchestration.ConnectivityOrchestrator
+import com.nblaisot.voxcrew.connectivity.state.ConnectivityState
+import com.nblaisot.voxcrew.connectivity.state.TransportPreference
+import com.nblaisot.voxcrew.connectivity.webrtc.ManagedPeerConnection
+import com.nblaisot.voxcrew.connectivity.webrtc.WebRtcConnectionSwitcher
 import com.nblaisot.voxcrew.service.SessionForegroundService
 import com.nblaisot.voxcrew.signaling.SignalingClient
 import com.nblaisot.voxcrew.signaling.SignalingEnvelope
 import com.nblaisot.voxcrew.signaling.SignalingMessageTypes
 import com.nblaisot.voxcrew.webrtc.IceTransportState
 import com.nblaisot.voxcrew.webrtc.PeerState
-import com.nblaisot.voxcrew.webrtc.WebRtcSessionManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -37,12 +44,20 @@ data class SessionUiState(
     val showDiagnostics: Boolean = false,
     val diagnosticsLog: List<String> = emptyList(),
     val micPermissionGranted: Boolean = false,
+    val transportLabel: String = "—",
+    val connectivityStateLabel: String = "Idle",
+    val activeGeneration: Long? = null,
+    val candidateGeneration: Long? = null,
+    val lastSwitchReason: String? = null,
+    val transportPreference: TransportPreference = TransportPreference.AUTO,
+    val localAddress: String? = null,
 )
 
 class SessionViewModel(
     private val appContext: Context,
     private val signalingClient: SignalingClient,
-    private val webRtc: WebRtcSessionManager,
+    private val orchestrator: ConnectivityOrchestrator,
+    private val connectionSwitcher: WebRtcConnectionSwitcher,
 ) : ViewModel() {
     private val _uiState = MutableStateFlow(SessionUiState())
     val uiState: StateFlow<SessionUiState> = _uiState.asStateFlow()
@@ -53,45 +68,76 @@ class SessionViewModel(
     private var remotePeerId: String? = null
     private var isInitiator = false
     private var sessionStarted = false
+    private var activeGeneration: GenerationId? = null
 
     private var policyWatchJob: Job? = null
 
     init {
         watchTransmissionPolicy(activePolicy)
+        connectionSwitcher.attachTransmissionPolicy(activePolicy)
         viewModelScope.launch {
-            combine(signalingClient.state, webRtc.diagnostics) { sig, diag ->
+            combine(signalingClient.state, connectionSwitcher.diagnostics, orchestrator.diagnostics) { sig, webrtc, conn ->
                 _uiState.value.copy(
                     participants = sig.participants,
                     localUid = sig.localUid,
-                    peerState = diag.peerState,
-                    iceState = diag.iceState,
-                    selectedCandidateType = diag.selectedCandidateType,
-                    dataChannelRttMs = diag.lastDataChannelRttMs,
+                    peerState = webrtc.peerState,
+                    iceState = webrtc.iceState,
+                    selectedCandidateType = webrtc.selectedCandidateType,
+                    dataChannelRttMs = webrtc.lastDataChannelRttMs,
                     transmissionMode = activePolicy.mode,
+                    transportLabel = transportLabel(conn.activeTransport),
+                    connectivityStateLabel = conn.connectivityState::class.simpleName ?: "—",
+                    activeGeneration = conn.activeGeneration,
+                    candidateGeneration = conn.candidateGeneration,
+                    lastSwitchReason = conn.lastSwitchReason,
+                    localAddress = conn.localAddress,
                 )
             }.collect { _uiState.value = it }
         }
         viewModelScope.launch {
             signalingClient.incoming.collect { handleSignaling(it) }
         }
+        viewModelScope.launch {
+            orchestrator.relayedSignaling.collect { handleSignaling(it) }
+        }
     }
 
-    fun start(sessionId: String) {
+    fun start(sessionId: String, isLocalHost: Boolean = false) {
         if (sessionStarted) return
         sessionStarted = true
-        SessionForegroundService.start(appContext, connected = false)
+        SessionForegroundService.start(appContext, transportLabel = "Connexion…")
+        val localUid = signalingClient.state.value.localUid ?: return
+        val descriptor = SessionDescriptor(
+            sessionId = sessionId,
+            participantId = localUid,
+            hostParticipantId = signalingClient.state.value.participants.minOrNull(),
+            isLocalHost = isLocalHost,
+        )
+        viewModelScope.launch {
+            orchestrator.beginSession(descriptor, _uiState.value.transportPreference)
+        }
         setupWebRtcCallbacks()
         val participants = signalingClient.state.value.participants
         val local = signalingClient.state.value.localUid
         remotePeerId = participants.firstOrNull { it != local }
-        isInitiator = local != null && participants.minOrNull() == local
-        webRtc.createPeerConnection(isInitiator)
-        webRtc.enableAudioTrack(activePolicy)
-        if (isInitiator && remotePeerId != null) {
-            webRtc.createOffer()
+        isInitiator = local != null && (descriptor.hostParticipantId == local || participants.minOrNull() == local)
+        val gen = connectionSwitcher.activeGeneration.value ?: GenerationId.next().also {
+            connectionSwitcher.createConnection(it, isInitiator, useLanIce = isLocalHost)
+            activeGeneration = it
         }
-        SessionForegroundService.start(appContext, connected = true)
-        log("Session démarrée initiator=$isInitiator peer=$remotePeerId")
+        activeGeneration = gen
+        wireConnectionCallbacks(connectionSwitcher.activeConnection())
+        if (isInitiator && remotePeerId != null) {
+            connectionSwitcher.activeConnection()?.createOffer()
+        }
+        SessionForegroundService.start(appContext, transportLabel = transportLabel(TransportMode.LOCAL_LAN))
+        log("Session démarrée initiator=$isInitiator peer=$remotePeerId gen=${gen.value}")
+    }
+
+    fun setTransportPreference(preference: TransportPreference) {
+        _uiState.update { it.copy(transportPreference = preference) }
+        orchestrator.setTransportPreference(preference)
+        viewModelScope.launch { orchestrator.evaluateNow() }
     }
 
     fun onMicPermissionResult(granted: Boolean) {
@@ -100,7 +146,7 @@ class SessionViewModel(
 
     fun useOpenMic() {
         activePolicy = openMicPolicy
-        webRtc.attachTransmissionPolicy(activePolicy)
+        connectionSwitcher.attachTransmissionPolicy(activePolicy)
         watchTransmissionPolicy(activePolicy)
         _uiState.update { it.copy(transmissionMode = TransmissionMode.OPEN_MIC) }
     }
@@ -108,7 +154,7 @@ class SessionViewModel(
     fun usePushToTalk() {
         activePolicy = pttPolicy
         pttPolicy.cancel()
-        webRtc.attachTransmissionPolicy(activePolicy)
+        connectionSwitcher.attachTransmissionPolicy(activePolicy)
         watchTransmissionPolicy(activePolicy)
         _uiState.update { it.copy(transmissionMode = TransmissionMode.PUSH_TO_TALK) }
     }
@@ -125,74 +171,99 @@ class SessionViewModel(
     fun pttPress() = pttPolicy.onPress()
     fun pttRelease() = pttPolicy.onRelease()
 
-    fun sendDataChannelPing() = webRtc.sendDataChannelPing()
-    fun refreshStats() = webRtc.refreshStats()
+    fun sendDataChannelPing() {
+        (connectionSwitcher.activeConnection() as? com.nblaisot.voxcrew.connectivity.webrtc.ManagedPeerConnectionImpl)
+            ?.sendDataChannelPing()
+    }
+
+    fun refreshStats() = Unit
     fun toggleDiagnostics() = _uiState.update { it.copy(showDiagnostics = !it.showDiagnostics) }
 
     fun leave() {
         viewModelScope.launch {
             signalingClient.leaveSession()
+            orchestrator.endSession()
         }
-        webRtc.close()
+        connectionSwitcher.closeAll()
         SessionForegroundService.stop(appContext)
         sessionStarted = false
     }
 
     private fun setupWebRtcCallbacks() {
-        webRtc.onIceCandidate = { candidate ->
+        viewModelScope.launch {
+            connectionSwitcher.activeGeneration.collect { gen ->
+                activeGeneration = gen
+                wireConnectionCallbacks(connectionSwitcher.activeConnection())
+            }
+        }
+    }
+
+    private fun wireConnectionCallbacks(conn: ManagedPeerConnection?) {
+        conn ?: return
+        val gen = conn.generation
+        conn.onIceCandidate = { candidate ->
             val peer = remotePeerId
-            if (peer != null) {
+            if (peer != null && !gen.isObsolete(connectionSwitcher.activeGeneration.value)) {
                 viewModelScope.launch {
-                    signalingClient.sendIceCandidate(
-                        peer,
-                        candidate.sdp,
-                        candidate.sdpMid,
-                        candidate.sdpMLineIndex,
-                    )
+                    signalingClient.sendIceCandidate(peer, candidate.sdp, candidate.sdpMid, candidate.sdpMLineIndex, gen.value)
                 }
             }
         }
-        webRtc.onOfferCreated = { sdp ->
+        conn.onOfferCreated = { sdp ->
             val peer = remotePeerId
-            if (peer != null) {
-                viewModelScope.launch { signalingClient.sendOffer(peer, sdp.description) }
+            if (peer != null && !gen.isObsolete(connectionSwitcher.activeGeneration.value)) {
+                viewModelScope.launch { signalingClient.sendOffer(peer, sdp.description, gen.value) }
             }
         }
-        webRtc.onAnswerCreated = { sdp ->
+        conn.onAnswerCreated = { sdp ->
             val peer = remotePeerId
-            if (peer != null) {
-                viewModelScope.launch { signalingClient.sendAnswer(peer, sdp.description) }
+            if (peer != null && !gen.isObsolete(connectionSwitcher.activeGeneration.value)) {
+                viewModelScope.launch { signalingClient.sendAnswer(peer, sdp.description, gen.value) }
             }
         }
     }
 
     private fun handleSignaling(envelope: SignalingEnvelope) {
         val local = _uiState.value.localUid ?: signalingClient.state.value.localUid
+        val envelopeGen = envelope.payload["generation"]?.jsonPrimitive?.content?.toLongOrNull()
+        val activeGen = connectionSwitcher.activeGeneration.value?.value
+        if (envelopeGen != null && activeGen != null && envelopeGen < activeGen) {
+            log("obsolete_generation_event_ignored gen=$envelopeGen active=$activeGen")
+            return
+        }
+        val conn = connectionSwitcher.activeConnection() ?: return
         when (envelope.type) {
             SignalingMessageTypes.PARTICIPANT_JOINED -> {
                 val id = envelope.payload["participantId"]?.jsonPrimitive?.content
                 if (id != null && id != local) {
                     remotePeerId = id
-                    if (isInitiator) webRtc.createOffer()
+                    if (isInitiator) conn.createOffer()
                 }
             }
             SignalingMessageTypes.OFFER -> {
                 val sdp = envelope.payload["sdp"]?.jsonPrimitive?.content ?: return
                 envelope.senderId?.let { remotePeerId = it }
-                webRtc.setRemoteDescription(SessionDescription(SessionDescription.Type.OFFER, sdp))
-                webRtc.createAnswer()
+                conn.setRemoteDescription(SessionDescription(SessionDescription.Type.OFFER, sdp))
+                conn.createAnswer()
             }
             SignalingMessageTypes.ANSWER -> {
                 val sdp = envelope.payload["sdp"]?.jsonPrimitive?.content ?: return
-                webRtc.setRemoteDescription(SessionDescription(SessionDescription.Type.ANSWER, sdp))
+                conn.setRemoteDescription(SessionDescription(SessionDescription.Type.ANSWER, sdp))
             }
             SignalingMessageTypes.ICE_CANDIDATE -> {
                 val c = envelope.payload["candidate"]?.jsonPrimitive?.content ?: return
                 val mid = envelope.payload["sdpMid"]?.jsonPrimitive?.content
                 val idx = envelope.payload["sdpMLineIndex"]?.jsonPrimitive?.content?.toIntOrNull()
-                webRtc.addIceCandidate(IceCandidate(mid, idx ?: 0, c))
+                conn.addIceCandidate(IceCandidate(mid, idx ?: 0, c))
             }
         }
+    }
+
+    private fun transportLabel(mode: TransportMode): String = when (mode) {
+        TransportMode.LOCAL_LAN -> "Local"
+        TransportMode.CLOUD_DIRECT -> "Internet direct"
+        TransportMode.CLOUD_RELAY -> "Internet relayé"
+        TransportMode.NONE -> "Déconnecté"
     }
 
     private fun log(message: String) {
@@ -200,7 +271,7 @@ class SessionViewModel(
     }
 
     override fun onCleared() {
-        webRtc.close()
+        connectionSwitcher.closeAll()
         super.onCleared()
     }
 }

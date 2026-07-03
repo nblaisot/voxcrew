@@ -22,14 +22,14 @@ class SessionForegroundService : Service() {
                 stopSelf()
             }
             else -> {
-                val connected = intent?.getBooleanExtra(EXTRA_CONNECTED, false) ?: false
-                startForeground(NOTIFICATION_ID, buildNotification(connected))
+                val transport = intent?.getStringExtra(EXTRA_TRANSPORT) ?: "Connexion…"
+                startForeground(NOTIFICATION_ID, buildNotification(transport))
             }
         }
         return START_STICKY
     }
 
-    private fun buildNotification(connected: Boolean): Notification {
+    private fun buildNotification(transportLabel: String): Notification {
         createChannel()
         val openIntent = PendingIntent.getActivity(
             this,
@@ -43,10 +43,9 @@ class SessionForegroundService : Service() {
             Intent(this, SessionForegroundService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val status = if (connected) "Connecté" else "Connexion…"
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_session_title))
-            .setContentText("$status — ${getString(R.string.notification_session_text)}")
+            .setContentText("$transportLabel — ${getString(R.string.notification_session_text)}")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(openIntent)
             .setOngoing(true)
@@ -69,11 +68,11 @@ class SessionForegroundService : Service() {
         const val CHANNEL_ID = "voxcrew_session"
         const val NOTIFICATION_ID = 1001
         const val ACTION_STOP = "com.nblaisot.voxcrew.STOP_SESSION"
-        const val EXTRA_CONNECTED = "connected"
+        const val EXTRA_TRANSPORT = "transport"
 
-        fun start(context: Context, connected: Boolean) {
+        fun start(context: Context, transportLabel: String) {
             val intent = Intent(context, SessionForegroundService::class.java)
-                .putExtra(EXTRA_CONNECTED, connected)
+                .putExtra(EXTRA_TRANSPORT, transportLabel)
             context.startForegroundService(intent)
         }
 

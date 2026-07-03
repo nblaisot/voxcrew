@@ -1,9 +1,9 @@
 package com.nblaisot.voxcrew.ui
 
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -34,28 +34,33 @@ fun VoxCrewNavHost(container: AppContainer) {
         }
         composable(Routes.HOME) {
             val vm: HomeViewModel = viewModel(factory = simpleFactory {
-                HomeViewModel(container.authRepository, container.signalingClient)
+                HomeViewModel(container.authRepository, container.signalingClient, container)
             })
             HomeScreen(
                 viewModel = vm,
-                onSessionReady = { id -> navController.navigate(Routes.session(id)) },
+                onSessionReady = { id, localHost -> navController.navigate(Routes.session(id, localHost)) },
                 onSignOut = { navController.navigate(Routes.LOGIN) { popUpTo(0) } },
             )
         }
         composable(
             route = Routes.SESSION,
-            arguments = listOf(navArgument("sessionId") { type = NavType.StringType }),
+            arguments = listOf(
+                navArgument("sessionId") { type = NavType.StringType },
+                navArgument("localHost") { type = NavType.BoolType; defaultValue = false },
+            ),
         ) { entry ->
             val sessionId = entry.arguments?.getString("sessionId") ?: return@composable
+            val localHost = entry.arguments?.getBoolean("localHost") ?: false
             val appContext = LocalContext.current.applicationContext
             val vm: SessionViewModel = viewModel(factory = simpleFactory {
                 SessionViewModel(
                     appContext = appContext,
                     signalingClient = container.signalingClient,
-                    webRtc = container.webRtcSessionManager,
+                    orchestrator = container.connectivityOrchestrator,
+                    connectionSwitcher = container.connectionSwitcher,
                 )
             })
-            SessionScreen(vm, sessionId) {
+            SessionScreen(vm, sessionId, localHost) {
                 navController.popBackStack()
             }
         }

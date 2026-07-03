@@ -32,11 +32,13 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.nblaisot.voxcrew.audio.TransmissionMode
+import com.nblaisot.voxcrew.connectivity.state.TransportPreference
 
 @Composable
 fun SessionScreen(
     viewModel: SessionViewModel,
     sessionId: String,
+    isLocalHost: Boolean,
     onLeave: () -> Unit,
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -46,8 +48,8 @@ fun SessionScreen(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> viewModel.onMicPermissionResult(granted) }
 
-    LaunchedEffect(sessionId) {
-        viewModel.start(sessionId)
+    LaunchedEffect(sessionId, isLocalHost) {
+        viewModel.start(sessionId, isLocalHost)
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -61,6 +63,12 @@ fun SessionScreen(
     ) {
         Text("Session", style = MaterialTheme.typography.headlineSmall)
         Text("ID : $sessionId")
+        Text("Transport : ${state.transportLabel}", style = MaterialTheme.typography.titleMedium)
+        Text("État : ${state.connectivityStateLabel}")
+        state.localAddress?.let { Text("LAN hôte : $it") }
+        state.activeGeneration?.let { Text("Génération active : $it") }
+        state.candidateGeneration?.let { Text("Génération candidate : $it") }
+        state.lastSwitchReason?.let { Text("Dernière bascule : $it") }
         Text("Participants : ${state.participants.joinToString()}")
         Text("WebRTC : ${state.peerState.name}")
         Text("ICE : ${state.iceState.name}")
@@ -68,6 +76,13 @@ fun SessionScreen(
         Text("Mode : ${state.transmissionMode.name}")
         Text("Transmission : ${if (state.isTransmitting) "ACTIVE" else "inactive"}")
         state.dataChannelRttMs?.let { Text("Data channel RTT : ${it} ms") }
+
+        TransportPreferenceChips(
+            selected = state.transportPreference,
+            onAuto = { viewModel.setTransportPreference(TransportPreference.AUTO) },
+            onForceLocal = { viewModel.setTransportPreference(TransportPreference.FORCE_LOCAL) },
+            onForceCloud = { viewModel.setTransportPreference(TransportPreference.FORCE_CLOUD) },
+        )
 
         RowChips(
             selected = state.transmissionMode,
@@ -119,6 +134,21 @@ fun SessionScreen(
         }, modifier = Modifier.fillMaxWidth()) {
             Text("Quitter la session")
         }
+    }
+}
+
+@Composable
+private fun TransportPreferenceChips(
+    selected: TransportPreference,
+    onAuto: () -> Unit,
+    onForceLocal: () -> Unit,
+    onForceCloud: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Transport (debug)", style = MaterialTheme.typography.labelLarge)
+        FilterChip(selected = selected == TransportPreference.AUTO, onClick = onAuto, label = { Text("Auto") })
+        FilterChip(selected = selected == TransportPreference.FORCE_LOCAL, onClick = onForceLocal, label = { Text("Forcer local") })
+        FilterChip(selected = selected == TransportPreference.FORCE_CLOUD, onClick = onForceCloud, label = { Text("Forcer cloud") })
     }
 }
 
