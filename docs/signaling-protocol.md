@@ -45,6 +45,30 @@ Premier message après ouverture WebSocket. Timeout serveur : 10 s.
 }
 ```
 
+**Extension local-first (rétrocompatible)** — cloud ignore `authKind` absent :
+
+```json
+{
+  "payload": {
+    "authKind": "firebase",
+    "token": "<firebase-id-token>"
+  }
+}
+```
+
+```json
+{
+  "payload": {
+    "authKind": "local",
+    "sessionId": "<id>",
+    "localToken": "<secret-court>",
+    "participantId": "<firebase-uid>"
+  }
+}
+```
+
+Messages WebRTC (`offer`, `answer`, `ice_candidate`) peuvent inclure un champ optionnel `generation` (long) dans `payload` pour corrélation orchestrateur.
+
 ### `authenticated` (serveur → client)
 
 ```json

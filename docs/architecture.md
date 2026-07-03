@@ -141,3 +141,21 @@ Le protocole de signaling identifie déjà `sessionId`, `senderId`, `recipientId
 ## Stockage et confidentialité
 
 Par défaut : aucun audio enregistré, aucun transit audio par le backend, aucune transcription.
+
+## Connectivité local-first (post-MVP cloud)
+
+```mermaid
+flowchart LR
+  A[Galaxy A] <-->|Local WebRTC| B[Galaxy B]
+  A <-->|Cloud control optional| CR[Cloud Run]
+  B <-->|Cloud control optional| CR
+  A -->|NSD or QR| LS[Local Ktor signaling on host]
+  B --> LS
+```
+
+Voir [connectivity-orchestration.md](connectivity-orchestration.md) et [local-signaling.md](local-signaling.md).
+
+- Préférence LAN stable ; fallback cloud transparent
+- Même session logique (`sessionId`, `participantId`) à travers les bascules
+- `ConnectivityOrchestrator` + `WebRtcConnectionSwitcher` + générations
+- Audio toujours via un seul pipeline WebRTC actif
