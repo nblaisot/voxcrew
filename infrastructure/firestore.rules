@@ -1,0 +1,9 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // MVP: deny all client access. Backend uses Admin SDK.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
