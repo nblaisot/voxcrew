@@ -1,14 +1,12 @@
-# Gradle files
+# Android local
+local.properties
+*.jks
+*.keystore
+android/app/google-services.json
+
+# Gradle
 .gradle/
 build/
-
-# Local configuration file (sdk path, etc)
-local.properties
-
-# Log/OS Files
-*.log
-
-# Android Studio generated files and folders
 captures/
 .externalNativeBuild/
 .cxx/
@@ -16,19 +14,35 @@ captures/
 *.apk
 output-metadata.json
 
-# IntelliJ
-*.iml
+# Node
+node_modules/
+dist/
+coverage/
+.env
+!.env.example
+.env.local
+.env.*.local
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+crash.log
+
+# IDE
 .idea/
+.vscode/
+*.iml
 misc.xml
 deploymentTargetDropDown.xml
 render.experimental.xml
+.DS_Store
 
-# Keystore files
-*.jks
-*.keystore
+# Credentials
+*credentials*.json
+*service-account*.json
 
-# Google Services (e.g. APIs or Firebase)
-google-services.json
-
-# Android Profiling
+# Log/OS
+*.log
 *.hprof
