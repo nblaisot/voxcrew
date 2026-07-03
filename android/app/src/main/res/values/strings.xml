@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VoxCrew</string>
+    <string name="notification_channel_session">Session vocale</string>
+    <string name="notification_session_title">VoxCrew — session active</string>
+    <string name="notification_session_text">Communication vocale en cours</string>
+    <string name="action_leave_session">Quitter</string>
+</resources>
