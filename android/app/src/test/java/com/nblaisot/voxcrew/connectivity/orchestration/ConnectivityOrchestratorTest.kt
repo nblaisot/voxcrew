@@ -310,4 +310,11 @@ class ConnectivityOrchestratorTest {
         f.orchestrator.evaluateNow()
         assertEquals(TransportPreference.FORCE_CLOUD, TransportPreference.FORCE_CLOUD)
     }
+
+    @Test fun `21 auto uses cloud when host has no discovered peer`() = runTest(dispatcher) {
+        val f = Fixture(this, thresholds, session)
+        f.orchestrator.beginSession(session.copy(isLocalHost = true), TransportPreference.AUTO)
+        advanceUntilIdle()
+        assertTrue(f.orchestrator.state.value is ConnectivityState.ConnectingCloud)
+    }
 }

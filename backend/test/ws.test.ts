@@ -127,4 +127,113 @@ describe("WebSocket signaling", () => {
     expect(err.payload.code).toBe("UNAUTHORIZED");
     wsA.close();
   });
+
+  it("accepts presence_register without email", async () => {
+    const ws = new WebSocket(baseUrl);
+    await new Promise<void>((r) => ws.on("open", () => r()));
+    send(ws, "authenticate", { token: "token-user-a" });
+    await waitForMessage(ws, "authenticated");
+
+    send(ws, "presence_register", { transportHint: "cloud" });
+    const snapshot = await waitForMessage(ws, "presence_snapshot");
+    expect(snapshot.type).toBe("presence_snapshot");
+    ws.close();
+  });
+
+  it("broadcasts presence on authenticate and heartbeat", async () => {
+    const wsA = new WebSocket(baseUrl);
+    const wsB = new WebSocket(baseUrl);
+    await Promise.all([
+      new Promise<void>((r) => wsA.on("open", () => r())),
+      new Promise<void>((r) => wsB.on("open", () => r())),
+    ]);
+
+    send(wsA, "authenticate", { token: "token-user-a" });
+    send(wsB, "authenticate", { token: "token-user-b" });
+    await waitForMessage(wsA, "authenticated");
+    await waitForMessage(wsB, "authenticated");
+
+    send(wsA, "presence_register", { email: "a@test.com", transportHint: "cloud" });
+    await waitForMessage(wsA, "presence_snapshot");
+    await waitForMessage(wsB, "presence_updated");
+
+    send(wsA, "presence_heartbeat", { transportHint: "cloud" });
+    const updated = await waitForMessage(wsB, "presence_updated");
+    expect(updated.payload.uid).toBe("user-a");
+    expect(updated.payload.online).toBe(true);
+
+    wsA.close();
+    const offline = await waitForMessage(wsB, "presence_offline", 20_000);
+    expect(offline.payload.uid).toBe("user-a");
+    wsB.close();
+  }, 25_000);
+
+  it("returns error when relaying offer to disconnected recipient", async () => {
+    const wsA = new WebSocket(baseUrl);
+    const wsB = new WebSocket(baseUrl);
+    await Promise.all([
+      new Promise<void>((r) => wsA.on("open", () => r())),
+      new Promise<void>((r) => wsB.on("open", () => r())),
+    ]);
+    send(wsA, "authenticate", { token: "token-user-a" });
+    send(wsB, "authenticate", { token: "token-user-b" });
+    await waitForMessage(wsA, "authenticated");
+    await waitForMessage(wsB, "authenticated");
+
+    send(wsA, "create_session", { name: "solo" });
+    const created = await waitForMessage(wsA, "session_created");
+    const sessionId = created.payload.sessionId as string;
+    send(wsB, "join_session", { sessionId });
+    await waitForMessage(wsB, "session_joined");
+    wsB.close();
+    await new Promise((r) => setTimeout(r, 100));
+
+    send(wsA, "offer", { sdp: "v=0", sdpType: "offer" }, {
+      sessionId,
+      recipientId: "user-b",
+    });
+    const err = await waitForMessage(wsA, "error");
+    expect(err.payload.code).toBe("RECIPIENT_OFFLINE");
+    wsA.close();
+  });
+
+  it("replaces duplicate uid socket without ejecting rejoined session", async () => {
+    const wsA1 = new WebSocket(baseUrl);
+    const wsA2 = new WebSocket(baseUrl);
+    const wsB = new WebSocket(baseUrl);
+    await Promise.all([
+      new Promise<void>((r) => wsA1.on("open", () => r())),
+      new Promise<void>((r) => wsA2.on("open", () => r())),
+      new Promise<void>((r) => wsB.on("open", () => r())),
+    ]);
+
+    send(wsA1, "authenticate", { token: "token-user-a" });
+    send(wsB, "authenticate", { token: "token-user-b" });
+    await waitForMessage(wsA1, "authenticated");
+    await waitForMessage(wsB, "authenticated");
+
+    send(wsA1, "create_session", { name: "race" });
+    const created = await waitForMessage(wsA1, "session_created");
+    const sessionId = created.payload.sessionId as string;
+    send(wsB, "join_session", { sessionId });
+    await waitForMessage(wsB, "session_joined");
+
+    send(wsA2, "authenticate", { token: "token-user-a" });
+    await waitForMessage(wsA2, "authenticated");
+    send(wsA2, "join_session", { sessionId });
+    await waitForMessage(wsA2, "session_joined");
+
+    wsA1.close();
+    await new Promise((r) => setTimeout(r, 200));
+
+    send(wsA2, "offer", { sdp: "v=0", sdpType: "offer" }, {
+      sessionId,
+      recipientId: "user-b",
+    });
+    const offer = await waitForMessage(wsB, "offer");
+    expect(offer.senderId).toBe("user-a");
+
+    wsA2.close();
+    wsB.close();
+  });
 });

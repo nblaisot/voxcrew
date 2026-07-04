@@ -11,6 +11,7 @@ import com.nblaisot.voxcrew.connectivity.quality.PeerPathEvaluatorImpl
 import com.nblaisot.voxcrew.connectivity.state.ConnectivityDiagnostics
 import com.nblaisot.voxcrew.connectivity.state.ConnectivityState
 import com.nblaisot.voxcrew.connectivity.state.TransportPreference
+import com.nblaisot.voxcrew.connectivity.transport.LocalLanSignalingTransport
 import com.nblaisot.voxcrew.connectivity.transport.SignalingTransport
 import com.nblaisot.voxcrew.connectivity.transport.SignalingTransportKind
 import com.nblaisot.voxcrew.connectivity.webrtc.ManagedPeerConnection
@@ -65,6 +66,9 @@ class ConnectivityOrchestratorImpl(
     private var candidateGeneration: GenerationId? = null
     private var activeTransportMode = TransportMode.NONE
     private var cloudControlConnected = false
+    private var failedRetryAttempt = 0
+    private var reconnectBackoffMs = 500L
+    private var registeredHostPort: Int? = null
 
     override suspend fun beginSession(
         descriptor: SessionDescriptor,
@@ -79,6 +83,8 @@ class ConnectivityOrchestratorImpl(
         if (descriptor.isLocalHost && localServer != null) {
             val info = localServer.start(descriptor.sessionId)
             _diagnostics.update { it.copy(localAddress = "${info.host}:${info.port}") }
+            registeredHostPort = info.port
+            localDiscovery.registerHost(info.port, instanceId = descriptor.participantId.take(8))
         }
         startEvaluationLoop()
         evaluateNow()
@@ -86,10 +92,16 @@ class ConnectivityOrchestratorImpl(
 
     override suspend fun endSession() {
         evaluateJob?.cancel()
+        localDiscovery.unregisterHost()
         localDiscovery.stop()
         localServer?.stop()
+        registeredHostPort = null
+        failedRetryAttempt = 0
+        reconnectBackoffMs = 500L
         localGeneration?.let { localTransport.disconnect(it) }
-        cloudGeneration?.let { cloudTransport.disconnect(it) }
+        if (!cloudTransport.sharesIntercomSignaling) {
+            cloudGeneration?.let { cloudTransport.disconnect(it) }
+        }
         connectionSwitcher.closeAll()
         session = null
         localGeneration = null
@@ -122,8 +134,8 @@ class ConnectivityOrchestratorImpl(
             is ConnectivityState.CloudActive -> handleCloudActive(current, s, now)
             is ConnectivityState.TransitioningToLocal -> handleTransitioningToLocal(current, s, now)
             is ConnectivityState.TransitioningToCloud -> handleTransitioningToCloud(current, s, now)
-            is ConnectivityState.Reconnecting -> handleReconnecting(now)
-            is ConnectivityState.Failed -> Unit
+            is ConnectivityState.Reconnecting -> handleReconnecting(s, now)
+            is ConnectivityState.Failed -> handleFailed(s, now)
         }
         updateDiagnostics()
     }
@@ -133,10 +145,7 @@ class ConnectivityOrchestratorImpl(
             TransportPreference.FORCE_CLOUD -> startCloudConnect(s)
             TransportPreference.FORCE_LOCAL -> startLocalConnect(s)
             TransportPreference.AUTO -> {
-                val localAvailable = s.isLocalHost ||
-                    localDiscovery.discoveredPeers.value.isNotEmpty() ||
-                    s.sessionSecret != null
-                if (localAvailable) startLocalConnect(s) else startCloudConnect(s)
+                if (isLocalLanViable(s)) startLocalConnect(s) else startCloudConnect(s)
             }
         }
     }
@@ -219,6 +228,8 @@ class ConnectivityOrchestratorImpl(
             return
         }
         if (transitionTimedOut(now)) {
+            candidateGeneration?.let { connectionSwitcher.retire(it) }
+            candidateGeneration = null
             val cloudConn = connectionSwitcher.connectionFor(GenerationId(current.previousGeneration))
             if (cloudConn != null) {
                 _state.value = ConnectivityState.CloudActive(
@@ -227,6 +238,10 @@ class ConnectivityOrchestratorImpl(
                     pathEvaluator.current(TransportMode.CLOUD_DIRECT),
                 )
                 activeTransportMode = TransportMode.CLOUD_DIRECT
+            } else {
+                _state.value = ConnectivityState.Failed(
+                    com.nblaisot.voxcrew.connectivity.model.ConnectivityFailure.TRANSITION_FAILED,
+                )
             }
         }
     }
@@ -247,28 +262,102 @@ class ConnectivityOrchestratorImpl(
             localGeneration?.let { connectionSwitcher.retire(it) }
             return
         }
-        if (transitionTimedOut(now) && pathEvaluator.isLocalStable(thresholds)) {
-            _state.value = ConnectivityState.LocalActive(
-                current.previousGeneration,
-                pathEvaluator.current(TransportMode.LOCAL_LAN),
-            )
-            activeTransportMode = TransportMode.LOCAL_LAN
+        if (transitionTimedOut(now)) {
             candidateGeneration?.let { connectionSwitcher.retire(it) }
+            candidateGeneration = null
+            if (pathEvaluator.isLocalStable(thresholds)) {
+                _state.value = ConnectivityState.LocalActive(
+                    current.previousGeneration,
+                    pathEvaluator.current(TransportMode.LOCAL_LAN),
+                )
+                activeTransportMode = TransportMode.LOCAL_LAN
+            } else {
+                val cloudConn = connectionSwitcher.connectionFor(GenerationId(current.previousGeneration))
+                if (cloudConn != null) {
+                    _state.value = ConnectivityState.CloudActive(
+                        current.previousGeneration,
+                        TransportMode.CLOUD_DIRECT,
+                        pathEvaluator.current(TransportMode.CLOUD_DIRECT),
+                    )
+                    activeTransportMode = TransportMode.CLOUD_DIRECT
+                } else {
+                    _state.value = ConnectivityState.Failed(
+                        com.nblaisot.voxcrew.connectivity.model.ConnectivityFailure.TRANSITION_FAILED,
+                    )
+                }
+            }
         }
     }
 
-    private suspend fun handleReconnecting(now: Long) {
-        delay(500)
+    private suspend fun handleReconnecting(s: SessionDescriptor, now: Long) {
+        delay(reconnectBackoffMs)
+        reconnectBackoffMs = minOf(30_000L, reconnectBackoffMs * 2)
+        localGeneration?.let {
+            runCatching { localTransport.disconnect(it) }
+            connectionSwitcher.retire(it)
+        }
+        cloudGeneration?.let {
+            if (!cloudTransport.sharesIntercomSignaling) {
+                runCatching { cloudTransport.disconnect(it) }
+            }
+            connectionSwitcher.retire(it)
+        }
+        candidateGeneration?.let { connectionSwitcher.retire(it) }
+        localGeneration = null
+        cloudGeneration = null
+        candidateGeneration = null
+        activeTransportMode = TransportMode.NONE
         _state.value = ConnectivityState.Discovering
+        handleDiscovering(s, now)
+    }
+
+    private suspend fun handleFailed(s: SessionDescriptor, now: Long) {
+        failedRetryAttempt += 1
+        val backoff = minOf(30_000L, 2_000L shl minOf(failedRetryAttempt, 4))
+        delay(backoff)
+        _state.value = ConnectivityState.Discovering
+        handleDiscovering(s, now)
+    }
+
+    private fun isLocalLanViable(s: SessionDescriptor): Boolean {
+        if (localDiscovery.freshDiscoveredPeers().isNotEmpty()) return true
+        return s.isLocalHost && localServer?.info?.value != null
+    }
+
+    private fun configureLocalEndpoint(s: SessionDescriptor): Boolean {
+        val transport = localTransport
+        if (transport !is LocalLanSignalingTransport) return true
+        localDiscovery.freshDiscoveredPeers().firstOrNull()?.let { peer ->
+            transport.configureEndpoint(peer.host, peer.port)
+            return true
+        }
+        if (s.isLocalHost) {
+            localServer?.info?.value?.let { info ->
+                transport.configureEndpoint(info.host, info.port)
+                return true
+            }
+        }
+        return false
     }
 
     private suspend fun startLocalConnect(s: SessionDescriptor) {
+        if (!configureLocalEndpoint(s)) {
+            when (preference) {
+                TransportPreference.AUTO -> {
+                    startCloudConnect(s)
+                    return
+                }
+                TransportPreference.FORCE_LOCAL -> {
+                    _state.value = ConnectivityState.Failed(
+                        com.nblaisot.voxcrew.connectivity.model.ConnectivityFailure.LOCAL_UNAVAILABLE,
+                    )
+                    return
+                }
+                else -> Unit
+            }
+        }
         val gen = GenerationId.next()
         localGeneration = gen
-        val peer = localDiscovery.discoveredPeers.value.firstOrNull()
-        if (peer != null && localTransport is com.nblaisot.voxcrew.connectivity.transport.LocalLanSignalingTransport) {
-            localTransport.configureEndpoint(peer.host, peer.port)
-        }
         localTransport.connect(s.copy(sessionSecret = s.sessionSecret ?: localServer?.info?.value?.sessionSecret?.token), gen)
         connectionSwitcher.createConnection(gen, isInitiatorFor(s), useLanIce = true)
         _state.value = ConnectivityState.ConnectingLocal(gen.value)
@@ -278,7 +367,9 @@ class ConnectivityOrchestratorImpl(
     private suspend fun startCloudConnect(s: SessionDescriptor) {
         val gen = GenerationId.next()
         cloudGeneration = gen
-        cloudTransport.connect(s, gen)
+        if (!cloudTransport.sharesIntercomSignaling) {
+            cloudTransport.connect(s, gen)
+        }
         connectionSwitcher.createConnection(gen, isInitiatorFor(s), useLanIce = false)
         _state.value = ConnectivityState.ConnectingCloud(gen.value)
     }
@@ -286,7 +377,9 @@ class ConnectivityOrchestratorImpl(
     private suspend fun beginTransitionToCloud(previousGen: Long, s: SessionDescriptor) {
         val gen = GenerationId.next()
         candidateGeneration = gen
-        cloudTransport.connect(s, gen)
+        if (!cloudTransport.sharesIntercomSignaling) {
+            cloudTransport.connect(s, gen)
+        }
         connectionSwitcher.createConnection(gen, isInitiatorFor(s), useLanIce = false)
         _state.value = ConnectivityState.TransitioningToCloud(previousGen, gen.value)
         transitionStartedAt = clock()
@@ -296,10 +389,7 @@ class ConnectivityOrchestratorImpl(
     private suspend fun beginTransitionToLocal(previousGen: Long, s: SessionDescriptor) {
         val gen = GenerationId.next()
         candidateGeneration = gen
-        val peer = localDiscovery.discoveredPeers.value.firstOrNull()
-        if (peer != null && localTransport is com.nblaisot.voxcrew.connectivity.transport.LocalLanSignalingTransport) {
-            localTransport.configureEndpoint(peer.host, peer.port)
-        }
+        if (!configureLocalEndpoint(s)) return
         localTransport.connect(s.copy(sessionSecret = s.sessionSecret ?: localServer?.info?.value?.sessionSecret?.token), gen)
         connectionSwitcher.createConnection(gen, isInitiatorFor(s), useLanIce = true)
         _state.value = ConnectivityState.TransitioningToLocal(previousGen, gen.value)
@@ -310,7 +400,9 @@ class ConnectivityOrchestratorImpl(
     private suspend fun ensureCloudControlChannel(s: SessionDescriptor) {
         if (cloudControlConnected || cloudGeneration != null) return
         val gen = GenerationId.next()
-        cloudTransport.connect(s, gen)
+        if (!cloudTransport.sharesIntercomSignaling) {
+            cloudTransport.connect(s, gen)
+        }
         cloudControlConnected = cloudTransport.state.value.connectionState == ConnectionState.AUTHENTICATED
     }
 
@@ -375,10 +467,10 @@ class ConnectivityOrchestratorImpl(
     }
 
     private suspend fun handleIncoming(envelope: SignalingEnvelope, kind: SignalingTransportKind) {
-        val gen = envelope.payload["generation"]?.jsonPrimitive?.content?.toLongOrNull()
-        val activeGen = connectionSwitcher.activeGeneration.value?.value
-        if (gen != null && activeGen != null && gen < activeGen) {
-            return // obsolete generation
+        // The envelope "generation" is the sender's local counter; it is not comparable
+        // to our own generation numbers, so no filtering happens here.
+        if (kind == SignalingTransportKind.CLOUD && cloudTransport.sharesIntercomSignaling) {
+            return
         }
         if (envelope.type in setOf(
                 SignalingMessageTypes.OFFER,
@@ -391,7 +483,7 @@ class ConnectivityOrchestratorImpl(
     }
 
     private fun updateDiagnostics() {
-        val localPeer = localDiscovery.discoveredPeers.value.isNotEmpty()
+        val localPeer = localDiscovery.freshDiscoveredPeers().isNotEmpty()
         _diagnostics.update {
             it.copy(
                 activeTransport = activeTransportMode,

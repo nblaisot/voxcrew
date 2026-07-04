@@ -45,6 +45,7 @@ class CloudRunSignalingTransport(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) : SignalingTransport {
     override val kind = SignalingTransportKind.CLOUD
+    override val sharesIntercomSignaling: Boolean = true
 
     private val _state = MutableStateFlow(
         SignalingTransportState(kind = SignalingTransportKind.CLOUD, endpoint = baseUrl),
@@ -58,6 +59,7 @@ class CloudRunSignalingTransport(
     private var reconnectJob: Job? = null
     private var intentionalDisconnect = false
     private var reconnectAttempt = 0
+    private var socketOpen = false
     private var activeGeneration: GenerationId? = null
     private val sendMutex = Mutex()
 
@@ -79,6 +81,7 @@ class CloudRunSignalingTransport(
         reconnectJob?.cancel()
         webSocket?.close(1000, "disconnect")
         webSocket = null
+        socketOpen = false
         activeGeneration = null
         _state.update { it.copy(connectionState = ConnectionState.DISCONNECTED, generation = null) }
     }
@@ -88,53 +91,81 @@ class CloudRunSignalingTransport(
         reconnectJob?.cancel()
         webSocket?.close(1000, "client disconnect")
         webSocket = null
+        socketOpen = false
         activeGeneration = null
         _state.update { it.copy(connectionState = ConnectionState.DISCONNECTED, generation = null) }
     }
 
     override suspend fun send(envelope: SignalingEnvelope) {
         sendMutex.withLock {
-            val ws = webSocket ?: error("WebSocket non connecté")
+            val ws = awaitWritableSocket()
             ws.send(signalingJson.encodeToString(SignalingEnvelope.serializer(), envelope))
         }
     }
 
+    private suspend fun awaitWritableSocket(): WebSocket {
+        val deadline = System.currentTimeMillis() + 15_000
+        while (System.currentTimeMillis() < deadline) {
+            val ws = webSocket
+            if (ws != null && socketOpen) return ws
+            delay(50)
+        }
+        error("WebSocket non connecté")
+    }
+
     private fun openSocket() {
+        if (socketOpen && webSocket != null && _state.value.connectionState == ConnectionState.AUTHENTICATED) {
+            return
+        }
+        reconnectJob?.cancel()
+        reconnectJob = null
+        webSocket?.close(1000, "reconnect")
+        webSocket = null
+        socketOpen = false
         _state.update { it.copy(connectionState = ConnectionState.CONNECTING, lastError = null) }
         val wsUrl = baseUrl.replace("https://", "wss://").replace("http://", "ws://").trimEnd('/') + "/ws"
         val request = Request.Builder().url(wsUrl).build()
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                scope.launch { authenticate() }
+            override fun onOpen(ws: WebSocket, response: Response) {
+                if (webSocket !== ws) return
+                socketOpen = true
+                scope.launch { authenticate(ws) }
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
+            override fun onMessage(ws: WebSocket, text: String) {
+                if (webSocket !== ws) return
                 scope.launch { handleMessage(text) }
             }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                if (webSocket !== ws) return
+                socketOpen = false
                 _state.update { it.copy(lastError = t.message) }
                 scheduleReconnect()
             }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                if (webSocket !== ws) return
+                socketOpen = false
                 if (!intentionalDisconnect) scheduleReconnect()
             }
         })
     }
 
-    private suspend fun authenticate() {
+    private suspend fun authenticate(ws: WebSocket) {
         val token = authRepository.getIdToken(forceRefresh = reconnectAttempt > 0).getOrElse { error ->
             _state.update { it.copy(connectionState = ConnectionState.DISCONNECTED, lastError = error.message) }
+            scheduleReconnect()
             return
         }
-        send(
-            SignalingEnvelope(
-                type = SignalingMessageTypes.AUTHENTICATE,
-                requestId = UUID.randomUUID().toString(),
-                payload = jsonPayload("authKind" to "firebase", "token" to token),
-            ),
+        val envelope = SignalingEnvelope(
+            type = SignalingMessageTypes.AUTHENTICATE,
+            requestId = UUID.randomUUID().toString(),
+            payload = jsonPayload("token" to token),
         )
+        // Send on the exact socket that just opened; going through send() could
+        // deliver the token to a newer socket and double-authenticate it.
+        ws.send(signalingJson.encodeToString(SignalingEnvelope.serializer(), envelope))
     }
 
     private suspend fun handleMessage(text: String) {
@@ -149,10 +180,16 @@ class CloudRunSignalingTransport(
             SignalingMessageTypes.AUTHENTICATION_ERROR -> {
                 val msg = envelope.payload["message"]?.jsonPrimitive?.content ?: "Auth error"
                 _state.update { it.copy(connectionState = ConnectionState.DISCONNECTED, lastError = msg) }
+                scheduleReconnect()
             }
             SignalingMessageTypes.ERROR -> {
+                val code = envelope.payload["code"]?.jsonPrimitive?.content
                 val msg = envelope.payload["message"]?.jsonPrimitive?.content
-                _state.update { it.copy(lastError = msg) }
+                val benign = code == "SESSION_NOT_FOUND" ||
+                    msg.equals("Already authenticated", ignoreCase = true)
+                if (!benign) {
+                    _state.update { it.copy(lastError = msg) }
+                }
             }
         }
         _incoming.emit(envelope)

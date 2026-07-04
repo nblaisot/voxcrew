@@ -4,14 +4,17 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -24,7 +27,9 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.clip
+import com.nblaisot.voxcrew.ui.theme.VoxPttActive
+import com.nblaisot.voxcrew.ui.theme.VoxPttIdle
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -91,26 +96,35 @@ fun SessionScreen(
         )
 
         if (state.transmissionMode == TransmissionMode.PUSH_TO_TALK) {
-            val pttColor = if (state.isTransmitting) Color(0xFFC62828) else MaterialTheme.colorScheme.primary
-            Button(
-                onClick = {},
+            val pttColor = if (state.isTransmitting) VoxPttActive else VoxPttIdle
+            // Box instead of Button: the Button's internal clickable consumes the
+            // down event and detectTapGestures.onPress never fires.
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(120.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(pttColor)
                     .pointerInput(Unit) {
                         detectTapGestures(
                             onPress = {
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 viewModel.pttPress()
-                                tryAwaitRelease()
-                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                viewModel.pttRelease()
+                                try {
+                                    tryAwaitRelease()
+                                } finally {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    viewModel.pttRelease()
+                                }
                             },
                         )
                     },
-                colors = ButtonDefaults.buttonColors(containerColor = pttColor),
+                contentAlignment = Alignment.Center,
             ) {
-                Text("PTT — maintenir pour parler")
+                Text(
+                    if (state.isTransmitting) "Transmission…" else "PTT — maintenir pour parler",
+                    color = MaterialTheme.colorScheme.onPrimary,
+                )
             }
         }
 

@@ -30,8 +30,8 @@ gcloud run deploy "${SERVICE}" \
   --project "${PROJECT_ID}" \
   --platform managed \
   --allow-unauthenticated \
-  --min-instances 0 \
-  --max-instances 3 \
+  --min-instances 1 \
+  --max-instances 1 \
   --timeout 3600 \
   --port 8080
 

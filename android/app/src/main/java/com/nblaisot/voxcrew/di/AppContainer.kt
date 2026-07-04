@@ -15,6 +15,8 @@ import com.nblaisot.voxcrew.connectivity.transport.LocalLanSignalingTransport
 import com.nblaisot.voxcrew.connectivity.webrtc.PeerConnectionFactoryFacade
 import com.nblaisot.voxcrew.connectivity.webrtc.WebRtcConnectionSwitcher
 import com.nblaisot.voxcrew.connectivity.webrtc.WebRtcConnectionSwitcherImpl
+import com.nblaisot.voxcrew.lanlink.LanIntercomEngine
+import com.nblaisot.voxcrew.roster.CrewRosterRepository
 import com.nblaisot.voxcrew.signaling.SignalingClient
 import com.nblaisot.voxcrew.signaling.SignalingEnvelope
 import com.nblaisot.voxcrew.signaling.SignalingMessageTypes
@@ -68,6 +70,18 @@ class AppContainer(context: Context) {
         localDiscovery = localDiscovery,
         localServer = localServer,
         connectionSwitcher = connectionSwitcher,
+    )
+
+    val lanIntercomEngine = LanIntercomEngine(
+        context = appContext,
+        scope = scope,
+    )
+
+    val rosterRepository = CrewRosterRepository(
+        context = appContext,
+        signalingClient = signalingClient,
+        lanPeers = lanIntercomEngine.peers,
+        scope = scope,
     )
 
     @Deprecated("Use connectionSwitcher for generation-aware sessions")

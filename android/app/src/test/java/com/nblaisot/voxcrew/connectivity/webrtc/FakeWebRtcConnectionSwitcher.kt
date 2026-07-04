@@ -40,6 +40,11 @@ class FakeManagedPeerConnection(
     override fun createAnswer() = Unit
     override fun setRemoteDescription(sdp: SessionDescription) = Unit
     override fun addIceCandidate(candidate: IceCandidate) = Unit
+    override suspend fun createOfferAwait(iceRestart: Boolean): SessionDescription =
+        SessionDescription(SessionDescription.Type.OFFER, "fake-offer")
+    override suspend fun createAnswerAwait(): SessionDescription =
+        SessionDescription(SessionDescription.Type.ANSWER, "fake-answer")
+    override suspend fun setRemoteDescriptionAwait(sdp: SessionDescription) = Unit
     override fun muteIncomingAudio(muted: Boolean) = Unit
     override fun close() {
         closed = true
@@ -58,6 +63,9 @@ class FakeWebRtcConnectionSwitcher : WebRtcConnectionSwitcher {
 
     private val _lastSwitch = MutableStateFlow<SwitchEvent?>(null)
     override val lastSwitch: StateFlow<SwitchEvent?> = _lastSwitch.asStateFlow()
+
+    private val _remoteAudioActive = MutableStateFlow(false)
+    override val remoteAudioActive: StateFlow<Boolean> = _remoteAudioActive.asStateFlow()
 
     val promoteCalls = mutableListOf<GenerationId>()
     val retireCalls = mutableListOf<GenerationId>()

@@ -22,6 +22,8 @@ data class SignalingTransportState(
 
 interface SignalingTransport {
     val kind: SignalingTransportKind
+    /** When true, the transport stays connected for app-wide signaling; orchestrator must not reconnect/disconnect it. */
+    val sharesIntercomSignaling: Boolean get() = false
     val state: StateFlow<SignalingTransportState>
     val incomingMessages: Flow<SignalingEnvelope>
 

@@ -19,6 +19,11 @@ export const messageTypeSchema = z.enum([
   "ping",
   "pong",
   "error",
+  "presence_register",
+  "presence_heartbeat",
+  "presence_snapshot",
+  "presence_updated",
+  "presence_offline",
 ]);
 
 export type MessageType = z.infer<typeof messageTypeSchema>;
@@ -26,10 +31,10 @@ export type MessageType = z.infer<typeof messageTypeSchema>;
 export const envelopeSchema = z.object({
   version: z.literal(PROTOCOL_VERSION),
   type: messageTypeSchema,
-  requestId: z.string().uuid().optional(),
-  sessionId: z.string().min(1).max(128).optional(),
-  senderId: z.string().min(1).max(128).optional(),
-  recipientId: z.string().min(1).max(128).optional(),
+  requestId: z.string().uuid().nullish(),
+  sessionId: z.string().min(1).max(128).nullish(),
+  senderId: z.string().min(1).max(128).nullish(),
+  recipientId: z.string().min(1).max(128).nullish(),
   payload: z.record(z.unknown()).default({}),
 });
 
@@ -43,10 +48,12 @@ export type ClientMessage = z.infer<typeof clientMessageSchema>;
 
 export const authenticatePayloadSchema = z.object({
   token: z.string().min(1),
+  authKind: z.string().optional(),
 });
 
 export const createSessionPayloadSchema = z.object({
   name: z.string().max(128).optional(),
+  sessionId: z.string().min(1).max(128).optional(),
 });
 
 export const joinSessionPayloadSchema = z.object({
@@ -67,6 +74,19 @@ export const icePayloadSchema = z.object({
 export const pingPayloadSchema = z.object({
   timestamp: z.number().optional(),
 });
+
+export const presenceRegisterPayloadSchema = z.object({
+  email: z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z.string().min(1).max(256).optional(),
+  ),
+  transportHint: z.enum(["local_lan", "cloud", "none"]).optional(),
+});
+
+export const presenceHeartbeatPayloadSchema = z.object({
+  transportHint: z.enum(["local_lan", "cloud", "none"]),
+});
+
 
 export type ErrorCode =
   | "TOKEN_INVALID"

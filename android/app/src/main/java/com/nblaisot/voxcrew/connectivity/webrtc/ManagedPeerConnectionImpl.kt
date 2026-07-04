@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
 import org.webrtc.DataChannel
@@ -23,6 +24,8 @@ import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import java.nio.ByteBuffer
 import java.nio.charset.Charset
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 class ManagedPeerConnectionImpl(
     override val generation: GenerationId,
@@ -42,6 +45,8 @@ class ManagedPeerConnectionImpl(
     private var remoteAudioReceivers = mutableListOf<RtpReceiver>()
     private var lastPingSentAt = 0L
     private var audioAttached = false
+    private var remoteDescriptionSet = false
+    private val pendingCandidates = mutableListOf<IceCandidate>()
 
     override var onIceCandidate: ((IceCandidate) -> Unit)? = null
     override var onOfferCreated: ((SessionDescription) -> Unit)? = null
@@ -126,31 +131,107 @@ class ManagedPeerConnectionImpl(
     }
 
     override fun createOffer() {
-        peerConnection?.createOffer(object : SimpleSdpObserver() {
+        peerConnection?.createOffer(object : ReportingSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription?) {
                 desc ?: return
-                peerConnection?.setLocalDescription(SimpleSdpObserver(), desc)
+                peerConnection?.setLocalDescription(ReportingSdpObserver(), desc)
                 onOfferCreated?.invoke(desc)
             }
         }, MediaConstraints())
     }
 
+    override suspend fun createOfferAwait(iceRestart: Boolean): SessionDescription {
+        val pc = peerConnection ?: throw IllegalStateException("peerConnection closed")
+        val constraints = MediaConstraints().apply {
+            if (iceRestart) {
+                mandatory.add(MediaConstraints.KeyValuePair("IceRestart", "true"))
+            }
+        }
+        val offer = suspendCancellableCoroutine { cont ->
+            pc.createOffer(object : ReportingSdpObserver() {
+                override fun onCreateSuccess(desc: SessionDescription?) {
+                    if (desc == null) cont.resumeWithException(IllegalStateException("offer null"))
+                    else cont.resume(desc)
+                }
+                override fun onCreateFailure(error: String?) {
+                    cont.resumeWithException(IllegalStateException(error ?: "offer failed"))
+                }
+            }, constraints)
+        }
+        suspendCancellableCoroutine { cont ->
+            pc.setLocalDescription(object : ReportingSdpObserver() {
+                override fun onSetSuccess() = cont.resume(Unit)
+                override fun onSetFailure(error: String?) =
+                    cont.resumeWithException(IllegalStateException(error ?: "setLocalDescription failed"))
+            }, offer)
+        }
+        return offer
+    }
+
     override fun createAnswer() {
-        peerConnection?.createAnswer(object : SimpleSdpObserver() {
+        peerConnection?.createAnswer(object : ReportingSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription?) {
                 desc ?: return
-                peerConnection?.setLocalDescription(SimpleSdpObserver(), desc)
+                peerConnection?.setLocalDescription(ReportingSdpObserver(), desc)
                 onAnswerCreated?.invoke(desc)
             }
         }, MediaConstraints())
     }
 
+    override suspend fun createAnswerAwait(): SessionDescription {
+        val pc = peerConnection ?: throw IllegalStateException("peerConnection closed")
+        val answer = suspendCancellableCoroutine { cont ->
+            pc.createAnswer(object : ReportingSdpObserver() {
+                override fun onCreateSuccess(desc: SessionDescription?) {
+                    if (desc == null) cont.resumeWithException(IllegalStateException("answer null"))
+                    else cont.resume(desc)
+                }
+                override fun onCreateFailure(error: String?) {
+                    cont.resumeWithException(IllegalStateException(error ?: "answer failed"))
+                }
+            }, MediaConstraints())
+        }
+        suspendCancellableCoroutine { cont ->
+            pc.setLocalDescription(object : ReportingSdpObserver() {
+                override fun onSetSuccess() = cont.resume(Unit)
+                override fun onSetFailure(error: String?) =
+                    cont.resumeWithException(IllegalStateException(error ?: "setLocalDescription failed"))
+            }, answer)
+        }
+        return answer
+    }
+
     override fun setRemoteDescription(sdp: SessionDescription) {
-        peerConnection?.setRemoteDescription(SimpleSdpObserver(), sdp)
+        peerConnection?.setRemoteDescription(ReportingSdpObserver(onSetSuccess = { flushCandidates() }), sdp)
+    }
+
+    override suspend fun setRemoteDescriptionAwait(sdp: SessionDescription) {
+        val pc = peerConnection ?: throw IllegalStateException("peerConnection closed")
+        suspendCancellableCoroutine { cont ->
+            pc.setRemoteDescription(object : ReportingSdpObserver() {
+                override fun onSetSuccess() {
+                    flushCandidates()
+                    cont.resume(Unit)
+                }
+                override fun onSetFailure(error: String?) {
+                    cont.resumeWithException(IllegalStateException(error ?: "setRemoteDescription failed"))
+                }
+            }, sdp)
+        }
     }
 
     override fun addIceCandidate(candidate: IceCandidate) {
+        if (!remoteDescriptionSet) {
+            pendingCandidates.add(candidate)
+            return
+        }
         peerConnection?.addIceCandidate(candidate)
+    }
+
+    private fun flushCandidates() {
+        remoteDescriptionSet = true
+        pendingCandidates.forEach { peerConnection?.addIceCandidate(it) }
+        pendingCandidates.clear()
     }
 
     override fun muteIncomingAudio(muted: Boolean) {
@@ -204,12 +285,20 @@ class ManagedPeerConnectionImpl(
         audioSource = null
         peerConnection = null
         remoteAudioReceivers.clear()
+        pendingCandidates.clear()
+        remoteDescriptionSet = false
         _diagnostics.value = WebRtcDiagnostics()
     }
 
-    private open class SimpleSdpObserver : SdpObserver {
+    internal fun peerConnectionForStats(): PeerConnection? = peerConnection
+
+    private open class ReportingSdpObserver(
+        private val onSetSuccess: (() -> Unit)? = null,
+    ) : SdpObserver {
         override fun onCreateSuccess(desc: SessionDescription?) = Unit
-        override fun onSetSuccess() = Unit
+        override fun onSetSuccess() {
+            onSetSuccess?.invoke()
+        }
         override fun onCreateFailure(error: String?) = Unit
         override fun onSetFailure(error: String?) = Unit
     }

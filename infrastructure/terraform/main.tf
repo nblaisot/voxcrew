@@ -62,6 +62,12 @@ resource "google_project_iam_member" "signaling_firebase_admin" {
   member  = "serviceAccount:${google_service_account.signaling.email}"
 }
 
+resource "google_project_iam_member" "signaling_firebase_sdk_admin" {
+  project = var.project_id
+  role    = "roles/firebase.sdkAdminServiceAgent"
+  member  = "serviceAccount:${google_service_account.signaling.email}"
+}
+
 resource "google_cloud_run_v2_service" "signaling" {
   depends_on = [google_project_service.required]
 
@@ -73,7 +79,7 @@ resource "google_cloud_run_v2_service" "signaling" {
     service_account = google_service_account.signaling.email
 
     scaling {
-      min_instance_count = 0
+      min_instance_count = var.min_instances
       max_instance_count = var.max_instances
     }
 

@@ -47,7 +47,7 @@ class NsdLocalPeerDiscovery(
         _state.value = LocalDiscoveryState.STOPPED
     }
 
-    fun registerHost(port: Int, instanceId: String) {
+    override fun registerHost(port: Int, instanceId: String) {
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = "voxcrew-$instanceId"
             serviceType = SERVICE_TYPE
@@ -68,6 +68,52 @@ class NsdLocalPeerDiscovery(
         nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
     }
 
+    override fun unregisterHost() {
+        registrationListener?.let { runCatching { nsdManager.unregisterService(it) } }
+        registrationListener = null
+    }
+
+    override fun freshDiscoveredPeers(maxAgeMs: Long): List<DiscoveredLocalPeer> {
+        pruneStalePeers(maxAgeMs)
+        return _discoveredPeers.value
+    }
+
+    private fun pruneStalePeers(maxAgeMs: Long) {
+        val now = System.currentTimeMillis()
+        val stale = peers.filterValues { now - it.discoveredAtMs > maxAgeMs }.keys
+        stale.forEach { peers.remove(it) }
+        if (stale.isNotEmpty()) {
+            _discoveredPeers.value = peers.values.toList()
+        }
+    }
+
+    private val resolveRetries = mutableSetOf<String>()
+
+    private fun scopeRetryResolve(info: NsdServiceInfo) {
+        if (!resolveRetries.add(info.serviceName)) return
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            runCatching {
+                nsdManager.resolveService(info, object : NsdManager.ResolveListener {
+                    override fun onResolveFailed(i: NsdServiceInfo, code: Int) = Unit
+                    override fun onServiceResolved(resolved: NsdServiceInfo) {
+                        val hash = resolved.attributes["sessionIdHash"]?.let { String(it) }
+                        if (sessionIdHash != null && hash != null && hash != sessionIdHash) return
+                        val host = resolved.host?.hostAddress ?: return
+                        val peer = DiscoveredLocalPeer(
+                            serviceName = resolved.serviceName,
+                            host = host,
+                            port = resolved.port,
+                            sessionIdHash = hash,
+                            instanceId = resolved.attributes["instanceId"]?.let { String(it) },
+                        )
+                        peers[resolved.serviceName] = peer
+                        _discoveredPeers.value = peers.values.toList()
+                    }
+                })
+            }
+        }, 1_000)
+    }
+
     private fun startDiscovery() {
         discoveryListener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(regType: String) {
@@ -77,7 +123,9 @@ class NsdLocalPeerDiscovery(
             override fun onServiceFound(service: NsdServiceInfo) {
                 if (service.serviceType != SERVICE_TYPE) return
                 nsdManager.resolveService(service, object : NsdManager.ResolveListener {
-                    override fun onResolveFailed(info: NsdServiceInfo, code: Int) = Unit
+                    override fun onResolveFailed(info: NsdServiceInfo, code: Int) {
+                        scopeRetryResolve(info)
+                    }
                     override fun onServiceResolved(info: NsdServiceInfo) {
                         val hash = info.attributes["sessionIdHash"]?.let { String(it) }
                         if (sessionIdHash != null && hash != null && hash != sessionIdHash) return
@@ -89,7 +137,7 @@ class NsdLocalPeerDiscovery(
                             sessionIdHash = hash,
                             instanceId = info.attributes["instanceId"]?.let { String(it) },
                         )
-                        peers[info.serviceName] = peer
+                        peers[info.serviceName] = peer.copy(discoveredAtMs = System.currentTimeMillis())
                         _discoveredPeers.value = peers.values.toList()
                     }
                 })

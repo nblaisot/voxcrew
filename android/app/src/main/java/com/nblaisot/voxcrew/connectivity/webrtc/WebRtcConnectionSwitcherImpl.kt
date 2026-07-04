@@ -10,6 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
@@ -36,6 +37,12 @@ class WebRtcConnectionSwitcherImpl(
     private val _lastSwitch = MutableStateFlow<SwitchEvent?>(null)
     override val lastSwitch: StateFlow<SwitchEvent?> = _lastSwitch.asStateFlow()
 
+    private val _remoteAudioActive = MutableStateFlow(false)
+    override val remoteAudioActive: StateFlow<Boolean> = _remoteAudioActive.asStateFlow()
+
+    private var audioMonitor: RemoteAudioActivityMonitor? = null
+    private var audioMonitorJob: Job? = null
+
     private val promoteMutex = Mutex()
 
     override fun createConnection(
@@ -57,6 +64,7 @@ class WebRtcConnectionSwitcherImpl(
             active = conn
             _activeGeneration.value = generation
             bindDiagnostics(conn)
+            bindAudioMonitor(conn)
         }
         return conn
     }
@@ -71,6 +79,7 @@ class WebRtcConnectionSwitcherImpl(
             active = impl
             _activeGeneration.value = impl.generation
             bindDiagnostics(impl)
+            bindAudioMonitor(impl)
             _lastSwitch.value = SwitchEvent(
                 fromGeneration = previous?.generation,
                 toGeneration = impl.generation,
@@ -86,6 +95,7 @@ class WebRtcConnectionSwitcherImpl(
         if (active?.generation == generation) {
             active = null
             _activeGeneration.value = null
+            bindAudioMonitor(null)
         }
         conn.close()
     }
@@ -112,6 +122,28 @@ class WebRtcConnectionSwitcherImpl(
         active = null
         _activeGeneration.value = null
         _diagnostics.value = WebRtcDiagnostics()
+        bindAudioMonitor(null)
+    }
+
+    private fun bindAudioMonitor(conn: ManagedPeerConnectionImpl?) {
+        audioMonitor?.stop()
+        audioMonitorJob?.cancel()
+        audioMonitor = null
+        if (conn == null) {
+            _remoteAudioActive.value = false
+            return
+        }
+        val monitor = RemoteAudioActivityMonitor(
+            peerConnectionProvider = { conn.peerConnectionForStats() },
+            scope = scope,
+        )
+        audioMonitor = monitor
+        monitor.start()
+        audioMonitorJob = scope.launch {
+            monitor.isReceiving.collect { active ->
+                _remoteAudioActive.value = active
+            }
+        }
     }
 
     private fun bindDiagnostics(conn: ManagedPeerConnectionImpl) {

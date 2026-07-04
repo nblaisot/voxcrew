@@ -250,6 +250,67 @@ Routage strict : le serveur ne transmet qu'aux participants de la même session 
 }
 ```
 
+## Présence équipier
+
+Messages rétrocompatibles — ignorés par les clients/serveurs qui ne les implémentent pas.
+
+### `presence_register` (client → serveur)
+
+Après authentification, enregistre l’email et le transport préféré.
+
+```json
+{
+  "version": 1,
+  "type": "presence_register",
+  "requestId": "...",
+  "payload": {
+    "email": "user@example.com",
+    "transportHint": "cloud | local_lan | none"
+  }
+}
+```
+
+### `presence_heartbeat` (client → serveur)
+
+Toutes les ~10 s. TTL serveur : 30 s sans heartbeat → hors ligne.
+
+```json
+{
+  "version": 1,
+  "type": "presence_heartbeat",
+  "requestId": "...",
+  "payload": {
+    "transportHint": "cloud | local_lan | none"
+  }
+}
+```
+
+### `presence_snapshot` (serveur → client)
+
+Liste complète des membres connus.
+
+```json
+{
+  "version": 1,
+  "type": "presence_snapshot",
+  "payload": {
+    "members": [
+      {
+        "uid": "firebase-uid",
+        "email": "user@example.com",
+        "transportHint": "cloud",
+        "online": true,
+        "lastSeenMs": 1710000000000
+      }
+    ]
+  }
+}
+```
+
+### `presence_updated` / `presence_offline` (serveur → client)
+
+Deltas lors d’une connexion, heartbeat ou déconnexion.
+
 ## Keepalive
 
 ### `ping` (client ou serveur)

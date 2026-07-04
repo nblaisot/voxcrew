@@ -4,6 +4,7 @@ import type { AppConfig } from "./config.js";
 import { createLoggerOptions } from "./logger.js";
 import { createTokenVerifier } from "./auth/index.js";
 import { SessionStore } from "./session/store.js";
+import { PresenceStore } from "./presence/store.js";
 import { WsConnectionHandler } from "./ws/handler.js";
 
 export interface BuildServerOptions {
@@ -20,8 +21,14 @@ export async function buildServer(options: BuildServerOptions): Promise<FastifyI
   });
 
   const sessionStore = new SessionStore();
+  const presenceStore = new PresenceStore();
   const tokenVerifier = createTokenVerifier(config, options.tokenVerifierMode);
-  const wsHandler = new WsConnectionHandler({ tokenVerifier, sessionStore, logger: app.log });
+  const wsHandler = new WsConnectionHandler({
+    tokenVerifier,
+    sessionStore,
+    presenceStore,
+    logger: app.log,
+  });
 
   app.get("/health", async () => ({
     status: "ok",

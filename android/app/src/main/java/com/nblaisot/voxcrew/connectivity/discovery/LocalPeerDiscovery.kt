@@ -24,4 +24,11 @@ interface LocalPeerDiscovery {
 
     suspend fun start(sessionId: String)
     suspend fun stop()
+
+    fun registerHost(port: Int, instanceId: String) = Unit
+
+    fun unregisterHost() = Unit
+
+    fun freshDiscoveredPeers(maxAgeMs: Long = 30_000): List<DiscoveredLocalPeer> =
+        discoveredPeers.value.filter { System.currentTimeMillis() - it.discoveredAtMs <= maxAgeMs }
 }

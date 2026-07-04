@@ -21,6 +21,9 @@ interface ManagedPeerConnection {
     fun createAnswer()
     fun setRemoteDescription(sdp: SessionDescription)
     fun addIceCandidate(candidate: IceCandidate)
+    suspend fun createOfferAwait(iceRestart: Boolean = false): SessionDescription
+    suspend fun createAnswerAwait(): SessionDescription
+    suspend fun setRemoteDescriptionAwait(sdp: SessionDescription)
     fun muteIncomingAudio(muted: Boolean)
     fun close()
 }
@@ -36,6 +39,7 @@ interface WebRtcConnectionSwitcher {
     val activeGeneration: StateFlow<GenerationId?>
     val diagnostics: StateFlow<WebRtcDiagnostics>
     val lastSwitch: StateFlow<SwitchEvent?>
+    val remoteAudioActive: StateFlow<Boolean>
 
     fun createConnection(generation: GenerationId, isInitiator: Boolean, useLanIce: Boolean): ManagedPeerConnection
     suspend fun promote(candidate: ManagedPeerConnection, reason: String)

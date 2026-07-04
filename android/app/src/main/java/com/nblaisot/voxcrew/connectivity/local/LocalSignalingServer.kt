@@ -31,6 +31,7 @@ class LocalSignalingServer(
     private var server: ApplicationEngine? = null
     private val uidSockets = ConcurrentHashMap<String, WebSocketSession>()
     private val sessionStore = LocalSignalingSessionStore()
+    private val presenceStore = LocalPresenceStore()
 
     private val _info = MutableStateFlow<ServerInfo?>(null)
     val info: StateFlow<ServerInfo?> = _info.asStateFlow()
@@ -49,7 +50,9 @@ class LocalSignalingServer(
                     val handler = LocalSignalingConnectionHandler(
                         secret = secret,
                         store = sessionStore,
+                        presenceStore = presenceStore,
                         sendToUid = { uid, envelope -> sendToUid(uid, envelope) },
+                        broadcastAll = { envelope -> broadcastAll(envelope) },
                         onAuthenticated = { uid -> uidSockets[uid] = session },
                         closeConnection = {
                             scope.launch {
@@ -79,7 +82,12 @@ class LocalSignalingServer(
         server = null
         uidSockets.clear()
         sessionStore.clear()
+        presenceStore.clear()
         _info.value = null
+    }
+
+    private fun broadcastAll(envelope: com.nblaisot.voxcrew.signaling.SignalingEnvelope) {
+        uidSockets.keys.forEach { sendToUid(it, envelope) }
     }
 
     private fun sendToUid(uid: String, envelope: com.nblaisot.voxcrew.signaling.SignalingEnvelope) {

@@ -5,8 +5,10 @@ import com.nblaisot.voxcrew.signaling.SignalingMessageTypes
 import com.nblaisot.voxcrew.signaling.jsonPayload
 import com.nblaisot.voxcrew.signaling.signalingJson
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
@@ -16,8 +18,8 @@ internal class LocalSignalingSessionStore {
 
     private val sessions = ConcurrentHashMap<String, Session>()
 
-    fun create(creatorId: String): Session {
-        val id = UUID.randomUUID().toString()
+    fun create(creatorId: String, sessionId: String? = null): Session {
+        val id = sessionId ?: UUID.randomUUID().toString()
         val session = Session(id, CopyOnWriteArraySet(listOf(creatorId)))
         sessions[id] = session
         return session
@@ -53,7 +55,9 @@ internal class LocalSignalingSessionStore {
 internal class LocalSignalingConnectionHandler(
     private val secret: LocalSessionSecret,
     private val store: LocalSignalingSessionStore = LocalSignalingSessionStore(),
+    private val presenceStore: LocalPresenceStore,
     private val sendToUid: (String, SignalingEnvelope) -> Unit,
+    private val broadcastAll: (SignalingEnvelope) -> Unit,
     private val onAuthenticated: (String) -> Unit,
     private val closeConnection: () -> Unit,
 ) {
@@ -85,12 +89,28 @@ internal class LocalSignalingConnectionHandler(
                     payload = msg.payload,
                 ),
             )
+            SignalingMessageTypes.PRESENCE_REGISTER -> handlePresenceRegister(msg)
+            SignalingMessageTypes.PRESENCE_HEARTBEAT -> handlePresenceHeartbeat(msg)
             else -> sendError("INVALID_MESSAGE", "Unsupported type", msg.requestId)
         }
     }
 
     fun onDisconnect() {
         val id = uid ?: return
+        val offline = presenceStore.markOffline(id)
+        if (offline != null) {
+            broadcastAll(
+                SignalingEnvelope(
+                    type = SignalingMessageTypes.PRESENCE_OFFLINE,
+                    senderId = id,
+                    payload = jsonPayload(
+                        "uid" to id,
+                        "email" to offline.email,
+                        "lastSeenMs" to offline.lastSeenMs.toString(),
+                    ),
+                ),
+            )
+        }
         store.removeFromAll(id).forEach { sessionId ->
             broadcast(sessionId, SignalingEnvelope(
                 type = SignalingMessageTypes.PARTICIPANT_LEFT,
@@ -117,19 +137,24 @@ internal class LocalSignalingConnectionHandler(
         uid = participantId
         authenticated = true
         onAuthenticated(participantId)
+        val email = msg.payload["email"]?.jsonPrimitive?.content ?: participantId
+        presenceStore.register(participantId, email, "local_lan")
         sendToSelf(
             SignalingEnvelope(
                 type = SignalingMessageTypes.AUTHENTICATED,
                 requestId = msg.requestId,
                 senderId = participantId,
-                payload = jsonPayload("uid" to participantId),
+                payload = jsonPayload("uid" to participantId, "email" to email),
             ),
         )
+        sendToSelf(buildPresenceSnapshot())
+        broadcastPresenceUpdated(participantId, email, "local_lan")
     }
 
     private fun handleCreate(msg: SignalingEnvelope) {
         val id = uid ?: return
-        val session = store.create(id)
+        val requestedId = msg.payload["sessionId"]?.jsonPrimitive?.content
+        val session = store.create(id, requestedId)
         sendToSelf(
             SignalingEnvelope(
                 type = SignalingMessageTypes.SESSION_CREATED,
@@ -219,5 +244,58 @@ internal class LocalSignalingConnectionHandler(
             ),
         )
         closeConnection()
+    }
+
+    private fun handlePresenceRegister(msg: SignalingEnvelope) {
+        val id = uid ?: return
+        val email = msg.payload["email"]?.jsonPrimitive?.content ?: id
+        val hint = msg.payload["transportHint"]?.jsonPrimitive?.content ?: "local_lan"
+        presenceStore.register(id, email, hint)
+        sendToSelf(buildPresenceSnapshot())
+        broadcastPresenceUpdated(id, email, hint)
+    }
+
+    private fun handlePresenceHeartbeat(msg: SignalingEnvelope) {
+        val id = uid ?: return
+        val hint = msg.payload["transportHint"]?.jsonPrimitive?.content ?: "local_lan"
+        val entry = presenceStore.heartbeat(id, hint)
+            ?: presenceStore.register(id, id, hint)
+        broadcastPresenceUpdated(id, entry.email, hint)
+    }
+
+    private fun buildPresenceSnapshot(): SignalingEnvelope {
+        val members = buildJsonArray {
+            presenceStore.snapshot().forEach { entry ->
+                add(
+                    buildJsonObject {
+                        put("uid", entry.uid)
+                        put("email", entry.email)
+                        put("transportHint", entry.transportHint)
+                        put("online", entry.online)
+                        put("lastSeenMs", entry.lastSeenMs)
+                    },
+                )
+            }
+        }
+        return SignalingEnvelope(
+            type = SignalingMessageTypes.PRESENCE_SNAPSHOT,
+            payload = buildJsonObject { put("members", members) },
+        )
+    }
+
+    private fun broadcastPresenceUpdated(uid: String, email: String, hint: String) {
+        broadcastAll(
+            SignalingEnvelope(
+                type = SignalingMessageTypes.PRESENCE_UPDATED,
+                senderId = uid,
+                payload = jsonPayload(
+                    "uid" to uid,
+                    "email" to email,
+                    "transportHint" to hint,
+                    "online" to "true",
+                    "lastSeenMs" to System.currentTimeMillis().toString(),
+                ),
+            ),
+        )
     }
 }

@@ -4,5 +4,7 @@
     <string name="notification_channel_session">Session vocale</string>
     <string name="notification_session_title">VoxCrew — session active</string>
     <string name="notification_session_text">Communication vocale en cours</string>
+    <string name="notification_vox_on">VOX actif — micro à l\'écoute</string>
+    <string name="notification_vox_off">VOX désactivé — PTT</string>
     <string name="action_leave_session">Quitter</string>
 </resources>
