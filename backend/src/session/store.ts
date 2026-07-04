@@ -16,8 +16,17 @@ export interface Session {
 export class SessionStore {
   private readonly sessions = new Map<string, Session>();
 
-  create(creatorUid: string, name?: string): Session {
-    const id = randomUUID();
+  create(creatorUid: string, name?: string, explicitId?: string): Session {
+    if (explicitId) {
+      const existing = this.sessions.get(explicitId);
+      if (existing) {
+        if (!existing.participants.has(creatorUid)) {
+          existing.participants.set(creatorUid, { uid: creatorUid, joinedAt: Date.now() });
+        }
+        return existing;
+      }
+    }
+    const id = explicitId ?? randomUUID();
     const session: Session = {
       id,
       name,

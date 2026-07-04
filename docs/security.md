@@ -36,6 +36,14 @@ Ne jamais faire confiance au seul contrôle côté Android.
 | `google-services.json` | Local `android/app/`, hors Git |
 | Allowlist UIDs | Variable env Cloud Run |
 | Tokens utilisateur | Mémoire volatile, jamais loggés |
+| Secret session local | Mémoire volatile, TTL court, QR encodé, jamais loggé |
+
+## Signaling local
+
+- Secret généré par `SecureRandom`, lié à `sessionId`, expiration courte
+- QR URI : token encodé ; ne jamais afficher le token complet dans les logs
+- Cleartext WS limité aux plages IP privées (`networkSecurityConfig`)
+- NSD : pas de token ni UID complet dans les TXT records
 
 Pas de clé de compte de service embarquée dans l'APK.
 

@@ -1,1 +1,2 @@
-sdk.dir=/Users/nblaisot/Library/Android/sdk
+# Copy to android/local.properties (gitignored) to override defaults.
+# SIGNALING_BASE_URL=https://voxcrew-signaling-xxxxx-ew.a.run.app

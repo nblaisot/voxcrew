@@ -4,14 +4,17 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -24,7 +27,9 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.clip
+import com.nblaisot.voxcrew.ui.theme.VoxPttActive
+import com.nblaisot.voxcrew.ui.theme.VoxPttIdle
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -32,11 +37,13 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.nblaisot.voxcrew.audio.TransmissionMode
+import com.nblaisot.voxcrew.connectivity.state.TransportPreference
 
 @Composable
 fun SessionScreen(
     viewModel: SessionViewModel,
     sessionId: String,
+    isLocalHost: Boolean,
     onLeave: () -> Unit,
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -46,8 +53,8 @@ fun SessionScreen(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> viewModel.onMicPermissionResult(granted) }
 
-    LaunchedEffect(sessionId) {
-        viewModel.start(sessionId)
+    LaunchedEffect(sessionId, isLocalHost) {
+        viewModel.start(sessionId, isLocalHost)
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -61,6 +68,12 @@ fun SessionScreen(
     ) {
         Text("Session", style = MaterialTheme.typography.headlineSmall)
         Text("ID : $sessionId")
+        Text("Transport : ${state.transportLabel}", style = MaterialTheme.typography.titleMedium)
+        Text("État : ${state.connectivityStateLabel}")
+        state.localAddress?.let { Text("LAN hôte : $it") }
+        state.activeGeneration?.let { Text("Génération active : $it") }
+        state.candidateGeneration?.let { Text("Génération candidate : $it") }
+        state.lastSwitchReason?.let { Text("Dernière bascule : $it") }
         Text("Participants : ${state.participants.joinToString()}")
         Text("WebRTC : ${state.peerState.name}")
         Text("ICE : ${state.iceState.name}")
@@ -69,6 +82,13 @@ fun SessionScreen(
         Text("Transmission : ${if (state.isTransmitting) "ACTIVE" else "inactive"}")
         state.dataChannelRttMs?.let { Text("Data channel RTT : ${it} ms") }
 
+        TransportPreferenceChips(
+            selected = state.transportPreference,
+            onAuto = { viewModel.setTransportPreference(TransportPreference.AUTO) },
+            onForceLocal = { viewModel.setTransportPreference(TransportPreference.FORCE_LOCAL) },
+            onForceCloud = { viewModel.setTransportPreference(TransportPreference.FORCE_CLOUD) },
+        )
+
         RowChips(
             selected = state.transmissionMode,
             onOpenMic = viewModel::useOpenMic,
@@ -76,26 +96,35 @@ fun SessionScreen(
         )
 
         if (state.transmissionMode == TransmissionMode.PUSH_TO_TALK) {
-            val pttColor = if (state.isTransmitting) Color(0xFFC62828) else MaterialTheme.colorScheme.primary
-            Button(
-                onClick = {},
+            val pttColor = if (state.isTransmitting) VoxPttActive else VoxPttIdle
+            // Box instead of Button: the Button's internal clickable consumes the
+            // down event and detectTapGestures.onPress never fires.
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(120.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(pttColor)
                     .pointerInput(Unit) {
                         detectTapGestures(
                             onPress = {
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 viewModel.pttPress()
-                                tryAwaitRelease()
-                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                viewModel.pttRelease()
+                                try {
+                                    tryAwaitRelease()
+                                } finally {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    viewModel.pttRelease()
+                                }
                             },
                         )
                     },
-                colors = ButtonDefaults.buttonColors(containerColor = pttColor),
+                contentAlignment = Alignment.Center,
             ) {
-                Text("PTT — maintenir pour parler")
+                Text(
+                    if (state.isTransmitting) "Transmission…" else "PTT — maintenir pour parler",
+                    color = MaterialTheme.colorScheme.onPrimary,
+                )
             }
         }
 
@@ -119,6 +148,21 @@ fun SessionScreen(
         }, modifier = Modifier.fillMaxWidth()) {
             Text("Quitter la session")
         }
+    }
+}
+
+@Composable
+private fun TransportPreferenceChips(
+    selected: TransportPreference,
+    onAuto: () -> Unit,
+    onForceLocal: () -> Unit,
+    onForceCloud: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Transport (debug)", style = MaterialTheme.typography.labelLarge)
+        FilterChip(selected = selected == TransportPreference.AUTO, onClick = onAuto, label = { Text("Auto") })
+        FilterChip(selected = selected == TransportPreference.FORCE_LOCAL, onClick = onForceLocal, label = { Text("Forcer local") })
+        FilterChip(selected = selected == TransportPreference.FORCE_CLOUD, onClick = onForceCloud, label = { Text("Forcer cloud") })
     }
 }
 

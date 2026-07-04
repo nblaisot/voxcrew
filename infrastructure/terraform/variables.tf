@@ -36,7 +36,13 @@ variable "container_image" {
 variable "max_instances" {
   type        = number
   description = "Maximum Cloud Run instances"
-  default     = 3
+  default     = 1
+}
+
+variable "min_instances" {
+  type        = number
+  description = "Minimum Cloud Run instances (keep warm while state is in-memory)"
+  default     = 1
 }
 
 variable "request_timeout_seconds" {

@@ -36,11 +36,17 @@ object SignalingMessageTypes {
     const val PING = "ping"
     const val PONG = "pong"
     const val ERROR = "error"
+    const val PRESENCE_REGISTER = "presence_register"
+    const val PRESENCE_HEARTBEAT = "presence_heartbeat"
+    const val PRESENCE_SNAPSHOT = "presence_snapshot"
+    const val PRESENCE_UPDATED = "presence_updated"
+    const val PRESENCE_OFFLINE = "presence_offline"
 }
 
 val signalingJson = Json {
     ignoreUnknownKeys = true
     encodeDefaults = true
+    explicitNulls = false
 }
 
 fun jsonPayload(vararg pairs: Pair<String, String>): JsonObject = buildJsonObject {

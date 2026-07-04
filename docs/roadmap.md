@@ -13,9 +13,11 @@
 - [x] Push-to-talk
 - [x] Foreground service
 - [x] CI GitHub
+- [ ] Connectivité local-first + fallback cloud (en cours)
 
 ## Post-MVP proche
 
+- Finaliser bascule local/cloud sur Galaxy réels
 - TURN serveur (coturn ou service managé)
 - VAD (Voice Activity Detection) sur même pipeline
 - Reconnexion WebRTC robuste

@@ -141,3 +141,33 @@ Le protocole de signaling identifie déjà `sessionId`, `senderId`, `recipientId
 ## Stockage et confidentialité
 
 Par défaut : aucun audio enregistré, aucun transit audio par le backend, aucune transcription.
+
+## Connectivité local-first (post-MVP cloud)
+
+```mermaid
+flowchart LR
+  A[Galaxy A] <-->|Local WebRTC| B[Galaxy B]
+  A <-->|Cloud control optional| CR[Cloud Run]
+  B <-->|Cloud control optional| CR
+  A -->|NSD or QR| LS[Local Ktor signaling on host]
+  B --> LS
+```
+
+Voir [connectivity-orchestration.md](connectivity-orchestration.md) et [local-signaling.md](local-signaling.md).
+
+- Préférence LAN stable ; fallback cloud transparent
+- Même session logique (`sessionId`, `participantId`) à travers les bascules
+- `ConnectivityOrchestrator` + `WebRtcConnectionSwitcher` + générations
+- Audio toujours via un seul pipeline WebRTC actif
+
+## UX post-login (écran principal)
+
+Après authentification Firebase, l'utilisateur arrive sur un **écran unique** :
+
+- Connexion signaling automatique (cloud + orchestrateur local en arrière-plan)
+- Liste d'équipiers avec email et icône de transport (Wifi = LAN, Cloud = internet, hors ligne = vu précédemment)
+- Tap sur un équipier → session pair déterministe (`hash(uidA, uidB)`) + WebRTC 1:1
+- Bouton PTT rouge (maintenir pour parler) ; toggle **Vox** désactive le PTT
+- Outils debug (QR, join manuel, diagnostics) : 7 taps sur le titre en build `DEBUG` uniquement
+
+Configurer l'URL Cloud Run via `SIGNALING_BASE_URL` dans `android/local.properties` (voir `local.properties.example`).

@@ -5,9 +5,19 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+import java.util.Properties
+
 if (file("google-services.json").exists()) {
     apply(plugin = "com.google.gms.google-services")
 }
+
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.inputStream().use { localProperties.load(it) }
+}
+val signalingBaseUrl = localProperties.getProperty("SIGNALING_BASE_URL")
+    ?: "https://voxcrew-signaling-PLACEHOLDER.run.app"
 
 android {
     namespace = "com.nblaisot.voxcrew"
@@ -20,7 +30,7 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
-        buildConfigField("String", "SIGNALING_BASE_URL", "\"https://voxcrew-signaling-PLACEHOLDER.run.app\"")
+        buildConfigField("String", "SIGNALING_BASE_URL", "\"$signalingBaseUrl\"")
         buildConfigField("String", "STUN_SERVER_URL", "\"stun:stun.l.google.com:19302\"")
     }
 
@@ -47,6 +57,7 @@ android {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
+    implementation("androidx.core:core-splashscreen:1.0.1")
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
@@ -56,12 +67,17 @@ dependencies {
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
+    implementation("androidx.compose.material:material-icons-extended")
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp)
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.auth.ktx)
     implementation(libs.stream.webrtc)
+    implementation(libs.ktor.server.core)
+    implementation(libs.ktor.server.cio)
+    implementation(libs.ktor.server.websockets)
+    implementation(libs.zxing.embedded)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)

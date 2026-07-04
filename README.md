@@ -4,24 +4,40 @@ Application Android privée de communication vocale de groupe pour activités ex
 
 ## Architecture (MVP)
 
-- **Audio** : WebRTC peer-to-peer direct entre participants (pas de transit audio par le backend).
-- **Backend** : Node.js / TypeScript / Fastify sur Google Cloud Run — signaling WebSocket, auth Firebase, sessions.
-- **Android** : Kotlin, Jetpack Compose, WebRTC natif, Firebase Authentication.
+- **Mode local (priorité)** : intercom LAN direct entre participants — découverte par broadcast UDP, audio brut (PCM) sur socket TCP. Aucun WebRTC, aucun signaling, aucun transit par le backend en local. Voir [Mode local (LAN intercom)](#mode-local-lan-intercom) ci-dessous.
+- **Mode cloud (parqué)** : WebRTC peer-to-peer avec signaling Cloud Run — code conservé dans le dépôt et accessible depuis les outils développeur, mais plus sur le chemin par défaut de l'écran principal.
+- **Backend** : Node.js / TypeScript / Fastify sur Google Cloud Run — signaling WebSocket, auth Firebase, sessions (utilisé par le mode cloud parqué).
+- **Android** : Kotlin, Jetpack Compose, Firebase Authentication, sockets TCP/UDP natifs pour le mode local, WebRTC natif pour le mode cloud.
 
 ```
+Galaxy A <== UDP beacon (découverte) + TCP audio PCM (LAN/hotspot) ==> Galaxy B
+
+Mode cloud parqué :
 Galaxy A <====== WebRTC audio ======> Galaxy B
      \                              /
       \---- WSS signaling (Cloud Run) ----/
 ```
+
+## Mode local (LAN intercom)
+
+Le mode local a été reconstruit autour d'un principe simple : **préserver la qualité et la complétude de l'audio avant la latence**, façon « téléchargement progressif ». Le détail est dans [android/app/src/main/java/com/nblaisot/voxcrew/lanlink/](android/app/src/main/java/com/nblaisot/voxcrew/lanlink/) :
+
+- **Découverte** : `LanBeacon` diffuse un identifiant (`uid`, nom, port TCP) en broadcast UDP (port `47100`) toutes les 2 s, et écoute les mêmes annonces. Fonctionne aussi bien entre deux appareils sur le même Wi-Fi qu'en hotspot (l'appareil hotspot et l'appareil connecté partagent le même domaine de broadcast).
+- **Transport** : `LanAudioLink` établit une socket TCP unique entre les deux appareils (fiable, ordonnée nativement — pas besoin de ré-implémenter l'ordre ou la retransmission). Le rôle client/serveur est déterministe (l'`uid` le plus petit compose) pour éviter toute collision de connexion.
+- **Reprise après coupure** : chaque trame audio porte un `seq` croissant ; l'émetteur garde les trames non confirmées dans un `SendBuffer` (~2 min, ring buffer) ; à la reconnexion, chaque côté annonce le dernier `seq` reçu et l'autre rejoue exactement le manque — aucun audio perdu, seulement retardé.
+- **Audio** : PCM 16 bits mono 16 kHz brut par trames de 20 ms (`AudioCapture`/`AudioPlayback`), routé sur le flux **multimédia** (haut-parleur par défaut, bascule automatique vers écouteurs/Bluetooth s'ils sont branchés) plutôt que le flux d'appel.
+- **Arrière-plan** : `LanIntercomEngine` vit dans `AppContainer` (portée application), piloté par un `SessionForegroundService` permanent dès la connexion — la réception audio et l'émission VOX continuent écran éteint ou app en arrière-plan ; la notification affiche l'état VOX (actif/désactivé) et le statut de la liaison locale.
+- **Roster** : les équipiers détectés en LAN apparaissent directement (icône Wifi) dès réception de leur beacon, indépendamment du cloud.
 
 ## État actuel
 
 | Composant | Statut |
 |-----------|--------|
 | Documentation | En place |
-| Backend signaling | Scaffold local + tests |
+| Backend signaling | Scaffold local + tests (mode cloud parqué) |
 | Terraform / GCP | Configuration prête, déploiement manuel |
-| Android | Compose, auth, signaling, WebRTC, audio, PTT, foreground service |
+| Android — mode local | Intercom LAN (UDP beacon + TCP audio), reprise sur coupure, service permanent, PTT/Vox |
+| Android — mode cloud | Compose, auth, signaling, WebRTC (parqué, accessible via outils développeur) |
 | CI GitHub | Workflows backend, Android, Terraform |
 
 ## Prérequis
