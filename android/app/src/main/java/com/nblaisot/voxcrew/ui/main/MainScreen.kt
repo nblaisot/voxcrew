@@ -36,6 +36,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -161,6 +162,9 @@ fun MainScreen(
                     CrewMemberRow(
                         member = member,
                         isReceivingAudio = state.receivingAudioFromUid == member.uid,
+                        rttMs = state.selectedPeerRttMs.takeIf { member.uid == state.selectedPeerUid },
+                        pathLabel = state.selectedPeerPathLabel.takeIf { member.uid == state.selectedPeerUid },
+                        backlogMs = state.selectedPeerBacklogMs.takeIf { member.uid == state.selectedPeerUid },
                         onClick = { viewModel.selectCrewMember(member) },
                     )
                 }
@@ -233,6 +237,9 @@ fun MainScreen(
 private fun CrewMemberRow(
     member: CrewMember,
     isReceivingAudio: Boolean,
+    rttMs: Long?,
+    pathLabel: String?,
+    backlogMs: Long?,
     onClick: () -> Unit,
 ) {
     val bg = when {
@@ -262,23 +269,62 @@ private fun CrewMemberRow(
                 .background(bg)
                 .padding(16.dp),
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                AvailabilityIcon(member.availability)
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = member.email,
-                        style = MaterialTheme.typography.bodyLarge,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+            Column {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    AvailabilityIcon(member.availability)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (rttMs != null) "${member.email} (${rttMs} ms)" else member.email,
+                            style = MaterialTheme.typography.bodyLarge,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        if (pathLabel != null) {
+                            Text(
+                                text = pathLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+                if (backlogMs != null) {
+                    BacklogGauge(backlogMs = backlogMs, modifier = Modifier.padding(top = 8.dp))
                 }
             }
         }
     }
 }
+
+/**
+ * Fills proportionally to audio time buffered on the sender because the peer hasn't
+ * acknowledged it yet (see [com.nblaisot.voxcrew.lanlink.PeerLink.backlogMs]) — nothing
+ * is ever dropped, so this is a queue depth, not a loss indicator. Caps its visual fill
+ * at [BACKLOG_GAUGE_MAX_MS] (10 s); the underlying buffer keeps growing well past that.
+ */
+@Composable
+private fun BacklogGauge(backlogMs: Long, modifier: Modifier = Modifier) {
+    val fraction = (backlogMs.toFloat() / BACKLOG_GAUGE_MAX_MS).coerceIn(0f, 1f)
+    val color = when {
+        fraction >= 0.7f -> MaterialTheme.colorScheme.error
+        fraction >= 0.3f -> VoxOrangeLight
+        else -> MaterialTheme.colorScheme.primary
+    }
+    LinearProgressIndicator(
+        progress = { fraction },
+        modifier = modifier
+            .fillMaxWidth()
+            .height(6.dp)
+            .clip(RoundedCornerShape(3.dp)),
+        color = color,
+        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+    )
+}
+
+private const val BACKLOG_GAUGE_MAX_MS = 10_000f
 
 @Composable
 private fun audioShimmerBrush(): Brush {

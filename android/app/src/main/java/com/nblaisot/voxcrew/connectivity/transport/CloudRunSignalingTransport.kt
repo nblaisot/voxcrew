@@ -3,6 +3,7 @@ package com.nblaisot.voxcrew.connectivity.transport
 import com.nblaisot.voxcrew.auth.AuthRepository
 import com.nblaisot.voxcrew.connectivity.model.GenerationId
 import com.nblaisot.voxcrew.connectivity.model.SessionDescriptor
+import com.nblaisot.voxcrew.lanlink.BinaryRelayChannel
 import com.nblaisot.voxcrew.signaling.ConnectionState
 import com.nblaisot.voxcrew.signaling.SignalingEnvelope
 import com.nblaisot.voxcrew.signaling.SignalingMessageTypes
@@ -30,6 +31,8 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.Buffer
+import okio.ByteString
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
@@ -43,7 +46,7 @@ class CloudRunSignalingTransport(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build(),
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
-) : SignalingTransport {
+) : SignalingTransport, BinaryRelayChannel {
     override val kind = SignalingTransportKind.CLOUD
     override val sharesIntercomSignaling: Boolean = true
 
@@ -54,6 +57,14 @@ class CloudRunSignalingTransport(
 
     private val _incoming = MutableSharedFlow<SignalingEnvelope>(extraBufferCapacity = 64)
     override val incomingMessages: SharedFlow<SignalingEnvelope> = _incoming.asSharedFlow()
+
+    /**
+     * Opaque binary WebSocket frames (the cloud relay path for [com.nblaisot.voxcrew.lanlink.PeerLink]).
+     * The backend forwards these uid-to-uid without parsing or storing them; see
+     * `backend/src/ws/handler.ts` `onBinaryMessage`.
+     */
+    private val _incomingBinary = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
+    override val incomingBinary: SharedFlow<ByteArray> = _incomingBinary.asSharedFlow()
 
     private var webSocket: WebSocket? = null
     private var reconnectJob: Job? = null
@@ -68,6 +79,8 @@ class CloudRunSignalingTransport(
         reconnectAttempt = 0
         openSocket()
     }
+
+    override fun connect() = connectCloud()
 
     override suspend fun connect(session: SessionDescriptor, generation: GenerationId) {
         activeGeneration = generation
@@ -103,6 +116,17 @@ class CloudRunSignalingTransport(
         }
     }
 
+    /**
+     * Best-effort binary send for the relay path: no queueing/blocking, since audio frames
+     * are already buffered upstream in [com.nblaisot.voxcrew.lanlink.SendBuffer] and replayed
+     * once the socket (or a better path) is available again.
+     */
+    override fun sendBinary(bytes: ByteArray) {
+        val ws = webSocket
+        if (ws == null || !socketOpen) return
+        ws.send(Buffer().write(bytes).readByteString())
+    }
+
     private suspend fun awaitWritableSocket(): WebSocket {
         val deadline = System.currentTimeMillis() + 15_000
         while (System.currentTimeMillis() < deadline) {
@@ -135,6 +159,11 @@ class CloudRunSignalingTransport(
             override fun onMessage(ws: WebSocket, text: String) {
                 if (webSocket !== ws) return
                 scope.launch { handleMessage(text) }
+            }
+
+            override fun onMessage(ws: WebSocket, bytes: ByteString) {
+                if (webSocket !== ws) return
+                _incomingBinary.tryEmit(bytes.toByteArray())
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {

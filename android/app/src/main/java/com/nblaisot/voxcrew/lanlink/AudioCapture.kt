@@ -13,10 +13,11 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Captures raw PCM from the microphone in 20 ms frames while transmission is active,
- * and hands each frame to [onFrame]. Recording starts/stops with the transmission
- * policy (PTT press/release, or VOX speech detection) rather than running
- * continuously, per the "no recording by default" principle.
+ * Captures the microphone in 20 ms frames while transmission is active, encodes each
+ * frame with Opus (see [OpusCodec]) and hands the encoded payload to [onFrame].
+ * Recording starts/stops with the transmission policy (PTT press/release, or VOX
+ * speech detection) rather than running continuously, per the "no recording by
+ * default" principle.
  */
 class AudioCapture(private val scope: CoroutineScope) {
     private var policyJob: Job? = null
@@ -72,13 +73,21 @@ class AudioCapture(private val scope: CoroutineScope) {
             recorder.release()
             return
         }
+        val encoder = OpusCodec.Encoder()
         try {
             recorder.startRecording()
             val frame = ByteArray(frameBytes)
             while (currentCoroutineContext().isActive) {
                 val read = recorder.read(frame, 0, frame.size)
-                if (read > 0) {
-                    onFrame(if (read == frame.size) frame.copyOf() else frame.copyOf(read))
+                if (read == frame.size) {
+                    val encoded = runCatching { encoder.encode(frame) }
+                        .onFailure { Log.w(TAG, "Opus encode failed: ${it.message}") }
+                        .getOrNull()
+                    if (encoded != null) onFrame(encoded)
+                } else if (read > 0) {
+                    // A short read means a malformed Opus frame (fixed frame size); drop it
+                    // rather than desync the encoder — only expected transiently at start/stop.
+                    Log.d(TAG, "dropping short read ($read/$frameBytes bytes)")
                 }
             }
         } finally {

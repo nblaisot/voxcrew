@@ -78,8 +78,10 @@ dependencies {
     implementation(libs.ktor.server.cio)
     implementation(libs.ktor.server.websockets)
     implementation(libs.zxing.embedded)
+    implementation(libs.concentus)
 
     testImplementation(libs.junit)
+    testImplementation(libs.concentus)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.mockk)
     testImplementation(libs.turbine)

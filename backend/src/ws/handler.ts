@@ -9,6 +9,7 @@ import {
   createSessionPayloadSchema,
   icePayloadSchema,
   joinSessionPayloadSchema,
+  p2pEndpointsPayloadSchema,
   pingPayloadSchema,
   presenceHeartbeatPayloadSchema,
   presenceRegisterPayloadSchema,
@@ -27,6 +28,16 @@ const MAX_MISSED_PONGS = 2;
 const REPLACED_SOCKET_CODE = 4002;
 const SESSION_DISCONNECT_GRACE_MS = 15_000;
 
+/**
+ * Binary relay frames (opaque audio, forwarded uid-to-uid, never parsed or
+ * stored) are budgeted separately from the JSON rate limit above: Opus at
+ * ~24 kbps is ~3 KB/s steady state, but a backlog replay after a reconnect
+ * can legitimately burst well above that for a few seconds. The limit here
+ * is a defensive backstop against a misbehaving client, not the normal path.
+ */
+const MAX_RELAY_BYTES_PER_SECOND = 64 * 1024;
+const MAX_RELAY_FRAME_BYTES = 4 * 1024;
+
 interface ClientState {
   socket: WebSocket;
   uid?: string;
@@ -36,6 +47,8 @@ interface ClientState {
   windowStart: number;
   missedPongs: number;
   pingTimer?: ReturnType<typeof setInterval>;
+  relayBytesInWindow: number;
+  relayWindowStart: number;
 }
 
 export interface WsHandlerDeps {
@@ -59,6 +72,8 @@ export class WsConnectionHandler {
       messageCount: 0,
       windowStart: Date.now(),
       missedPongs: 0,
+      relayBytesInWindow: 0,
+      relayWindowStart: Date.now(),
     };
     this.clients.set(socket, state);
     this.startPingLoop(socket, state);
@@ -73,7 +88,11 @@ export class WsConnectionHandler {
       }
     }, AUTH_TIMEOUT_MS);
 
-    socket.on("message", (raw) => {
+    socket.on("message", (raw, isBinary) => {
+      if (isBinary) {
+        this.onBinaryMessage(state, raw as Buffer);
+        return;
+      }
       void this.onMessage(socket, state, raw, () => clearTimeout(authTimer));
     });
 
@@ -175,6 +194,12 @@ export class WsConnectionHandler {
         break;
       case "presence_heartbeat":
         this.handlePresenceHeartbeat(socket, state, message);
+        break;
+      case "p2p_connect_request":
+        this.handleP2pConnectRequest(socket, state, message);
+        break;
+      case "p2p_endpoints":
+        this.handleP2pEndpoints(socket, state, message);
         break;
       default:
         this.sendError(socket, state, "INVALID_MESSAGE", `Unsupported type: ${message.type}`, message.requestId);
@@ -398,6 +423,77 @@ export class WsConnectionHandler {
       online: true,
       lastSeenMs: Date.now(),
     }, { senderId: state.uid }));
+  }
+
+  /**
+   * Rendezvous request: "try to reach me over the internet" with no payload
+   * beyond who to notify. Forwarded uid-to-uid; requires no active session,
+   * since LAN peers never create one — presence is enough to reach them here.
+   */
+  private handleP2pConnectRequest(socket: WebSocket, state: ClientState, message: ClientMessage): void {
+    if (!state.uid || !message.recipientId) {
+      this.sendError(socket, state, "INVALID_MESSAGE", "recipientId required", message.requestId);
+      return;
+    }
+    const delivered = this.sendToUid(message.recipientId, buildServerMessage("p2p_connect_request", {}, {
+      requestId: message.requestId,
+      senderId: state.uid,
+      recipientId: message.recipientId,
+    }));
+    if (!delivered) {
+      this.sendError(socket, state, "RECIPIENT_OFFLINE", "Recipient not connected", message.requestId);
+    }
+  }
+
+  private handleP2pEndpoints(socket: WebSocket, state: ClientState, message: ClientMessage): void {
+    if (!state.uid || !message.recipientId) {
+      this.sendError(socket, state, "INVALID_MESSAGE", "recipientId required", message.requestId);
+      return;
+    }
+    const payload = p2pEndpointsPayloadSchema.safeParse(message.payload);
+    if (!payload.success) {
+      this.sendError(socket, state, "INVALID_MESSAGE", "Invalid p2p_endpoints payload", message.requestId);
+      return;
+    }
+    const delivered = this.sendToUid(message.recipientId, buildServerMessage("p2p_endpoints", payload.data, {
+      requestId: message.requestId,
+      senderId: state.uid,
+      recipientId: message.recipientId,
+    }));
+    if (!delivered) {
+      this.sendError(socket, state, "RECIPIENT_OFFLINE", "Recipient not connected", message.requestId);
+    }
+  }
+
+  /**
+   * Last-resort relay for the intercom audio path: opaque bytes forwarded
+   * uid-to-uid, wire format `[recipientUidLen:1][recipientUid][payload]`.
+   * Never parsed, logged, or stored — the server cannot see inside a frame.
+   */
+  private onBinaryMessage(state: ClientState, data: Buffer): void {
+    if (!state.authenticated || !state.uid) return;
+    if (data.length < 2) return;
+
+    const recipientLen = data.readUInt8(0);
+    if (data.length < 1 + recipientLen) return;
+    const recipientId = data.toString("utf8", 1, 1 + recipientLen);
+    const payloadLength = data.length - 1 - recipientLen;
+    if (payloadLength <= 0 || payloadLength > MAX_RELAY_FRAME_BYTES) return;
+
+    const now = Date.now();
+    if (now - state.relayWindowStart > 1_000) {
+      state.relayWindowStart = now;
+      state.relayBytesInWindow = 0;
+    }
+    state.relayBytesInWindow += data.length;
+    if (state.relayBytesInWindow > MAX_RELAY_BYTES_PER_SECOND) {
+      this.deps.logger.warn({ uid: truncateUid(state.uid) }, "relay byte-rate limit exceeded, dropping frame");
+      return;
+    }
+
+    const recipientSocket = this.uidToSocket.get(recipientId);
+    if (!recipientSocket || recipientSocket.readyState !== 1) return;
+    recipientSocket.send(data, { binary: true });
   }
 
   private buildPresenceSnapshot(): Envelope {

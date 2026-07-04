@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.nblaisot.voxcrew.auth.AuthRepository
 import com.nblaisot.voxcrew.lanlink.LanIntercomEngine
+import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.roster.CrewMember
 import com.nblaisot.voxcrew.roster.CrewRosterRepository
 import com.nblaisot.voxcrew.service.SessionForegroundService
@@ -24,6 +25,9 @@ data class MainUiState(
     val crew: List<CrewMember> = emptyList(),
     val selectedPeerUid: String? = null,
     val receivingAudioFromUid: String? = null,
+    val selectedPeerRttMs: Long? = null,
+    val selectedPeerPathLabel: String? = null,
+    val selectedPeerBacklogMs: Long = 0L,
     val voxEnabled: Boolean = false,
     val isTransmitting: Boolean = false,
     val pttEnabled: Boolean = true,
@@ -73,6 +77,26 @@ class MainViewModel(
         viewModelScope.launch {
             lanEngine.statusText.collect { status -> _uiState.update { it.copy(statusMessage = status) } }
         }
+        viewModelScope.launch {
+            // Source of truth for the standing target is the engine (it persists and
+            // restores it across launches); mirror it into the roster and UI state here.
+            lanEngine.selectedPeerUid.collect { uid ->
+                rosterRepository.select(uid)
+                _uiState.update { it.copy(selectedPeerUid = uid) }
+            }
+        }
+        viewModelScope.launch {
+            lanEngine.rttMs.collect { rtt -> _uiState.update { it.copy(selectedPeerRttMs = rtt) } }
+        }
+        viewModelScope.launch {
+            lanEngine.backlogMs.collect { backlog -> _uiState.update { it.copy(selectedPeerBacklogMs = backlog) } }
+        }
+        viewModelScope.launch {
+            lanEngine.linkState.collect { link ->
+                val label = (link as? PeerLink.LinkState.Connected)?.via
+                _uiState.update { it.copy(selectedPeerPathLabel = label) }
+            }
+        }
         startIntercom()
     }
 
@@ -99,8 +123,7 @@ class MainViewModel(
 
     fun selectCrewMember(member: CrewMember) {
         if (member.isSelf) return
-        rosterRepository.select(member.uid)
-        _uiState.update { it.copy(selectedPeerUid = member.uid) }
+        // Roster selection and ui state follow reactively from lanEngine.selectedPeerUid.
         lanEngine.selectPeer(member.uid)
     }
 

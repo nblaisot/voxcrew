@@ -75,6 +75,7 @@ class AppContainer(context: Context) {
     val lanIntercomEngine = LanIntercomEngine(
         context = appContext,
         scope = scope,
+        cloudTransport = cloudTransport,
     )
 
     val rosterRepository = CrewRosterRepository(

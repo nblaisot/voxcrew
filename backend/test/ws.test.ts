@@ -197,6 +197,80 @@ describe("WebSocket signaling", () => {
     wsA.close();
   });
 
+  it("forwards p2p_connect_request and p2p_endpoints uid-to-uid without a session", async () => {
+    const wsA = new WebSocket(baseUrl);
+    const wsB = new WebSocket(baseUrl);
+    await Promise.all([
+      new Promise<void>((r) => wsA.on("open", () => r())),
+      new Promise<void>((r) => wsB.on("open", () => r())),
+    ]);
+    send(wsA, "authenticate", { token: "token-user-a" });
+    send(wsB, "authenticate", { token: "token-user-b" });
+    await waitForMessage(wsA, "authenticated");
+    await waitForMessage(wsB, "authenticated");
+
+    const connectRequestPromise = waitForMessage(wsB, "p2p_connect_request");
+    send(wsA, "p2p_connect_request", {}, { recipientId: "user-b" });
+    const connectRequest = await connectRequestPromise;
+    expect(connectRequest.senderId).toBe("user-a");
+
+    const endpointsPromise = waitForMessage(wsA, "p2p_endpoints");
+    send(wsB, "p2p_endpoints", {
+      publicHost: "203.0.113.5",
+      publicPort: 40000,
+      localHost: "192.168.1.10",
+      localPort: 50000,
+    }, { recipientId: "user-a" });
+    const endpoints = await endpointsPromise;
+    expect(endpoints.senderId).toBe("user-b");
+    expect(endpoints.payload.publicPort).toBe(40000);
+
+    wsA.close();
+    wsB.close();
+  });
+
+  it("errors p2p_connect_request when the recipient is not connected", async () => {
+    const wsA = new WebSocket(baseUrl);
+    await new Promise<void>((r) => wsA.on("open", () => r()));
+    send(wsA, "authenticate", { token: "token-user-a" });
+    await waitForMessage(wsA, "authenticated");
+
+    send(wsA, "p2p_connect_request", {}, { recipientId: "user-b" });
+    const err = await waitForMessage(wsA, "error");
+    expect(err.payload.code).toBe("RECIPIENT_OFFLINE");
+    wsA.close();
+  });
+
+  it("relays opaque binary frames uid-to-uid without touching JSON rate limit", async () => {
+    const wsA = new WebSocket(baseUrl);
+    const wsB = new WebSocket(baseUrl);
+    await Promise.all([
+      new Promise<void>((r) => wsA.on("open", () => r())),
+      new Promise<void>((r) => wsB.on("open", () => r())),
+    ]);
+    send(wsA, "authenticate", { token: "token-user-a" });
+    send(wsB, "authenticate", { token: "token-user-b" });
+    await waitForMessage(wsA, "authenticated");
+    await waitForMessage(wsB, "authenticated");
+
+    const recipientId = Buffer.from("user-b", "utf8");
+    const payload = Buffer.from([1, 2, 3, 4, 5]);
+    const frame = Buffer.concat([Buffer.from([recipientId.length]), recipientId, payload]);
+
+    const received = new Promise<Buffer>((resolve) => {
+      wsB.once("message", (data, isBinary) => {
+        expect(isBinary).toBe(true);
+        resolve(data as Buffer);
+      });
+    });
+    wsA.send(frame);
+    const relayed = await received;
+    expect(relayed.subarray(1 + recipientId.length).equals(payload)).toBe(true);
+
+    wsA.close();
+    wsB.close();
+  });
+
   it("replaces duplicate uid socket without ejecting rejoined session", async () => {
     const wsA1 = new WebSocket(baseUrl);
     const wsA2 = new WebSocket(baseUrl);

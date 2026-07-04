@@ -18,6 +18,7 @@ mockk = "1.13.13"
 turbine = "1.2.0"
 ktor = "2.3.13"
 zxing = "4.3.0"
+concentus = "1.0.2"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -47,6 +48,7 @@ ktor-server-core = { group = "io.ktor", name = "ktor-server-core", version.ref =
 ktor-server-cio = { group = "io.ktor", name = "ktor-server-cio", version.ref = "ktor" }
 ktor-server-websockets = { group = "io.ktor", name = "ktor-server-websockets", version.ref = "ktor" }
 zxing-embedded = { group = "com.journeyapps", name = "zxing-android-embedded", version.ref = "zxing" }
+concentus = { group = "io.github.jaredmdobson", name = "concentus", version.ref = "concentus" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

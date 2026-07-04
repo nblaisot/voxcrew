@@ -32,10 +32,10 @@ class LanProtocolTest {
     @Test
     fun `audio frame round trips with pcm payload preserved exactly`() {
         val pcm = ByteArray(640) { (it % 256).toByte() }
-        val frame = LanFrame.Audio(seq = 7L, pcm = pcm)
+        val frame = LanFrame.Audio(seq = 7L, payload = pcm)
         val decoded = roundTrip(frame) as LanFrame.Audio
         assertEquals(7L, decoded.seq)
-        assertArrayEquals(pcm, decoded.pcm)
+        assertArrayEquals(pcm, decoded.payload)
     }
 
     @Test
@@ -70,11 +70,25 @@ class LanProtocolTest {
         assertEquals(frames[0], decoded[0])
         val audio0 = decoded[1] as LanFrame.Audio
         assertEquals(0L, audio0.seq)
-        assertArrayEquals(byteArrayOf(1, 2, 3), audio0.pcm)
+        assertArrayEquals(byteArrayOf(1, 2, 3), audio0.payload)
         val audio1 = decoded[2] as LanFrame.Audio
         assertEquals(1L, audio1.seq)
-        assertArrayEquals(byteArrayOf(4, 5, 6), audio1.pcm)
+        assertArrayEquals(byteArrayOf(4, 5, 6), audio1.payload)
         assertEquals(frames[3], decoded[3])
+    }
+
+    @Test
+    fun `encodeFrame and decodeFrame round trip for datagram transports`() {
+        val frame = LanFrame.Audio(seq = 3L, payload = byteArrayOf(9, 8, 7))
+        val bytes = LanProtocol.encodeFrame(frame)
+        val decoded = LanProtocol.decodeFrame(bytes) as LanFrame.Audio
+        assertEquals(3L, decoded.seq)
+        assertArrayEquals(byteArrayOf(9, 8, 7), decoded.payload)
+    }
+
+    @Test
+    fun `decodeFrame returns null for empty bytes`() {
+        assertNull(LanProtocol.decodeFrame(ByteArray(0)))
     }
 
     @Test

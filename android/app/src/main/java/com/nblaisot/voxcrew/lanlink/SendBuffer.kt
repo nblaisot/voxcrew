@@ -8,7 +8,7 @@ package com.nblaisot.voxcrew.lanlink
  * so no audio is lost, only delayed.
  */
 class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
-    data class Entry(val seq: Long, val data: ByteArray)
+    data class Entry(val seq: Long, val data: ByteArray, val enqueuedAtMs: Long = System.currentTimeMillis())
 
     private val frames = ArrayDeque<Entry>()
     private var totalBytes = 0L
@@ -21,6 +21,10 @@ class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
             totalBytes -= frames.removeFirst().data.size
         }
     }
+
+    /** Age of the oldest still-unacknowledged frame, or null if the buffer is empty. */
+    @Synchronized
+    fun oldestEnqueuedAtMs(): Long? = frames.firstOrNull()?.enqueuedAtMs
 
     /** Drops all frames the peer has confirmed receiving (seq <= ackedSeq). */
     @Synchronized

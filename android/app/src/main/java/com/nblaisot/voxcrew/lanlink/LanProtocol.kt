@@ -13,7 +13,9 @@ import java.io.IOException
  */
 sealed class LanFrame {
     data class Hello(val uid: String, val lastContiguousSeq: Long) : LanFrame()
-    data class Audio(val seq: Long, val pcm: ByteArray) : LanFrame()
+
+    /** [payload] is codec-encoded audio (Opus), not raw PCM — see [AudioCapture]/[AudioPlayback]. */
+    data class Audio(val seq: Long, val payload: ByteArray) : LanFrame()
     data class Ack(val lastContiguousSeq: Long) : LanFrame()
     data class Ping(val timestampMs: Long) : LanFrame()
     data class Pong(val timestampMs: Long) : LanFrame()
@@ -36,6 +38,22 @@ object LanProtocol {
         out.writeInt(payload.size)
         out.write(payload)
         out.flush()
+    }
+
+    /** Datagram-oriented encoding (one frame = one UDP packet / WS binary message payload). */
+    fun encodeFrame(frame: LanFrame): ByteArray {
+        val payload = encodePayload(frame)
+        val buffer = java.io.ByteArrayOutputStream(1 + payload.size)
+        buffer.write(typeOf(frame))
+        buffer.write(payload)
+        return buffer.toByteArray()
+    }
+
+    /** Counterpart to [encodeFrame]. Returns null if [bytes] is too short to be a valid frame. */
+    fun decodeFrame(bytes: ByteArray): LanFrame? {
+        if (bytes.isEmpty()) return null
+        val type = bytes[0].toInt() and 0xFF
+        return runCatching { decodePayload(type, bytes.copyOfRange(1, bytes.size)) }.getOrNull()
     }
 
     /** Returns null on clean stream end (EOF before any byte of the next frame). */
@@ -73,7 +91,7 @@ object LanProtocol {
             }
             is LanFrame.Audio -> {
                 data.writeLong(frame.seq)
-                data.write(frame.pcm)
+                data.write(frame.payload)
             }
             is LanFrame.Ack -> data.writeLong(frame.lastContiguousSeq)
             is LanFrame.Ping -> data.writeLong(frame.timestampMs)

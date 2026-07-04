@@ -24,6 +24,8 @@ export const messageTypeSchema = z.enum([
   "presence_snapshot",
   "presence_updated",
   "presence_offline",
+  "p2p_connect_request",
+  "p2p_endpoints",
 ]);
 
 export type MessageType = z.infer<typeof messageTypeSchema>;
@@ -85,6 +87,17 @@ export const presenceRegisterPayloadSchema = z.object({
 
 export const presenceHeartbeatPayloadSchema = z.object({
   transportHint: z.enum(["local_lan", "cloud", "none"]),
+});
+
+/**
+ * Rendezvous messages for the direct (UDP hole-punched) cloud fallback path.
+ * The server only forwards these uid-to-uid; it never sees or stores audio.
+ */
+export const p2pEndpointsPayloadSchema = z.object({
+  publicHost: z.string().min(1).max(64),
+  publicPort: z.number().int().min(1).max(65535),
+  localHost: z.string().min(1).max(64).optional(),
+  localPort: z.number().int().min(1).max(65535).optional(),
 });
 
 

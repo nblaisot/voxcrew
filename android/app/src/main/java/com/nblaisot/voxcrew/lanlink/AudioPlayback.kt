@@ -13,19 +13,24 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Plays back inbound PCM frames in the order they are received. Frames only ever
- * arrive in order and deduplicated (guaranteed by [LanAudioLink]/TCP), so playback is
- * a straight streaming write — no jitter buffer needed, backlog after a resume just
+ * Plays back inbound Opus frames in the order they are received, decoding each with
+ * [OpusCodec] before writing PCM to the track. Frames only ever arrive in order and
+ * deduplicated (guaranteed by [PeerLink] regardless of transport), so playback is a
+ * straight streaming write — no jitter buffer needed, backlog after a resume just
  * plays back a little behind live, which is the intended trade-off.
  */
 class AudioPlayback(private val scope: CoroutineScope) {
     private var track: AudioTrack? = null
     private var idleJob: Job? = null
+    private val decoder = OpusCodec.Decoder()
 
     private val _isReceiving = MutableStateFlow(false)
     val isReceiving: StateFlow<Boolean> = _isReceiving.asStateFlow()
 
-    fun play(pcm: ByteArray) {
+    fun play(payload: ByteArray) {
+        val pcm = runCatching { decoder.decode(payload) }
+            .onFailure { Log.w(TAG, "Opus decode failed: ${it.message}") }
+            .getOrNull() ?: return
         val activeTrack = ensureTrack() ?: return
         activeTrack.write(pcm, 0, pcm.size)
         _isReceiving.value = true
