@@ -4,11 +4,13 @@ import android.content.Context
 import com.nblaisot.voxcrew.audio.PushToTalkTransmissionPolicy
 import com.nblaisot.voxcrew.audio.SileroVoiceDetector
 import com.nblaisot.voxcrew.audio.TransmissionPolicy
+import com.nblaisot.voxcrew.audio.UiFeedbackPlayer
 import com.nblaisot.voxcrew.audio.VoiceActivatedTransmissionPolicy
 import com.nblaisot.voxcrew.audio.VoxGate
 import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.connectivity.NetworkMonitor
 import com.nblaisot.voxcrew.connectivity.transport.CloudRunSignalingTransport
+import com.nblaisot.voxcrew.signaling.SignalingClient
 import com.nblaisot.voxcrew.signaling.SignalingEnvelope
 import com.nblaisot.voxcrew.signaling.SignalingMessageTypes
 import kotlinx.coroutines.CoroutineScope
@@ -27,6 +29,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.Inet4Address
@@ -42,6 +45,7 @@ class LanIntercomEngine(
     context: Context,
     private val scope: CoroutineScope,
     private val cloudTransport: CloudRunSignalingTransport,
+    private val signalingClient: SignalingClient? = null,
     private val networkMonitor: NetworkMonitor = NetworkMonitor(context),
 ) {
     private val appContext = context.applicationContext
@@ -52,9 +56,11 @@ class LanIntercomEngine(
     private val sharedUdp = SharedUdpSocket()
     private val capture = AudioCapture(scope)
     private val playback = AudioPlayback(scope)
+    private val uiFeedback = UiFeedbackPlayer(scope)
 
     private val connections = ConcurrentHashMap<String, PeerConnection>()
     private val audioCollectJobs = ConcurrentHashMap<String, Job>()
+    private val feedbackWatchJobs = ConcurrentHashMap<String, Job>()
     private val receivingUntilMs = ConcurrentHashMap<String, Long>()
 
     private val pttPolicy = PushToTalkTransmissionPolicy()
@@ -130,6 +136,11 @@ class LanIntercomEngine(
         }
         scope.launch {
             cloudTransport.incomingMessages.collect { handleCloudMessage(it) }
+        }
+        signalingClient?.let { client ->
+            scope.launch {
+                client.peerOffline.collect { uid -> connections[uid]?.onPeerPresenceLost() }
+            }
         }
         scope.launch {
             networkMonitor.networkChanged.collect { onNetworkChanged() }
@@ -225,6 +236,7 @@ class LanIntercomEngine(
                 localIpv4Provider = ::localIpv4Address,
             )
             startAudioCollection(conn)
+            startConnectionFeedback(conn)
             conn
         }
     }
@@ -244,9 +256,30 @@ class LanIntercomEngine(
 
     private fun removeConnection(peerUid: String) {
         audioCollectJobs.remove(peerUid)?.cancel()
+        feedbackWatchJobs.remove(peerUid)?.cancel()
         connections.remove(peerUid)?.stop()
         receivingUntilMs.remove(peerUid)
         refreshReceivingUids()
+    }
+
+    private fun startConnectionFeedback(conn: PeerConnection) {
+        if (feedbackWatchJobs.containsKey(conn.peerUid)) return
+        feedbackWatchJobs[conn.peerUid] = scope.launch(Dispatchers.Default) {
+            var previous = conn.linkState.value
+            conn.linkState.collect { state ->
+                if (state == previous) return@collect
+                val activeRecipients = _activeRecipientUids.value
+                if (conn.peerUid in activeRecipients) {
+                    when {
+                        previous !is PeerLink.LinkState.Connected && state is PeerLink.LinkState.Connected ->
+                            uiFeedback.playConnected()
+                        previous is PeerLink.LinkState.Connected && state is PeerLink.LinkState.Disconnected ->
+                            uiFeedback.playDisconnected()
+                    }
+                }
+                previous = state
+            }
+        }
     }
 
     private fun startAudioCollection(conn: PeerConnection) {
@@ -277,6 +310,12 @@ class LanIntercomEngine(
     }
 
     private fun updateLanTargets(peerList: List<LanPeer>) {
+        val visibleUids = peerList.map { it.uid }.toSet()
+        connections.keys.forEach { uid ->
+            if (uid != localUid && uid !in visibleUids) {
+                connections[uid]?.onLanPeerAbsent()
+            }
+        }
         peerList.forEach { peer ->
             if (peer.uid == localUid) return@forEach
             val conn = ensureConnection(peer.uid)
@@ -316,6 +355,10 @@ class LanIntercomEngine(
 
     private fun handleCloudMessage(envelope: SignalingEnvelope) {
         when (envelope.type) {
+            SignalingMessageTypes.RELAY_UNAVAILABLE -> {
+                val recipientId = envelope.payload["recipientId"]?.jsonPrimitive?.content ?: return
+                connections[recipientId]?.onPeerPresenceLost()
+            }
             SignalingMessageTypes.P2P_CONNECT_REQUEST,
             SignalingMessageTypes.P2P_ENDPOINTS,
             -> {

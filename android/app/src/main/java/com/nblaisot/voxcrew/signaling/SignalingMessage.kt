@@ -40,6 +40,7 @@ object SignalingMessageTypes {
     const val PRESENCE_OFFLINE = "presence_offline"
     const val P2P_CONNECT_REQUEST = "p2p_connect_request"
     const val P2P_ENDPOINTS = "p2p_endpoints"
+    const val RELAY_UNAVAILABLE = "relay_unavailable"
 }
 
 val signalingJson = Json {

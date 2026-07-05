@@ -51,6 +51,9 @@ class PeerLink(private val scope: CoroutineScope) {
     private val _backlogMs = MutableStateFlow(0L)
     val backlogMs: StateFlow<Long> = _backlogMs.asStateFlow()
 
+    private val _bufferExpired = MutableSharedFlow<Int>(extraBufferCapacity = 8)
+    val bufferExpired: SharedFlow<Int> = _bufferExpired.asSharedFlow()
+
     private var currentPeerUid: String? = null
     private var activeTransport: FrameTransport? = null
     private var healthLoopJob: Job? = null
@@ -60,6 +63,7 @@ class PeerLink(private val scope: CoroutineScope) {
     @Volatile private var lastContiguousInSeq = -1L
     @Volatile private var lastActivityMs = System.currentTimeMillis()
     @Volatile private var lastPingSentMs = 0L
+    @Volatile private var awaitingPongSinceMs: Long? = null
 
     val selectedPeerUid: String? get() = currentPeerUid
 
@@ -88,6 +92,8 @@ class PeerLink(private val scope: CoroutineScope) {
         outSeq = 0
         lastContiguousInSeq = -1
         lastActivityMs = System.currentTimeMillis()
+        awaitingPongSinceMs = null
+        lastPingSentMs = 0L
         _backlogMs.value = 0
         _rttMs.value = null
         _state.value = LinkState.Idle
@@ -103,6 +109,8 @@ class PeerLink(private val scope: CoroutineScope) {
         sendBuffer.clear()
         outSeq = 0
         lastContiguousInSeq = -1
+        awaitingPongSinceMs = null
+        lastPingSentMs = 0L
         _backlogMs.value = 0
         _rttMs.value = null
         _state.value = LinkState.Idle
@@ -130,6 +138,8 @@ class PeerLink(private val scope: CoroutineScope) {
         }
         activeTransport = transport
         lastActivityMs = System.currentTimeMillis()
+        awaitingPongSinceMs = null
+        lastPingSentMs = 0L
         sendBuffer.trimTo(peerAnnouncedLastContiguousSeq)
         updateBacklog()
         _state.value = LinkState.Connected(peerUid, transport.label)
@@ -154,7 +164,15 @@ class PeerLink(private val scope: CoroutineScope) {
                 updateBacklog()
             }
             is LanFrame.Ping -> transport.sendFrame(LanFrame.Pong(frame.timestampMs))
-            is LanFrame.Pong -> _rttMs.value = System.currentTimeMillis() - frame.timestampMs
+            is LanFrame.Pong -> {
+                // Ignore pongs from other ping sources (e.g. UDP keepalive) or delayed replies.
+                if (frame.timestampMs != lastPingSentMs) return
+                awaitingPongSinceMs = null
+                val rtt = System.currentTimeMillis() - frame.timestampMs
+                if (rtt in 0..PEER_TIMEOUT_MS) {
+                    _rttMs.value = rtt
+                }
+            }
             is LanFrame.Hello -> Unit
         }
     }
@@ -163,8 +181,45 @@ class PeerLink(private val scope: CoroutineScope) {
     fun onDisconnected(transport: FrameTransport, peerUid: String) {
         if (activeTransport !== transport) return
         activeTransport = null
+        awaitingPongSinceMs = null
         _rttMs.value = null
         _state.value = LinkState.Disconnected(peerUid)
+    }
+
+    /**
+     * Peer stopped responding or left the LAN. Clears the active transport without
+     * resetting sequence state so a later reconnect can still resume the buffer.
+     * UDP/Relay [FrameTransport.dropAndRetry] does not call [onDisconnected] itself
+     * (unlike LAN TCP session close), so this is invoked from the health loop and
+     * when a LAN beacon peer disappears.
+     */
+    fun markUnreachable() {
+        val transport = activeTransport
+        val uid = currentPeerUid
+        if (transport != null && uid != null) {
+            transport.dropAndRetry()
+            onDisconnected(transport, uid)
+            return
+        }
+        if (uid != null && _state.value is LinkState.Connected) {
+            _rttMs.value = null
+            _state.value = LinkState.Disconnected(uid)
+        }
+    }
+
+    /** Testable liveness check used by the health loop. Returns true if the link should stay up. */
+    internal fun evaluateLiveness(nowMs: Long): Boolean {
+        if (activeTransport == null) return true
+        awaitingPongSinceMs?.let { pingSent ->
+            if (nowMs - pingSent > PONG_TIMEOUT_MS) return false
+        }
+        if (nowMs - lastActivityMs > PEER_TIMEOUT_MS) return false
+        return true
+    }
+
+    internal fun markPingSentForTest(nowMs: Long) {
+        lastPingSentMs = nowMs
+        awaitingPongSinceMs = nowMs
     }
 
     private fun ensureHealthLoop() {
@@ -172,16 +227,23 @@ class PeerLink(private val scope: CoroutineScope) {
         healthLoopJob = scope.launch(Dispatchers.IO) {
             while (currentCoroutineContext().isActive) {
                 delay(ACK_INTERVAL_MS)
+                val dropped = sendBuffer.expireOlderThan(SendBuffer.DEFAULT_MAX_AGE_MS)
+                if (dropped > 0) {
+                    updateBacklog()
+                    _bufferExpired.tryEmit(dropped)
+                }
                 val transport = activeTransport ?: continue
                 transport.sendFrame(LanFrame.Ack(lastContiguousInSeq))
                 val now = System.currentTimeMillis()
                 if (now - lastPingSentMs > PING_INTERVAL_MS) {
                     lastPingSentMs = now
+                    awaitingPongSinceMs = now
                     transport.sendFrame(LanFrame.Ping(now))
                 }
-                if (now - lastActivityMs > PEER_TIMEOUT_MS) {
+                if (!evaluateLiveness(now)) {
                     lastActivityMs = now
-                    transport.dropAndRetry()
+                    awaitingPongSinceMs = null
+                    markUnreachable()
                 }
             }
         }
@@ -194,7 +256,8 @@ class PeerLink(private val scope: CoroutineScope) {
     companion object {
         private const val ACK_INTERVAL_MS = 250L
         private const val PING_INTERVAL_MS = 2_000L
-        private const val PEER_TIMEOUT_MS = 12_000L
+        private const val PONG_TIMEOUT_MS = 3_000L
+        private const val PEER_TIMEOUT_MS = 6_000L
 
         /** Threshold used by the path manager to consider a connected local link "degraded". */
         const val DEGRADED_RTT_MS = 2_000L

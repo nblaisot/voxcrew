@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -353,10 +354,14 @@ private fun CrewMemberRow(
                         },
                         modifier = Modifier.size(22.dp),
                     )
-                    AvailabilityIcon(displayAvailability(member.availability, pathLabel, linkState))
+                    AvailabilityIcon(
+                        availability = displayAvailability(member.availability, pathLabel, linkState),
+                        rttMs = if (linkState is PeerLink.LinkState.Connected) rttMs else null,
+                        inactiveAlpha = inactiveAlpha,
+                    )
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = if (rttMs != null) "${member.email} (${rttMs} ms)" else member.email,
+                            text = member.email,
                             style = MaterialTheme.typography.bodyLarge,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -381,9 +386,9 @@ private fun CrewMemberRow(
 
 /**
  * Fills proportionally to audio time buffered on the sender because the peer hasn't
- * acknowledged it yet (see [com.nblaisot.voxcrew.lanlink.PeerLink.backlogMs]) — nothing
- * is ever dropped, so this is a queue depth, not a loss indicator. Caps its visual fill
- * at [BACKLOG_GAUGE_MAX_MS] (10 s); the underlying buffer keeps growing well past that.
+ * acknowledged it yet (see [com.nblaisot.voxcrew.lanlink.PeerLink.backlogMs]). Frames
+ * may be evicted by age ([com.nblaisot.voxcrew.lanlink.SendBuffer.DEFAULT_MAX_AGE_MS])
+ * or byte cap. Caps its visual fill at [BACKLOG_GAUGE_MAX_MS] (10 s).
  */
 @Composable
 private fun BacklogGauge(backlogMs: Long, modifier: Modifier = Modifier) {
@@ -428,13 +433,28 @@ private fun audioShimmerBrush(): Brush {
 }
 
 @Composable
-private fun AvailabilityIcon(availability: MemberAvailability) {
+private fun AvailabilityIcon(
+    availability: MemberAvailability,
+    rttMs: Long? = null,
+    inactiveAlpha: Float = 1f,
+) {
     val (icon, tint, desc) = when (availability) {
         MemberAvailability.ONLINE_LOCAL -> Triple(Icons.Filled.Wifi, MaterialTheme.colorScheme.primary, "Local")
         MemberAvailability.ONLINE_CLOUD -> Triple(Icons.Filled.Cloud, MaterialTheme.colorScheme.tertiary, "Cloud")
         MemberAvailability.OFFLINE -> Triple(Icons.Filled.CloudOff, MaterialTheme.colorScheme.onSurfaceVariant, "Hors ligne")
     }
-    Box(modifier = Modifier.size(28.dp), contentAlignment = Alignment.Center) {
-        Icon(icon, contentDescription = desc, tint = tint)
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.widthIn(min = 28.dp),
+    ) {
+        Icon(icon, contentDescription = desc, tint = tint, modifier = Modifier.size(22.dp))
+        if (rttMs != null) {
+            Text(
+                text = "${rttMs} ms",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = inactiveAlpha),
+                maxLines = 1,
+            )
+        }
     }
 }

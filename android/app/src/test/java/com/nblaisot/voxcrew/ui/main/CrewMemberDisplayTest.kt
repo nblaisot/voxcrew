@@ -36,4 +36,24 @@ class CrewMemberDisplayTest {
         )
         assertEquals(MemberAvailability.OFFLINE, result)
     }
+
+    @Test
+    fun `disconnected link state overrides roster online hint`() {
+        val result = displayAvailability(
+            rosterAvailability = MemberAvailability.ONLINE_LOCAL,
+            pathLabel = "Local",
+            linkState = PeerLink.LinkState.Disconnected("peer-b"),
+        )
+        assertEquals(MemberAvailability.OFFLINE, result)
+    }
+
+    @Test
+    fun `connecting link state does not inherit roster online hint`() {
+        val result = displayAvailability(
+            rosterAvailability = MemberAvailability.ONLINE_CLOUD,
+            pathLabel = null,
+            linkState = PeerLink.LinkState.Connecting("peer-b"),
+        )
+        assertEquals(MemberAvailability.OFFLINE, result)
+    }
 }

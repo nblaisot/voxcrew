@@ -71,4 +71,40 @@ class SendBufferTest {
         assertEquals(0, buffer.size())
         assertEquals(emptyList<Long>(), buffer.replayFrom(-1).map { it.seq })
     }
+
+    @Test
+    fun `expireOlderThan keeps frames younger than max age`() {
+        val buffer = SendBuffer()
+        val now = 1_000_000L
+        buffer.add(0, byteArrayOf(1), enqueuedAtMs = now - 30_000)
+        buffer.add(1, byteArrayOf(2), enqueuedAtMs = now - 10_000)
+
+        assertEquals(0, buffer.expireOlderThan(SendBuffer.DEFAULT_MAX_AGE_MS, nowMs = now))
+        assertEquals(listOf(0L, 1L), buffer.replayFrom(-1).map { it.seq })
+    }
+
+    @Test
+    fun `expireOlderThan removes frames older than max age`() {
+        val buffer = SendBuffer()
+        val now = 1_000_000L
+        buffer.add(0, byteArrayOf(1), enqueuedAtMs = now - 120_000)
+        buffer.add(1, byteArrayOf(2), enqueuedAtMs = now - 90_000)
+        buffer.add(2, byteArrayOf(3), enqueuedAtMs = now - 30_000)
+
+        assertEquals(2, buffer.expireOlderThan(SendBuffer.DEFAULT_MAX_AGE_MS, nowMs = now))
+        assertEquals(listOf(2L), buffer.replayFrom(-1).map { it.seq })
+        assertEquals(1, buffer.size())
+        assertEquals(1L, buffer.byteSize())
+    }
+
+    @Test
+    fun `expireOlderThan drops all expired frames including the last one`() {
+        val buffer = SendBuffer()
+        val now = 1_000_000L
+        buffer.add(0, byteArrayOf(1), enqueuedAtMs = now - 120_000)
+
+        assertEquals(1, buffer.expireOlderThan(SendBuffer.DEFAULT_MAX_AGE_MS, nowMs = now))
+        assertEquals(0, buffer.size())
+        assertEquals(0L, buffer.byteSize())
+    }
 }

@@ -38,6 +38,9 @@ class SignalingClient(
     private val _presenceMembers = MutableStateFlow<List<PresenceMember>>(emptyList())
     val presenceMembers: StateFlow<List<PresenceMember>> = _presenceMembers.asStateFlow()
 
+    private val _peerOffline = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    val peerOffline: SharedFlow<String> = _peerOffline.asSharedFlow()
+
     val incoming: SharedFlow<SignalingEnvelope> = transport.incomingMessages
 
     private val _reauthenticated = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
@@ -312,6 +315,7 @@ class SignalingClient(
                 if (it.uid == uid) it.copy(online = false, lastSeenMs = envelope.payload["lastSeenMs"]?.jsonPrimitive?.content?.toLongOrNull()) else it
             }
         }
+        _peerOffline.tryEmit(uid)
     }
 
     private fun parsePresenceMember(obj: JsonObject): PresenceMember? {

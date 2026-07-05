@@ -13,11 +13,14 @@ internal fun displayAvailability(
     pathLabel: String?,
     linkState: PeerLink.LinkState?,
 ): MemberAvailability {
-    if (linkState is PeerLink.LinkState.Connected) {
-        return when (pathLabel) {
+    when (linkState) {
+        is PeerLink.LinkState.Connected -> return when (pathLabel) {
             "Local" -> MemberAvailability.ONLINE_LOCAL
             else -> MemberAvailability.ONLINE_CLOUD
         }
+        is PeerLink.LinkState.Disconnected -> return MemberAvailability.OFFLINE
+        is PeerLink.LinkState.Connecting -> return MemberAvailability.OFFLINE
+        else -> Unit
     }
     return rosterAvailability
 }

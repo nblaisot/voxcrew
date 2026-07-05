@@ -34,6 +34,7 @@ class AppContainer(context: Context) {
         context = appContext,
         scope = scope,
         cloudTransport = cloudTransport,
+        signalingClient = signalingClient,
     )
 
     val rosterRepository = CrewRosterRepository(

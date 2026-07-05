@@ -80,6 +80,25 @@ class PeerConnection(
         lanTcpClient.setTarget(peer)
     }
 
+    /** LAN beacon for this peer expired — tear down a local-only link promptly. */
+    fun onLanPeerAbsent() {
+        if (!started) return
+        lanTcpClient.setTarget(null)
+        onPeerPresenceLost(localOnly = true)
+    }
+
+    /** Cloud presence lost or relay unavailable — tear down any active audio link. */
+    fun onPeerPresenceLost(localOnly: Boolean = false) {
+        if (!started) return
+        if (localOnly) {
+            if ((peerLink.state.value as? PeerLink.LinkState.Connected)?.via == lanTcpClient.label) {
+                peerLink.markUnreachable()
+            }
+        } else {
+            peerLink.markUnreachable()
+        }
+    }
+
     fun send(payload: ByteArray) {
         if (!started) return
         peerLink.send(payload)

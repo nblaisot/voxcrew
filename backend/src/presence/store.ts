@@ -9,7 +9,7 @@ export interface PresenceEntry {
 }
 
 const STALE_MS = 30_000;
-export const OFFLINE_GRACE_MS = 15_000;
+export const OFFLINE_GRACE_MS = 5_000;
 
 export class PresenceStore {
   private readonly entries = new Map<string, PresenceEntry>();
