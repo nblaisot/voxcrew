@@ -288,7 +288,23 @@ Liste complète des membres connus.
 
 ### `presence_updated` / `presence_offline` (serveur → client)
 
-Deltas lors d’une connexion, heartbeat ou déconnexion.
+Deltas lors d’une connexion, heartbeat ou déconnexion. Grace offline : **5 s** avant `presence_offline`.
+
+### `relay_unavailable` (serveur → client)
+
+Émis lorsqu’un relais binaire uid-to-uid ne peut pas être livré (destinataire hors ligne). Rate-limité à ~1 notification par paire expéditeur/destinataire toutes les 2 s.
+
+```json
+{
+  "version": 1,
+  "type": "relay_unavailable",
+  "senderId": "<uid>",
+  "payload": {
+    "recipientId": "<uid>",
+    "reason": "offline"
+  }
+}
+```
 
 ## Keepalive
 

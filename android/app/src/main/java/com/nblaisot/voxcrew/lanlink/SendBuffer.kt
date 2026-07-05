@@ -4,8 +4,8 @@ package com.nblaisot.voxcrew.lanlink
  * Ring buffer of sent-but-possibly-unacknowledged audio frames for a single peer
  * conversation. This is the heart of the "progressive download" resume model:
  * while disconnected, frames keep accumulating here (capture never blocks); once
- * reconnected, everything past the peer's last-known contiguous seq is replayed
- * so no audio is lost, only delayed.
+ * reconnected, everything past the peer's last-known contiguous seq is replayed.
+ * Frames older than [DEFAULT_MAX_AGE_MS] or beyond the byte cap are evicted.
  */
 class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
     data class Entry(val seq: Long, val data: ByteArray, val enqueuedAtMs: Long = System.currentTimeMillis())
@@ -14,8 +14,8 @@ class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
     private var totalBytes = 0L
 
     @Synchronized
-    fun add(seq: Long, data: ByteArray) {
-        frames.addLast(Entry(seq, data))
+    fun add(seq: Long, data: ByteArray, enqueuedAtMs: Long = System.currentTimeMillis()) {
+        frames.addLast(Entry(seq, data, enqueuedAtMs))
         totalBytes += data.size
         while (totalBytes > maxBytes && frames.size > 1) {
             totalBytes -= frames.removeFirst().data.size
@@ -50,8 +50,23 @@ class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
     @Synchronized
     fun byteSize(): Long = totalBytes
 
+    /** Drops frames enqueued before [nowMs] - [maxAgeMs]. Returns the number removed. */
+    @Synchronized
+    fun expireOlderThan(maxAgeMs: Long, nowMs: Long = System.currentTimeMillis()): Int {
+        val cutoff = nowMs - maxAgeMs
+        var dropped = 0
+        while (frames.isNotEmpty() && frames.first().enqueuedAtMs < cutoff) {
+            totalBytes -= frames.removeFirst().data.size
+            dropped++
+        }
+        return dropped
+    }
+
     companion object {
         /** ~2 minutes of 16 kHz mono 16-bit PCM (32 KB/s). */
         const val DEFAULT_MAX_BYTES = 4 * 1024 * 1024
+
+        /** Unacknowledged frames older than this are discarded (see [expireOlderThan]). */
+        const val DEFAULT_MAX_AGE_MS = 30_000L
     }
 }

@@ -216,6 +216,25 @@ describe("WebSocket signaling", () => {
     wsB.close();
   });
 
+  it("notifies sender when binary relay recipient is offline", async () => {
+    const wsA = new WebSocket(baseUrl);
+    await new Promise<void>((r) => wsA.on("open", () => r()));
+    send(wsA, "authenticate", { token: "token-user-a" });
+    await waitForMessage(wsA, "authenticated");
+
+    const recipientId = Buffer.from("user-b", "utf8");
+    const payload = Buffer.from([1, 2, 3]);
+    const frame = Buffer.concat([Buffer.from([recipientId.length]), recipientId, payload]);
+
+    const unavailablePromise = waitForMessage(wsA, "relay_unavailable");
+    wsA.send(frame);
+    const unavailable = await unavailablePromise;
+    expect(unavailable.payload.recipientId).toBe("user-b");
+    expect(unavailable.payload.reason).toBe("offline");
+
+    wsA.close();
+  });
+
   it("replaces duplicate uid socket without ejecting rejoined session", async () => {
     const wsA1 = new WebSocket(baseUrl);
     const wsA2 = new WebSocket(baseUrl);

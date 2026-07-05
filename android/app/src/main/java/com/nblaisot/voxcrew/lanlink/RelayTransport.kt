@@ -79,6 +79,10 @@ class RelayTransport(
         handshakeSent = false
         connected = false
         cloudChannel.connect()
+        receiveJob?.cancel()
+        receiveJob = scope.launch(Dispatchers.IO) {
+            cloudChannel.incomingBinary.collect { bytes -> handleIncoming(bytes) }
+        }
         helloRetryJob?.cancel()
         helloRetryJob = scope.launch(Dispatchers.IO) {
             while (currentCoroutineContext().isActive && !connected) {

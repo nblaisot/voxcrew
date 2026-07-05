@@ -21,6 +21,7 @@ export const messageTypeSchema = z.enum([
   "presence_snapshot",
   "presence_updated",
   "presence_offline",
+  "relay_unavailable",
   "p2p_connect_request",
   "p2p_endpoints",
 ]);

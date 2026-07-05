@@ -35,6 +35,7 @@ const SESSION_DISCONNECT_GRACE_MS = 15_000;
  */
 const MAX_RELAY_BYTES_PER_SECOND = 64 * 1024;
 const MAX_RELAY_FRAME_BYTES = 4 * 1024;
+const RELAY_UNAVAILABLE_MIN_INTERVAL_MS = 2_000;
 
 interface ClientState {
   socket: WebSocket;
@@ -60,6 +61,7 @@ export class WsConnectionHandler {
   private readonly clients = new Map<WebSocket, ClientState>();
   private readonly uidToSocket = new Map<string, WebSocket>();
   private readonly sessionRemovalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly relayUnavailableLastSent = new Map<string, number>();
 
   constructor(private readonly deps: WsHandlerDeps) {}
 
@@ -445,8 +447,23 @@ export class WsConnectionHandler {
     }
 
     const recipientSocket = this.uidToSocket.get(recipientId);
-    if (!recipientSocket || recipientSocket.readyState !== 1) return;
+    if (!recipientSocket || recipientSocket.readyState !== 1) {
+      this.maybeSendRelayUnavailable(state.socket, state.uid, recipientId);
+      return;
+    }
     recipientSocket.send(data, { binary: true });
+  }
+
+  private maybeSendRelayUnavailable(senderSocket: WebSocket, senderUid: string, recipientId: string): void {
+    const key = `${senderUid}:${recipientId}`;
+    const now = Date.now();
+    const lastSent = this.relayUnavailableLastSent.get(key) ?? 0;
+    if (now - lastSent < RELAY_UNAVAILABLE_MIN_INTERVAL_MS) return;
+    this.relayUnavailableLastSent.set(key, now);
+    this.send(senderSocket, buildServerMessage("relay_unavailable", {
+      recipientId,
+      reason: "offline",
+    }, { senderId: senderUid }));
   }
 
   private buildPresenceSnapshot(): Envelope {
