@@ -4,7 +4,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** Stub for future VAD integration — not active in MVP audio path. */
+/**
+ * Exposes [VoxGate]'s transmit/hold decision (see
+ * [com.nblaisot.voxcrew.lanlink.AudioCapture.attachVox]) as a [TransmissionPolicy], so
+ * VOX and PTT plug into [com.nblaisot.voxcrew.lanlink.LanIntercomEngine] the same way.
+ * [setSpeechDetected] is called by the VOX capture loop, never directly by the UI.
+ */
 class VoiceActivatedTransmissionPolicy : TransmissionPolicy {
     override val mode: TransmissionMode = TransmissionMode.VOICE_ACTIVATED
     private val _shouldTransmit = MutableStateFlow(false)

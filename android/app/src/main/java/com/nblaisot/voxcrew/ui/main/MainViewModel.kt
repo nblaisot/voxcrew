@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.auth.AuthRepository
 import com.nblaisot.voxcrew.lanlink.LanIntercomEngine
 import com.nblaisot.voxcrew.lanlink.PeerLink
@@ -29,6 +30,7 @@ data class MainUiState(
     val selectedPeerPathLabel: String? = null,
     val selectedPeerBacklogMs: Long = 0L,
     val voxEnabled: Boolean = false,
+    val voxSensitivity: Int = VoxSensitivity.DEFAULT.level,
     val isTransmitting: Boolean = false,
     val pttEnabled: Boolean = true,
     val micPermissionGranted: Boolean = false,
@@ -95,6 +97,16 @@ class MainViewModel(
                 _uiState.update { it.copy(selectedPeerPathLabel = label) }
             }
         }
+        viewModelScope.launch {
+            lanEngine.voxEnabled.collect { enabled ->
+                _uiState.update { it.copy(voxEnabled = enabled, pttEnabled = !enabled) }
+            }
+        }
+        viewModelScope.launch {
+            lanEngine.voxSensitivity.collect { sensitivity ->
+                _uiState.update { it.copy(voxSensitivity = sensitivity.level) }
+            }
+        }
         startIntercom()
     }
 
@@ -139,8 +151,13 @@ class MainViewModel(
     }
 
     fun setVoxEnabled(enabled: Boolean) {
-        _uiState.update { it.copy(voxEnabled = enabled, pttEnabled = !enabled) }
+        // Source of truth is the engine (it persists and restores it across launches,
+        // see lanEngine.voxEnabled collector above); this just triggers the change.
         lanEngine.setVoxEnabled(enabled)
+    }
+
+    fun setVoxSensitivity(level: Int) {
+        lanEngine.setVoxSensitivity(VoxSensitivity.coerce(level))
     }
 
     fun pttPress() {

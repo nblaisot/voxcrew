@@ -37,7 +37,7 @@
 3. Signaling avant audio cloud fallback.
 4. Micro ouvert avant PTT.
 5. PTT écran allumé avant foreground service.
-6. VAD après PTT fiable — interfaces et doc seulement jusqu'alors.
+6. VAD après PTT fiable — implémenté (Silero VAD, voir `docs/android-audio.md`) ; validation terrain outdoor restant à faire par l'utilisateur.
 
 ## Ce qu'il ne faut pas prétendre
 

@@ -39,6 +39,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -61,13 +63,14 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.roster.CrewMember
 import com.nblaisot.voxcrew.roster.MemberAvailability
 import com.nblaisot.voxcrew.ui.permissions.RequestAppPermissions
 import com.nblaisot.voxcrew.ui.theme.VoxOrangeLight
 import com.nblaisot.voxcrew.ui.theme.VoxPttActive
-import com.nblaisot.voxcrew.ui.theme.VoxPttDisabled
 import com.nblaisot.voxcrew.ui.theme.VoxPttIdle
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -176,12 +179,14 @@ fun MainScreen(
                     ),
                 )
             }
-
-            val pttColor = when {
-                !state.pttEnabled -> VoxPttDisabled
-                state.isTransmitting -> VoxPttActive
-                else -> VoxPttIdle
+            if (state.voxEnabled) {
+                VoxSensitivitySlider(
+                    sensitivity = state.voxSensitivity,
+                    onSensitivityChange = viewModel::setVoxSensitivity,
+                )
             }
+
+            val pttColor = if (state.isTransmitting) VoxPttActive else VoxPttIdle
             // Deliberately NOT a material Button: its internal clickable consumes
             // the down event, which prevents detectTapGestures.onPress from ever
             // firing (press-and-hold would be dead).
@@ -208,10 +213,11 @@ fun MainScreen(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    if (state.pttEnabled) {
-                        if (state.isTransmitting) "Transmission…" else "PTT — maintenir pour parler"
-                    } else {
-                        "PTT désactivé (Vox actif)"
+                    when {
+                        state.voxEnabled && state.isTransmitting -> "Vox — transmission…"
+                        state.voxEnabled -> "Vox actif — en écoute"
+                        state.isTransmitting -> "Transmission…"
+                        else -> "PTT — maintenir pour parler"
                     },
                     color = MaterialTheme.colorScheme.onPrimary,
                     fontWeight = FontWeight.SemiBold,
@@ -220,6 +226,51 @@ fun MainScreen(
             Spacer(modifier = Modifier.height(8.dp))
         }
     }
+}
+
+/**
+ * VOX sensitivity control: low end only transmits on confident, sustained speech
+ * (most robust to outdoor wind/traffic noise), high end triggers more easily on
+ * quieter voices at the cost of more false positives. See [VoxSensitivity].
+ */
+@Composable
+private fun VoxSensitivitySlider(sensitivity: Int, onSensitivityChange: (Int) -> Unit) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                "Sensibilité Vox",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                voxSensitivityLabel(sensitivity),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Slider(
+            value = sensitivity.toFloat(),
+            onValueChange = { onSensitivityChange(it.roundToInt()) },
+            valueRange = VoxSensitivity.MIN.toFloat()..VoxSensitivity.MAX.toFloat(),
+            steps = VoxSensitivity.MAX - VoxSensitivity.MIN - 1,
+            colors = SliderDefaults.colors(
+                thumbColor = MaterialTheme.colorScheme.primary,
+                activeTrackColor = MaterialTheme.colorScheme.primary,
+                inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant,
+            ),
+        )
+    }
+}
+
+private fun voxSensitivityLabel(level: Int): String = when (level) {
+    1 -> "Faible — voix seule"
+    2 -> "Réduite"
+    3 -> "Moyenne"
+    4 -> "Élevée"
+    else -> "Maximale"
 }
 
 @Composable

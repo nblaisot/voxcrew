@@ -73,6 +73,10 @@ dependencies {
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.auth.ktx)
     implementation(libs.concentus)
+    // Silero VAD (ONNX Runtime Mobile) — neural voice-activity detection for VOX, chosen
+    // over an RMS/energy gate or WebRTC's GMM VAD for robustness to outdoor noise (wind,
+    // traffic). See docs/android-audio.md.
+    implementation(libs.android.vad.silero)
 
     testImplementation(libs.junit)
     testImplementation(libs.concentus)

@@ -2,8 +2,11 @@ package com.nblaisot.voxcrew.lanlink
 
 import android.content.Context
 import com.nblaisot.voxcrew.audio.PushToTalkTransmissionPolicy
+import com.nblaisot.voxcrew.audio.SileroVoiceDetector
 import com.nblaisot.voxcrew.audio.TransmissionPolicy
 import com.nblaisot.voxcrew.audio.VoiceActivatedTransmissionPolicy
+import com.nblaisot.voxcrew.audio.VoxGate
+import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.connectivity.NetworkMonitor
 import com.nblaisot.voxcrew.connectivity.transport.CloudRunSignalingTransport
 import com.nblaisot.voxcrew.signaling.ConnectionState
@@ -57,7 +60,8 @@ class LanIntercomEngine(
     private val cloudTransport: CloudRunSignalingTransport,
     private val networkMonitor: NetworkMonitor = NetworkMonitor(context),
 ) {
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val beacon = LanBeacon(context, scope)
     private val peerLink = PeerLink(scope)
     private val tcpTransport = LanTcpTransport(scope, peerLink)
@@ -83,8 +87,15 @@ class LanIntercomEngine(
     private val _voxEnabled = MutableStateFlow(false)
     val voxEnabled: StateFlow<Boolean> = _voxEnabled.asStateFlow()
 
+    private val _voxSensitivity = MutableStateFlow(
+        VoxSensitivity.coerce(prefs.getInt(KEY_VOX_SENSITIVITY, VoxSensitivity.DEFAULT.level)),
+    )
+    val voxSensitivity: StateFlow<VoxSensitivity> = _voxSensitivity.asStateFlow()
+
     private val _isTransmitting = MutableStateFlow(false)
     val isTransmitting: StateFlow<Boolean> = _isTransmitting.asStateFlow()
+
+    private var voxJob: Job? = null
 
     val statusText: StateFlow<String> = combine(peers, selectedPeerUid, linkState) { peerList, selected, link ->
         describeStatus(peerList, selected, link)
@@ -111,8 +122,15 @@ class LanIntercomEngine(
         beacon.start(uid, displayName, tcpTransport.localPort)
         networkMonitor.start()
 
-        capture.attach(activePolicy.shouldTransmit) { payload -> peerLink.send(payload) }
-        watchPolicy(activePolicy)
+        // Restore the VOX toggle from the previous session before the first attach, so
+        // capture starts in the right mode immediately rather than briefly as PTT.
+        val restoreVoxEnabled = prefs.getBoolean(KEY_VOX_ENABLED, false)
+        if (restoreVoxEnabled) {
+            setVoxEnabled(true)
+        } else {
+            capture.attach(activePolicy.shouldTransmit) { payload -> peerLink.send(payload) }
+            watchPolicy(activePolicy)
+        }
 
         scope.launch(Dispatchers.IO) {
             peerLink.incomingAudio.collect { payload -> playback.play(payload) }
@@ -164,16 +182,42 @@ class LanIntercomEngine(
 
     fun setVoxEnabled(enabled: Boolean) {
         _voxEnabled.value = enabled
-        activePolicy = if (enabled) {
-            voxPolicy.setSpeechDetected(true)
-            voxPolicy
-        } else {
-            voxPolicy.setSpeechDetected(false)
+        prefs.edit().putBoolean(KEY_VOX_ENABLED, enabled).apply()
+        if (enabled) {
             pttPolicy.cancel()
-            pttPolicy
+            activePolicy = voxPolicy
+            watchPolicy(activePolicy)
+            startVoxCapture()
+        } else {
+            stopVoxCapture()
+            activePolicy = pttPolicy
+            watchPolicy(activePolicy)
+            capture.attach(activePolicy.shouldTransmit) { payload -> peerLink.send(payload) }
         }
-        watchPolicy(activePolicy)
-        capture.attach(activePolicy.shouldTransmit) { payload -> peerLink.send(payload) }
+    }
+
+    /** Applied immediately if VOX is currently on; always persisted for next launch. */
+    fun setVoxSensitivity(sensitivity: VoxSensitivity) {
+        _voxSensitivity.value = sensitivity
+        prefs.edit().putInt(KEY_VOX_SENSITIVITY, sensitivity.level).apply()
+        if (_voxEnabled.value) startVoxCapture()
+    }
+
+    private fun startVoxCapture() {
+        val sensitivity = _voxSensitivity.value
+        voxJob = capture.attachVox(
+            voiceDetectorFactory = { SileroVoiceDetector(appContext, sensitivity) },
+            gate = VoxGate(),
+            onTransmittingChanged = { transmitting -> voxPolicy.setSpeechDetected(transmitting) },
+            onFrame = { payload -> peerLink.send(payload) },
+        )
+    }
+
+    private fun stopVoxCapture() {
+        voxJob?.cancel()
+        voxJob = null
+        voxPolicy.setSpeechDetected(false)
+        capture.detach()
     }
 
     fun pttPress() {
@@ -374,5 +418,7 @@ class LanIntercomEngine(
         private const val UDP_CONNECT_GRACE_MS = 7_000L
         private const val PREFS_NAME = "voxcrew_lanlink"
         private const val KEY_SELECTED_PEER = "selected_peer_uid"
+        private const val KEY_VOX_ENABLED = "vox_enabled"
+        private const val KEY_VOX_SENSITIVITY = "vox_sensitivity"
     }
 }
