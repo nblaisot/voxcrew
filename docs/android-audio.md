@@ -80,6 +80,9 @@ AudioRecord (continu) → frame PCM 20 ms ────────────�
 
 Implémenté dans `audio/` :
 
+- `IntercomAudioSession` — mode communication, routage haut-parleur/casque.
+- `CaptureAudioEffects` — AEC, NS, AGC sur la session capture.
+- `VoxEchoGuard` — garde anti faux-déclenchement VOX pendant la réception.
 - `VoiceDetector` — interface pour le modèle acoustique (découplée du reste du pipeline).
 - `SileroVoiceDetector` — implémentation par défaut, basée sur
   [Silero VAD](https://github.com/snakers4/silero-vad) (réseau de neurones, ~2 Mo, ONNX
@@ -128,9 +131,41 @@ connaît pas l'UI. L'état Vox actif/inactif et la sensibilité sont persistés 
 
 ## Routes audio
 
-Priorité MVP : écouteur, haut-parleur, Bluetooth si disponible.
+Priorité MVP : haut-parleur mains libres, écouteurs filaires, Bluetooth si disponible.
 
-Flux **multimédia** (`AudioManager.STREAM_MUSIC`) pour le playback intercom.
+Flux **communication** (`AudioAttributes.USAGE_VOICE_COMMUNICATION`) pour le playback
+intercom, avec `AudioManager.MODE_IN_COMMUNICATION` pendant la session. Le haut-parleur
+est activé explicitement quand aucun casque n'est branché ; le routage se met à jour
+automatiquement au branchement/débranchement (`IntercomAudioSession`).
+
+## Annulation d'écho (AEC)
+
+Problème : en mains libres, l'audio reçu est diffusé sur le haut-parleur, capté par le
+micro et renvoyé au correspondant (surtout en mode VOX où le micro tourne en continu).
+
+Solution : chemin VoIP natif Android, sans dépendance tierce :
+
+```text
+LanIntercomEngine.start()
+  → IntercomAudioSession.enter()     (MODE_IN_COMMUNICATION + routage)
+  → AudioPlayback.warmUp()           (session playback avant capture)
+  → AudioCapture                     (VOICE_COMMUNICATION + effets)
+```
+
+Effets attachés sur la session [AudioRecord] quand disponibles (`CaptureAudioEffects`) :
+
+- `AcousticEchoCanceler` (AEC)
+- `NoiseSuppressor`
+- `AutomaticGainControl`
+
+La référence écho (signal joué) est fournie par le HAL — pas de tap PCM applicatif.
+
+Garde applicative VOX (`VoxEchoGuard`) : pendant ~100 ms après le début d'une réception,
+les décisions VAD sont forcées à « non-parole » pour limiter les faux déclenchements
+résiduels sur certains OEM. Le PTT n'est pas affecté.
+
+Diagnostics logués au premier attach (`CaptureAudioEffects`) : disponibilité/activation
+AEC, NS, AGC. La qualité acoustique reste à valider sur téléphone physique (voir AGENTS.md).
 
 ## Diagnostics (UI principale)
 
