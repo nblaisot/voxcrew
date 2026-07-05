@@ -11,13 +11,14 @@
 - [x] Intercom LAN (UDP beacon + TCP Opus)
 - [x] Repli cloud (hole punching UDP + relais WebSocket)
 - [x] Push-to-talk et Vox (interfaces)
+- [x] Vox — détection de voix réelle (Silero VAD, curseur de sensibilité)
 - [x] Foreground service
 - [x] CI GitHub
 - [ ] Validation terrain Galaxy réels (local ↔ cloud)
+- [ ] Validation terrain Vox en extérieur (vent, bruit ambiant)
 
 ## Post-MVP proche
 
-- VAD (Voice Activity Detection) sur le pipeline Opus
 - Reconnexion robuste après changement réseau
 - 3+ participants
 - Chiffrement applicatif LAN (évaluer)
