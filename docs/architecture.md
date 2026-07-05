@@ -9,8 +9,8 @@ flowchart TB
     AppB[App Participant B]
   end
   subgraph lanlink [LanIntercomEngine]
-    PL[PeerLink + Opus]
-    LAN[LanTcpTransport]
+    PL[PeerLink mesh]
+    LAN[LanTcpServer + LanTcpClient]
     UDP[UdpP2pTransport]
     REL[RelayTransport]
   end
@@ -48,7 +48,7 @@ Le backend ne parse, ne stocke ni ne traite l'audio en fonctionnement normal. Se
 
 Priorité automatique dans `LanIntercomEngine` :
 
-1. **Local** — `LanBeacon` (UDP discovery) + `LanTcpTransport` (TCP)
+1. **Local** — `LanBeacon` (UDP discovery) + `LanTcpServer` / `LanTcpClient` (TCP, une session par pair)
 2. **Internet direct** — `UdpP2pTransport` (STUN + hole punching UDP)
 3. **Relais cloud** — `RelayTransport` (trames binaires opaques sur le WebSocket existant)
 
@@ -117,13 +117,15 @@ Modes MVP : `OPEN_MIC`, `PUSH_TO_TALK`. Futur : `VOICE_ACTIVATED` (VAD).
 
 ## Évolution vers les groupes
 
-### Deux participants (MVP)
+### Petit groupe (implémenté)
 
-Un lien audio actif entre la paire sélectionnée.
+Mesh client-side : un [`PeerConnection`](android/app/src/main/java/com/nblaisot/voxcrew/lanlink/PeerConnection.kt) par coéquipier, chacun avec son propre chemin Local / Internet direct / Relais cloud. L'encodage Opus est unique ; la capture est dupliquée (fan-out) vers tous les destinataires **actifs**. Topologies mixtes supportées (ex. Alice en Local, Bob en relais cloud, depuis le même appareil).
 
-### Petit groupe (futur)
+- Tap sur un équipier → activer/désactiver comme destinataire sortant (inbound toujours reçu)
+- Appui long → envoi privé (un seul destinataire actif)
+- Par défaut : tous les coéquipiers connus sont actifs
 
-Mesh ou relais centralisé — le protocole `PeerLink` et le signaling uid-à-uid préparent le routage pair-à-pair.
+**Limite relais cloud :** le backend plafonne à 64 KiB/s par expéditeur (`handler.ts`). Suffisant pour ~8 destinataires en relais pur (~3 KB/s Opus chacun) ; pas de limite si les pairs sont en LAN ou UDP direct.
 
 ### Gros groupe (futur)
 
@@ -139,8 +141,8 @@ Après authentification Firebase, l'utilisateur arrive sur un **écran unique** 
 
 - Connexion signaling cloud automatique (présence / roster)
 - Découverte LAN en parallèle via `LanIntercomEngine`
-- Liste d'équipiers avec email et icône de transport (Wifi = LAN, Cloud = internet, hors ligne = vu précédemment)
-- Tap sur un équipier → lien intercom 1:1
+- Liste d'équipiers avec email, icône de transport et chemin par pair (Local / Internet direct / Relais cloud)
+- Tap sur un équipier → activer/désactiver comme destinataire ; appui long → envoi privé
 - Bouton PTT rouge (maintenir pour parler) ; toggle **Vox** désactive le PTT
 
 Configurer l'URL Cloud Run via `SIGNALING_BASE_URL` dans `android/local.properties` (voir `local.properties.example`).

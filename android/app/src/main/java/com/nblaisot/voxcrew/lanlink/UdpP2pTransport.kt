@@ -18,16 +18,14 @@ import java.net.InetSocketAddress
  * peer's public (and, as a bonus for the same-NAT case, local) endpoint, discovered
  * via [StunClient] and exchanged through the backend rendezvous (`p2p_endpoints`).
  *
- * Unlike TCP, UDP gives no delivery/ordering guarantee, so this transport does its
- * own lightweight reliability on top of [PeerLink]'s sequence numbers: it punches
- * with the peer's own Hello frame (which doubles as the resume handshake once a
- * reply is heard from either candidate address), sends periodic keepalives to hold
- * the NAT mapping open, and retransmits the whole unacknowledged window (Go-Back-N)
- * whenever the oldest unacked frame has been sitting for longer than [rtoMs].
+ * When constructed with [sharedUdp], the socket and receive loop are owned by
+ * [LanIntercomEngine]; this transport only punches/sends and handles demuxed packets
+ * via [handleDatagram].
  */
 class UdpP2pTransport(
     private val scope: CoroutineScope,
     private val peerLink: PeerLink,
+    private val sharedUdp: SharedUdpSocket? = null,
     private val punchIntervalMs: Long = PUNCH_INTERVAL_MS,
     private val punchDurationMs: Long = PUNCH_DURATION_MS,
     private val keepaliveIntervalMs: Long = KEEPALIVE_INTERVAL_MS,
@@ -36,50 +34,78 @@ class UdpP2pTransport(
 ) : FrameTransport {
     override val label: String = "Internet direct"
 
-    private var socket: DatagramSocket? = null
+    private var ownedSocket: DatagramSocket? = null
     private var localUid: String = ""
     private var peerUid: String = ""
     @Volatile private var peerCandidates: List<InetSocketAddress> = emptyList()
     @Volatile private var confirmedAddress: InetSocketAddress? = null
     @Volatile private var connected = false
     @Volatile private var handshakeSent = false
+    @Volatile private var running = false
 
     private var punchJob: Job? = null
     private var receiveJob: Job? = null
     private var retransmitJob: Job? = null
 
+    val activePeerUid: String get() = peerUid
+
     /** Opens the local socket (idempotent) so it can be used for both STUN discovery and punching. */
     fun openSocket(): DatagramSocket {
-        socket?.let { return it }
+        sharedUdp?.open()?.let { return it }
+        ownedSocket?.let { return it }
         val newSocket = DatagramSocket(0)
-        socket = newSocket
+        ownedSocket = newSocket
         return newSocket
     }
 
-    val localSocketPort: Int get() = socket?.localPort ?: 0
+    val localSocketPort: Int
+        get() = sharedUdp?.localPort ?: ownedSocket?.localPort ?: 0
 
     /** Must be called on the socket returned by [openSocket] (NAT mapping is per-socket). */
     fun discoverPublicEndpoint(stunHost: String, stunPort: Int): StunClient.Endpoint? {
-        val active = socket ?: return null
+        val active = ownedSocket ?: sharedUdp?.open() ?: return null
         return StunClient.discover(active, stunHost, stunPort)
     }
 
     /** Starts punching towards [candidates] (public, then local, endpoints of the peer). */
     fun start(localUid: String, peerUid: String, candidates: List<InetSocketAddress>) {
-        val active = openSocket()
+        openSocket()
         this.localUid = localUid
         this.peerUid = peerUid
         this.peerCandidates = candidates
         confirmedAddress = null
         connected = false
         handshakeSent = false
+        running = true
         peerLink.markConnecting(peerUid)
-        receiveJob?.cancel()
-        receiveJob = scope.launch(Dispatchers.IO) { receiveLoop(active) }
         punchJob?.cancel()
-        punchJob = scope.launch(Dispatchers.IO) { punchLoop(active) }
+        punchJob = scope.launch(Dispatchers.IO) { punchLoop() }
         retransmitJob?.cancel()
         retransmitJob = scope.launch(Dispatchers.IO) { retransmitLoop() }
+        if (sharedUdp == null) {
+            receiveJob?.cancel()
+            val socket = ownedSocket ?: return
+            receiveJob = scope.launch(Dispatchers.IO) { receiveLoop(socket) }
+        }
+    }
+
+    /** Called by the engine's shared UDP receiver when [sharedUdp] is in use. */
+    fun handleDatagram(data: ByteArray, fromAddress: InetSocketAddress) {
+        if (!running || peerUid.isBlank()) return
+        val frame = LanProtocol.decodeFrame(data) ?: return
+        handleFrame(frame, fromAddress)
+    }
+
+    /** True if this transport may accept packets from [address] (candidate or confirmed). */
+    fun isInterestedIn(address: InetSocketAddress): Boolean {
+        if (!running || peerUid.isBlank()) return false
+        confirmedAddress?.let { return it == address }
+        return peerCandidates.any { it == address }
+    }
+
+    /** True if [frame] is a Hello from the peer this transport is punching towards. */
+    fun matchesHello(frame: LanFrame): Boolean {
+        return running && frame is LanFrame.Hello && frame.uid == peerUid
     }
 
     override fun sendFrame(frame: LanFrame) {
@@ -91,50 +117,59 @@ class UdpP2pTransport(
         confirmedAddress = null
         connected = false
         handshakeSent = false
-        val active = socket ?: return
+        if (!running) return
         punchJob?.cancel()
-        punchJob = scope.launch(Dispatchers.IO) { punchLoop(active) }
+        punchJob = scope.launch(Dispatchers.IO) { punchLoop() }
     }
 
     override fun stop() {
+        running = false
         punchJob?.cancel()
         receiveJob?.cancel()
         retransmitJob?.cancel()
         punchJob = null
         receiveJob = null
         retransmitJob = null
-        runCatching { socket?.close() }
-        socket = null
+        if (sharedUdp == null) {
+            runCatching { ownedSocket?.close() }
+            ownedSocket = null
+        }
         confirmedAddress = null
         connected = false
         handshakeSent = false
+        peerUid = ""
+        peerCandidates = emptyList()
     }
+
+    private fun activeSocket(): DatagramSocket? = sharedUdp?.open() ?: ownedSocket
 
     private fun sendTo(frame: LanFrame, address: InetSocketAddress) {
         val bytes = LanProtocol.encodeFrame(frame)
         try {
-            socket?.send(DatagramPacket(bytes, bytes.size, address))
+            activeSocket()?.send(DatagramPacket(bytes, bytes.size, address))
         } catch (e: IOException) {
             Log.d(TAG, "send to $address failed: ${e.message}")
         }
     }
 
-    private suspend fun punchLoop(socket: DatagramSocket) {
+    private suspend fun punchLoop() {
         val deadline = System.currentTimeMillis() + punchDurationMs
-        while (currentCoroutineContext().isActive && confirmedAddress == null && System.currentTimeMillis() < deadline) {
+        while (currentCoroutineContext().isActive && running && confirmedAddress == null &&
+            System.currentTimeMillis() < deadline
+        ) {
             val hello = LanFrame.Hello(localUid, peerLink.lastContiguousInSeq())
             peerCandidates.forEach { candidate -> sendTo(hello, candidate) }
             delay(punchIntervalMs)
         }
-        // Whether or not punching succeeded, keep the NAT mapping warm — a reply
-        // arriving later still confirms the path and completes the handshake.
-        while (currentCoroutineContext().isActive) {
+        while (currentCoroutineContext().isActive && running) {
             delay(keepaliveIntervalMs)
             val address = confirmedAddress
             if (address != null) {
                 sendTo(LanFrame.Ping(System.currentTimeMillis()), address)
             } else {
-                peerCandidates.forEach { candidate -> sendTo(LanFrame.Hello(localUid, peerLink.lastContiguousInSeq()), candidate) }
+                peerCandidates.forEach { candidate ->
+                    sendTo(LanFrame.Hello(localUid, peerLink.lastContiguousInSeq()), candidate)
+                }
             }
         }
     }
@@ -142,12 +177,11 @@ class UdpP2pTransport(
     private suspend fun receiveLoop(socket: DatagramSocket) {
         val buffer = ByteArray(2048)
         try {
-            while (currentCoroutineContext().isActive) {
+            while (currentCoroutineContext().isActive && running) {
                 val packet = DatagramPacket(buffer, buffer.size)
                 socket.receive(packet)
                 val fromAddress = InetSocketAddress(packet.address, packet.port)
-                val frame = LanProtocol.decodeFrame(packet.data.copyOf(packet.length)) ?: continue
-                handleFrame(frame, fromAddress)
+                handleDatagram(packet.data.copyOf(packet.length), fromAddress)
             }
         } catch (e: IOException) {
             Log.d(TAG, "receive loop ended: ${e.message}")
@@ -157,9 +191,10 @@ class UdpP2pTransport(
     private fun handleFrame(frame: LanFrame, fromAddress: InetSocketAddress) {
         val existing = confirmedAddress
         if (existing == null) {
+            if (frame is LanFrame.Hello && frame.uid != peerUid) return
             confirmedAddress = fromAddress
         } else if (existing != fromAddress) {
-            return // ignore stray packets from an unconfirmed source once a path is settled
+            return
         }
         when (frame) {
             is LanFrame.Hello -> {
@@ -174,7 +209,7 @@ class UdpP2pTransport(
                 }
             }
             else -> {
-                if (!connected) return // wait for the handshake so seq bookkeeping stays consistent
+                if (!connected) return
                 peerLink.onFrameReceived(this, frame)
             }
         }
@@ -182,14 +217,16 @@ class UdpP2pTransport(
 
     private suspend fun retransmitLoop() {
         var lastResendMs = 0L
-        while (currentCoroutineContext().isActive) {
+        while (currentCoroutineContext().isActive && running) {
             delay(rtoCheckIntervalMs)
             if (!connected) continue
             val now = System.currentTimeMillis()
             if (peerLink.oldestUnackedAgeMs() > rtoMs && now - lastResendMs > rtoMs) {
                 lastResendMs = now
                 val address = confirmedAddress ?: continue
-                peerLink.unacknowledgedFrames().forEach { entry -> sendTo(LanFrame.Audio(entry.seq, entry.data), address) }
+                peerLink.unacknowledgedFrames().forEach { entry ->
+                    sendTo(LanFrame.Audio(entry.seq, entry.data), address)
+                }
             }
         }
     }

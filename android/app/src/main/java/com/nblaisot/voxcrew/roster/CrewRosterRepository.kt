@@ -34,7 +34,7 @@ class CrewRosterRepository(
     private val _members = MutableStateFlow<List<CrewMember>>(emptyList())
     val members: StateFlow<List<CrewMember>> = _members.asStateFlow()
 
-    private var selectedUid: String? = null
+    private var activeRecipientUids: Set<String> = emptySet()
     private var localUid: String? = null
     private var localEmail: String? = null
     private val availabilityStabilizer = AvailabilityStabilizer()
@@ -44,14 +44,14 @@ class CrewRosterRepository(
         this.localEmail = localEmail
         scope.launch {
             combine(signalingClient.presenceMembers, lanPeers) { cloudPresence, peers ->
-                merge(localUid, localEmail, cloudPresence, peers, selectedUid)
+                merge(localUid, localEmail, cloudPresence, peers, activeRecipientUids)
             }.collect { _members.value = it }
         }
     }
 
-    fun select(uid: String?) {
-        selectedUid = uid
-        _members.update { list -> list.map { it.copy(isSelected = it.uid == uid) } }
+    fun setActiveRecipients(uids: Set<String>) {
+        activeRecipientUids = uids
+        _members.update { list -> list.map { it.copy(isActiveRecipient = it.uid in uids) } }
     }
 
     private fun merge(
@@ -59,7 +59,7 @@ class CrewRosterRepository(
         localEmail: String?,
         presence: List<PresenceMember>,
         lanPeers: List<LanPeer>,
-        selectedUid: String?,
+        activeUids: Set<String>,
     ): List<CrewMember> {
         val cache = loadCache().toMutableMap()
         val byUid = linkedMapOf<String, CrewMember>()
@@ -78,7 +78,7 @@ class CrewRosterRepository(
                 availability = availability,
                 lastSeenMs = p.lastSeenMs,
                 isSelf = p.uid == localUid,
-                isSelected = p.uid == selectedUid,
+                isActiveRecipient = p.uid in activeUids,
             )
         }
 
@@ -90,7 +90,7 @@ class CrewRosterRepository(
                 email = email,
                 availability = MemberAvailability.ONLINE_LOCAL,
                 lastSeenMs = peer.lastSeenMs,
-                isSelected = peer.uid == selectedUid,
+                isActiveRecipient = peer.uid in activeUids,
             )
         }
 
@@ -102,7 +102,7 @@ class CrewRosterRepository(
                 email = cached.email,
                 availability = MemberAvailability.OFFLINE,
                 lastSeenMs = cached.lastSeenMs,
-                isSelected = cached.uid == selectedUid,
+                isActiveRecipient = cached.uid in activeUids,
             )
         }
 

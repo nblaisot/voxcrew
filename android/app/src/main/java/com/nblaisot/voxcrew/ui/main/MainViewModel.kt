@@ -7,7 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.auth.AuthRepository
 import com.nblaisot.voxcrew.lanlink.LanIntercomEngine
-import com.nblaisot.voxcrew.lanlink.PeerLink
+import com.nblaisot.voxcrew.lanlink.PeerMetrics
 import com.nblaisot.voxcrew.roster.CrewMember
 import com.nblaisot.voxcrew.roster.CrewRosterRepository
 import com.nblaisot.voxcrew.service.SessionForegroundService
@@ -24,11 +24,9 @@ data class MainUiState(
     val statusMessage: String = "Recherche de coéquipiers…",
     val bannerMessage: String? = null,
     val crew: List<CrewMember> = emptyList(),
-    val selectedPeerUid: String? = null,
+    val activeRecipientUids: Set<String> = emptySet(),
     val receivingAudioFromUid: String? = null,
-    val selectedPeerRttMs: Long? = null,
-    val selectedPeerPathLabel: String? = null,
-    val selectedPeerBacklogMs: Long = 0L,
+    val peerMetrics: Map<String, PeerMetrics> = emptyMap(),
     val voxEnabled: Boolean = false,
     val voxSensitivity: Int = VoxSensitivity.DEFAULT.level,
     val isTransmitting: Boolean = false,
@@ -37,11 +35,9 @@ data class MainUiState(
 )
 
 /**
- * Local-mode-first: this screen is now a thin observer/controller of
- * [LanIntercomEngine], which owns discovery, the TCP link, capture and playback and
- * keeps running independently of this ViewModel's lifecycle (see
- * [com.nblaisot.voxcrew.di.AppContainer]). Cloud fallback (UDP hole punch
- * and WebSocket relay) is handled inside the engine when LAN is unavailable.
+ * Local-mode-first: this screen is a thin observer/controller of
+ * [LanIntercomEngine], which owns discovery, per-peer links, capture fan-out
+ * and playback and keeps running independently of this ViewModel's lifecycle.
  */
 class MainViewModel(
     private val appContext: Context,
@@ -58,10 +54,10 @@ class MainViewModel(
     init {
         viewModelScope.launch {
             combine(authRepository.currentUser, rosterRepository.members) { user, crew -> user?.email to crew }
-                .collect { (email, crew) -> _uiState.update { it.copy(localEmail = email, crew = crew) } }
-        }
-        viewModelScope.launch {
-            rosterRepository.members.collect { crew -> maybeAutoSelectSolePeer(crew) }
+                .collect { (email, crew) ->
+                    _uiState.update { it.copy(localEmail = email, crew = crew) }
+                    lanEngine.syncCrewPeers(crew.map { it.uid }.toSet())
+                }
         }
         viewModelScope.launch {
             lanEngine.isTransmitting.collect { tx ->
@@ -70,31 +66,22 @@ class MainViewModel(
             }
         }
         viewModelScope.launch {
-            combine(lanEngine.isReceiving, lanEngine.selectedPeerUid) { receiving, peer ->
-                if (receiving) peer else null
-            }.collect { peer -> _uiState.update { it.copy(receivingAudioFromUid = peer) } }
+            lanEngine.receivingFromUids.collect { uids ->
+                _uiState.update { it.copy(receivingAudioFromUid = uids.firstOrNull()) }
+            }
         }
         viewModelScope.launch {
             lanEngine.statusText.collect { status -> _uiState.update { it.copy(statusMessage = status) } }
         }
         viewModelScope.launch {
-            // Source of truth for the standing target is the engine (it persists and
-            // restores it across launches); mirror it into the roster and UI state here.
-            lanEngine.selectedPeerUid.collect { uid ->
-                rosterRepository.select(uid)
-                _uiState.update { it.copy(selectedPeerUid = uid) }
+            lanEngine.activeRecipientUids.collect { uids ->
+                rosterRepository.setActiveRecipients(uids)
+                _uiState.update { it.copy(activeRecipientUids = uids) }
             }
         }
         viewModelScope.launch {
-            lanEngine.rttMs.collect { rtt -> _uiState.update { it.copy(selectedPeerRttMs = rtt) } }
-        }
-        viewModelScope.launch {
-            lanEngine.backlogMs.collect { backlog -> _uiState.update { it.copy(selectedPeerBacklogMs = backlog) } }
-        }
-        viewModelScope.launch {
-            lanEngine.linkState.collect { link ->
-                val label = (link as? PeerLink.LinkState.Connected)?.via
-                _uiState.update { it.copy(selectedPeerPathLabel = label) }
+            lanEngine.peerMetrics.collect { metrics ->
+                _uiState.update { it.copy(peerMetrics = metrics) }
             }
         }
         viewModelScope.launch {
@@ -114,8 +101,6 @@ class MainViewModel(
         if (intercomStarted) return
         intercomStarted = true
         startForegroundIfAllowed()
-        // Best-effort: cloud presence is a nice-to-have for the roster, never
-        // required — local discovery works even if this never connects.
         runCatching { signalingClient.connect() }
         viewModelScope.launch {
             val user = authRepository.currentUser.value ?: return@launch
@@ -131,28 +116,17 @@ class MainViewModel(
         if (micGranted) startForegroundIfAllowed()
     }
 
-    fun selectCrewMember(member: CrewMember) {
+    fun toggleRecipient(member: CrewMember) {
         if (member.isSelf) return
-        // Roster selection and ui state follow reactively from lanEngine.selectedPeerUid.
-        lanEngine.selectPeer(member.uid)
+        lanEngine.toggleRecipient(member.uid)
     }
 
-    private var solePeerAutoConnectAttempted = false
-
-    private fun maybeAutoSelectSolePeer(crew: List<CrewMember>) {
-        if (crew.size != 1) {
-            solePeerAutoConnectAttempted = false
-            return
-        }
-        if (_uiState.value.selectedPeerUid != null) return
-        if (solePeerAutoConnectAttempted) return
-        solePeerAutoConnectAttempted = true
-        selectCrewMember(crew.first())
+    fun soloRecipient(member: CrewMember) {
+        if (member.isSelf) return
+        lanEngine.soloRecipient(member.uid)
     }
 
     fun setVoxEnabled(enabled: Boolean) {
-        // Source of truth is the engine (it persists and restores it across launches,
-        // see lanEngine.voxEnabled collector above); this just triggers the change.
         lanEngine.setVoxEnabled(enabled)
     }
 

@@ -12,5 +12,5 @@ data class CrewMember(
     val availability: MemberAvailability,
     val lastSeenMs: Long? = null,
     val isSelf: Boolean = false,
-    val isSelected: Boolean = false,
+    val isActiveRecipient: Boolean = false,
 )
