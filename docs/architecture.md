@@ -8,31 +8,53 @@ flowchart TB
     AppA[App Participant A]
     AppB[App Participant B]
   end
+  subgraph lanlink [LanIntercomEngine]
+    PL[PeerLink + Opus]
+    LAN[LanTcpTransport]
+    UDP[UdpP2pTransport]
+    REL[RelayTransport]
+  end
   subgraph gcp [Google Cloud]
     CR[Cloud Run voxcrew-signaling]
     FA[Firebase Auth]
-    FS[(Firestore)]
   end
-  AppA -->|HTTPS WSS TLS| CR
-  AppB -->|HTTPS WSS TLS| CR
+  AppA --> PL
+  AppB --> PL
+  PL --> LAN
+  PL --> UDP
+  PL --> REL
+  LAN <-->|TCP Opus LAN| AppB
+  UDP <-->|UDP Opus direct| AppB
+  REL -->|WSS binary relay| CR
+  CR -->|WSS binary relay| REL
   AppA -->|Firebase ID token| FA
   AppB -->|Firebase ID token| FA
-  AppA <-->|SRTP WebRTC audio P2P| AppB
-  CR --> FS
+  AppA -->|WSS JSON signaling| CR
+  AppB -->|WSS JSON signaling| CR
 ```
 
-Le backend ne reçoit, ne stocke ni ne traite l'audio en fonctionnement normal.
+Le backend ne parse, ne stocke ni ne traite l'audio en fonctionnement normal. Seul le relais WebSocket binaire (dernier recours) forward des trames opaques uid-à-uid.
 
 ## Responsabilités
 
 | Composant | Rôle |
 |-----------|------|
 | Firebase Auth | Identité utilisateur, jetons ID |
-| Cloud Run | Signaling WebSocket, sessions, présence éphémère |
-| Firestore | Données persistantes minimales (si nécessaire) |
-| WebRTC P2P | Transport audio chiffré SRTP |
+| Cloud Run | Signaling WebSocket, présence, rendez-vous P2P, relais binaire |
+| `LanIntercomEngine` | Découverte LAN, protocole `PeerLink`, capture/playback Opus, bascule transport |
+| `CloudRunSignalingTransport` | WebSocket partagé : JSON (signaling) + binaire (relais audio) |
 
-## Établissement d'une connexion WebRTC
+## Chemin audio production
+
+Priorité automatique dans `LanIntercomEngine` :
+
+1. **Local** — `LanBeacon` (UDP discovery) + `LanTcpTransport` (TCP)
+2. **Internet direct** — `UdpP2pTransport` (STUN + hole punching UDP)
+3. **Relais cloud** — `RelayTransport` (trames binaires opaques sur le WebSocket existant)
+
+Un seul espace de séquence `PeerLink` survit à chaque changement de transport (make-before-break vers le local quand il revient).
+
+## Rendez-vous cloud fallback
 
 ```mermaid
 sequenceDiagram
@@ -41,39 +63,33 @@ sequenceDiagram
   participant B as Galaxy B
   A->>S: authenticate(token)
   S-->>A: authenticated
-  A->>S: create_session
-  S-->>A: session_created
-  B->>S: join_session(sessionId)
-  S-->>B: session_joined
-  S-->>A: participant_joined(B)
-  A->>S: offer(SDP)
-  S-->>B: offer
-  B->>S: answer(SDP)
-  S-->>A: answer
-  A->>S: ice_candidate
-  S-->>B: ice_candidate
-  B->>S: ice_candidate
-  S-->>A: ice_candidate
-  Note over A,B: PeerConnection CONNECTED
-  A-->>B: WebRTC media/data direct
+  A->>S: p2p_connect_request(recipientId=B)
+  S-->>B: p2p_connect_request
+  A->>S: p2p_endpoints(publicHost, publicPort)
+  S-->>B: p2p_endpoints
+  B->>S: p2p_endpoints(publicHost, publicPort)
+  S-->>A: p2p_endpoints
+  Note over A,B: UDP hole punch (Opus direct)
+  alt punch fails
+    A->>S: binary relay frame
+    S-->>B: binary relay frame
+  end
 ```
 
-## Cycle de vie d'une session
+## Cycle de vie intercom
 
 ```mermaid
 stateDiagram-v2
   [*] --> Idle
-  Idle --> Authenticating: open WebSocket
-  Authenticating --> Authenticated: token OK
-  Authenticating --> Idle: auth_error
-  Authenticated --> InSession: create/join session
-  InSession --> WebRTCConnecting: peer present
-  WebRTCConnecting --> WebRTCConnected: ICE connected
-  WebRTCConnected --> InSession: peer left
-  InSession --> Authenticated: leave_session
-  Authenticated --> Idle: disconnect
-  WebRTCConnected --> WebRTCReconnecting: ICE failed
-  WebRTCReconnecting --> WebRTCConnected: recovered
+  Idle --> Discovering: start engine
+  Discovering --> LocalConnected: LAN TCP up
+  Discovering --> CloudFallback: LAN timeout/degraded
+  CloudFallback --> UdpConnected: hole punch OK
+  CloudFallback --> RelayConnected: relay started
+  LocalConnected --> CloudFallback: LAN lost
+  UdpConnected --> LocalConnected: LAN returns
+  RelayConnected --> LocalConnected: LAN returns
+  LocalConnected --> Idle: stop
 ```
 
 ## États Android (couche application)
@@ -81,24 +97,20 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
   [*] --> Login
-  Login --> Home: Firebase auth OK
-  Home --> Session: create/join
-  Session --> SessionActive: signaling + WebRTC OK
-  SessionActive --> Session: recoverable error
-  Session --> Home: leave
-  Home --> Login: sign out
+  Login --> Main: Firebase auth OK
+  Main --> Login: sign out
 ```
 
-Couches découplées : `AuthRepository`, `SignalingClient`, `WebRtcSession`, `TransmissionPolicy`, UI Compose.
+Couches découplées : `AuthRepository`, `SignalingClient`, `LanIntercomEngine`, `TransmissionPolicy`, UI Compose.
 
 ## Politique de transmission audio
 
-Un seul pipeline :
+Un seul pipeline Opus :
 
 ```
-AudioSource → WebRTC AudioTrack → PeerConnection
-                    ↑
-         TransmissionPolicy.shouldTransmit
+AudioRecord → Opus encode → PeerLink.send
+                              ↑
+                   TransmissionPolicy.shouldTransmit
 ```
 
 Modes MVP : `OPEN_MIC`, `PUSH_TO_TALK`. Futur : `VOICE_ACTIVATED` (VAD).
@@ -107,67 +119,28 @@ Modes MVP : `OPEN_MIC`, `PUSH_TO_TALK`. Futur : `VOICE_ACTIVATED` (VAD).
 
 ### Deux participants (MVP)
 
-Connexion WebRTC directe full-mesh à 1 lien.
+Un lien audio actif entre la paire sélectionnée.
 
 ### Petit groupe (futur)
 
-Mesh P2P : chaque paire établit un PeerConnection.
-
-- Avantages : pas d'infrastructure SFU
-- Inconvénients : upload × (N−1), batterie, complexité signaling
+Mesh ou relais centralisé — le protocole `PeerLink` et le signaling uid-à-uid préparent le routage pair-à-pair.
 
 ### Gros groupe (futur)
 
-SFU (Selective Forwarding Unit) : chaque client envoie une piste au SFU qui redistribue.
-
-```mermaid
-flowchart LR
-  A[Client A] --> SFU[SFU]
-  B[Client B] --> SFU
-  C[Client C] --> SFU
-  SFU --> A
-  SFU --> B
-  SFU --> C
-```
-
-Le protocole de signaling identifie déjà `sessionId`, `senderId`, `recipientId` pour supporter le routage pair-à-pair et futur SFU.
-
-## ICE / NAT
-
-- MVP : STUN public configurable (développement uniquement).
-- Production : TURN requis pour de nombreux réseaux mobiles/NAT symétrique.
-- Diagnostics : afficher type de candidat sélectionné (`host`, `srflx`, `relay`).
+SFU ou serveur de relais dédié.
 
 ## Stockage et confidentialité
 
-Par défaut : aucun audio enregistré, aucun transit audio par le backend, aucune transcription.
-
-## Connectivité local-first (post-MVP cloud)
-
-```mermaid
-flowchart LR
-  A[Galaxy A] <-->|Local WebRTC| B[Galaxy B]
-  A <-->|Cloud control optional| CR[Cloud Run]
-  B <-->|Cloud control optional| CR
-  A -->|NSD or QR| LS[Local Ktor signaling on host]
-  B --> LS
-```
-
-Voir [connectivity-orchestration.md](connectivity-orchestration.md) et [local-signaling.md](local-signaling.md).
-
-- Préférence LAN stable ; fallback cloud transparent
-- Même session logique (`sessionId`, `participantId`) à travers les bascules
-- `ConnectivityOrchestrator` + `WebRtcConnectionSwitcher` + générations
-- Audio toujours via un seul pipeline WebRTC actif
+Par défaut : aucun audio enregistré, aucun transit audio parsé par le backend (sauf forward binaire opaque en relais).
 
 ## UX post-login (écran principal)
 
 Après authentification Firebase, l'utilisateur arrive sur un **écran unique** :
 
-- Connexion signaling automatique (cloud + orchestrateur local en arrière-plan)
+- Connexion signaling cloud automatique (présence / roster)
+- Découverte LAN en parallèle via `LanIntercomEngine`
 - Liste d'équipiers avec email et icône de transport (Wifi = LAN, Cloud = internet, hors ligne = vu précédemment)
-- Tap sur un équipier → session pair déterministe (`hash(uidA, uidB)`) + WebRTC 1:1
+- Tap sur un équipier → lien intercom 1:1
 - Bouton PTT rouge (maintenir pour parler) ; toggle **Vox** désactive le PTT
-- Outils debug (QR, join manuel, diagnostics) : 7 taps sur le titre en build `DEBUG` uniquement
 
 Configurer l'URL Cloud Run via `SIGNALING_BASE_URL` dans `android/local.properties` (voir `local.properties.example`).

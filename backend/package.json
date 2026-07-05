@@ -2,7 +2,7 @@
   "name": "voxcrew-signaling",
   "version": "0.1.0",
   "private": true,
-  "description": "VoxCrew WebRTC signaling server",
+  "description": "VoxCrew signaling and cloud relay server",
   "engines": {
     "node": ">=22.0.0"
   },

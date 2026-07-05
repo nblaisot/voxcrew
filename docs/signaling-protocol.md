@@ -25,7 +25,7 @@ Tous les messages client → serveur et serveur → client partagent cette struc
 | `requestId` | client→serveur : oui | UUID pour corrélation |
 | `sessionId` | selon type | ID de session |
 | `senderId` | serveur→client | UID Firebase de l'émetteur |
-| `recipientId` | pair-à-pair | UID du destinataire (offer, answer, ICE) |
+| `recipientId` | pair-à-pair | UID du destinataire (`p2p_*`, relais binaire) |
 | `payload` | oui | Corps typé selon `type` |
 
 ## Authentification
@@ -44,30 +44,6 @@ Premier message après ouverture WebSocket. Timeout serveur : 10 s.
   }
 }
 ```
-
-**Extension local-first (rétrocompatible)** — cloud ignore `authKind` absent :
-
-```json
-{
-  "payload": {
-    "authKind": "firebase",
-    "token": "<firebase-id-token>"
-  }
-}
-```
-
-```json
-{
-  "payload": {
-    "authKind": "local",
-    "sessionId": "<id>",
-    "localToken": "<secret-court>",
-    "participantId": "<firebase-uid>"
-  }
-}
-```
-
-Messages WebRTC (`offer`, `answer`, `ice_candidate`) peuvent inclure un champ optionnel `generation` (long) dans `payload` pour corrélation orchestrateur.
 
 ### `authenticated` (serveur → client)
 
@@ -197,58 +173,61 @@ Messages WebRTC (`offer`, `answer`, `ice_candidate`) peuvent inclure un champ op
 }
 ```
 
-## WebRTC signaling
+## Rendez-vous P2P (repli cloud)
 
-Routage strict : le serveur ne transmet qu'aux participants de la même session et au `recipientId` indiqué.
+Messages uid-à-uid, **sans session active requise**. Utilisés par `LanIntercomEngine` pour le hole punching UDP.
 
-### `offer`
+### `p2p_connect_request` (client → serveur → client)
 
-```json
-{
-  "version": 1,
-  "type": "offer",
-  "requestId": "...",
-  "sessionId": "<id>",
-  "recipientId": "<peer-uid>",
-  "payload": {
-    "sdp": "<sdp-string>",
-    "sdpType": "offer"
-  }
-}
-```
-
-### `answer`
+Demande à un équipier de tenter une connexion directe.
 
 ```json
 {
   "version": 1,
-  "type": "answer",
+  "type": "p2p_connect_request",
   "requestId": "...",
-  "sessionId": "<id>",
   "recipientId": "<peer-uid>",
-  "payload": {
-    "sdp": "<sdp-string>",
-    "sdpType": "answer"
-  }
+  "payload": {}
 }
 ```
 
-### `ice_candidate`
+### `p2p_endpoints` (client → serveur → client)
+
+Échange d'adresses après découverte STUN.
 
 ```json
 {
   "version": 1,
-  "type": "ice_candidate",
+  "type": "p2p_endpoints",
   "requestId": "...",
-  "sessionId": "<id>",
   "recipientId": "<peer-uid>",
   "payload": {
-    "candidate": "<candidate-string>",
-    "sdpMid": "0",
-    "sdpMLineIndex": 0
+    "publicHost": "203.0.113.5",
+    "publicPort": 40000,
+    "localHost": "192.168.1.10",
+    "localPort": 50000
   }
 }
 ```
+
+| Champ | Obligatoire | Description |
+|-------|-------------|-------------|
+| `publicHost` | oui | Adresse publique (STUN) |
+| `publicPort` | oui | Port UDP public |
+| `localHost` | non | Adresse LAN |
+| `localPort` | non | Port UDP LAN |
+
+## Relais binaire (dernier recours cloud)
+
+Trames **binaires** WebSocket (pas JSON). Format wire :
+
+```text
+[recipientUidLen:1][recipientUid UTF-8][opaque payload]
+```
+
+- Le serveur forward uid-à-uid sans parser le payload audio.
+- Limite serveur : 4 KiB par trame, 64 KiB/s par client (backstop).
+- Budget rate-limit JSON séparé du relais binaire.
 
 ## Présence équipier
 
@@ -381,5 +360,5 @@ Deltas lors d’une connexion, heartbeat ou déconnexion.
 
 1. Nouvelle connexion WebSocket
 2. `authenticate` avec jeton rafraîchi
-3. `join_session` avec `sessionId` précédent si applicable
-4. Renégociation WebRTC si nécessaire
+3. `join_session` avec `sessionId` précédent si applicable (roster / sessions legacy)
+4. `LanIntercomEngine` reprend le rendez-vous P2P et le relais si nécessaire

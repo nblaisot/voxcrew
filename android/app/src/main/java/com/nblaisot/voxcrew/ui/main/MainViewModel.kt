@@ -38,10 +38,8 @@ data class MainUiState(
  * Local-mode-first: this screen is now a thin observer/controller of
  * [LanIntercomEngine], which owns discovery, the TCP link, capture and playback and
  * keeps running independently of this ViewModel's lifecycle (see
- * [com.nblaisot.voxcrew.di.AppContainer]). The cloud/WebRTC pipeline
- * ([com.nblaisot.voxcrew.connectivity.orchestration.ConnectivityOrchestrator]) is
- * intentionally not wired here — it is parked, reachable from the debug tools
- * session screen, not deleted.
+ * [com.nblaisot.voxcrew.di.AppContainer]). Cloud fallback (UDP hole punch
+ * and WebSocket relay) is handled inside the engine when LAN is unavailable.
  */
 class MainViewModel(
     private val appContext: Context,

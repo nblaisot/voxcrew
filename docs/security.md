@@ -13,8 +13,7 @@ Ne jamais faire confiance au seul contrôle côté Android.
 ## Autorisation
 
 - Allowlist serveur (variable d'environnement, virgules).
-- Messages WebRTC routés uniquement entre participants de la même session.
-- `recipientId` obligatoire pour offer/answer/ICE.
+- Messages `p2p_*` et relais binaire routés uniquement au `recipientId` indiqué.
 - Client Android : règles Firestore restrictives (pas d'écriture arbitraire).
 
 ## TLS
@@ -22,11 +21,13 @@ Ne jamais faire confiance au seul contrôle côté Android.
 - Cloud Run : HTTPS/WSS obligatoire en production.
 - Certificats gérés par Google.
 
-## WebRTC
+## Audio
 
-- Media chiffré SRTP/DTLS entre pairs.
-- Chaque terminal participant a accès au flux déchiffré localement.
-- Candidats ICE peuvent révéler des adresses IP — ne pas logger en production.
+- LAN : TCP/UDP sur réseau local (pas de chiffrement applicatif MVP).
+- Cloud direct : UDP hole-punched entre pairs (Opus).
+- Relais cloud : trames binaires opaques forwardées par le serveur (dernier recours).
+- Chaque terminal participant décode l'audio localement.
+- Ne pas logger le contenu audio ni les payloads binaires.
 
 ## Secrets
 
@@ -36,14 +37,6 @@ Ne jamais faire confiance au seul contrôle côté Android.
 | `google-services.json` | Local `android/app/`, hors Git |
 | Allowlist UIDs | Variable env Cloud Run |
 | Tokens utilisateur | Mémoire volatile, jamais loggés |
-| Secret session local | Mémoire volatile, TTL court, QR encodé, jamais loggé |
-
-## Signaling local
-
-- Secret généré par `SecureRandom`, lié à `sessionId`, expiration courte
-- QR URI : token encodé ; ne jamais afficher le token complet dans les logs
-- Cleartext WS limité aux plages IP privées (`networkSecurityConfig`)
-- NSD : pas de token ni UID complet dans les TXT records
 
 Pas de clé de compte de service embarquée dans l'APK.
 
@@ -51,7 +44,7 @@ Pas de clé de compte de service embarquée dans l'APK.
 
 **Logger :** niveau, timestamp, requestId, type message, sessionId, UID tronqué (8 car.), codes erreur.
 
-**Ne pas logger :** tokens Firebase, SDP complet, candidats ICE complets en prod, mots de passe, audio, secrets.
+**Ne pas logger :** tokens Firebase, mots de passe, audio, payloads binaires relay.
 
 ## Menaces principales
 
@@ -60,13 +53,14 @@ Pas de clé de compte de service embarquée dans l'APK.
 | Usurpation signaling | Auth Firebase + allowlist |
 | Écoute signaling | TLS/WSS |
 | Injection messages | Validation Zod, limites taille |
-| Flood WebSocket | Rate limiting basique |
+| Flood WebSocket | Rate limiting basique (JSON + relais binaire séparés) |
 | Accès Firestore client | Règles deny-by-default |
-| MITM audio | DTLS-SRTP WebRTC |
+| MITM audio LAN | Risque accepté MVP ; chiffrement transport à évaluer |
+| Abus relais cloud | Rate limit binaire, trames opaques non stockées |
 
 ## Limites du MVP
 
-- STUN public insuffisant pour tous les réseaux (TURN requis plus tard).
+- Hole punching UDP insuffisant sur certains NAT (relais WebSocket en fallback).
 - Pas d'audit trail complet des sessions.
 - Métadonnées de présence visibles par le backend.
 - Deux comptes de test seulement — pas de gestion utilisateurs avancée.

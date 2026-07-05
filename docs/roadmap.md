@@ -8,25 +8,23 @@
 - [x] Terraform + scripts déploiement Cloud Run
 - [x] Android scaffold Compose
 - [x] Client signaling authentifié
-- [x] WebRTC data channel diagnostic
-- [x] Audio micro ouvert
-- [x] Push-to-talk
+- [x] Intercom LAN (UDP beacon + TCP Opus)
+- [x] Repli cloud (hole punching UDP + relais WebSocket)
+- [x] Push-to-talk et Vox (interfaces)
 - [x] Foreground service
 - [x] CI GitHub
-- [ ] Connectivité local-first + fallback cloud (en cours)
+- [ ] Validation terrain Galaxy réels (local ↔ cloud)
 
 ## Post-MVP proche
 
-- Finaliser bascule local/cloud sur Galaxy réels
-- TURN serveur (coturn ou service managé)
-- VAD (Voice Activity Detection) sur même pipeline
-- Reconnexion WebRTC robuste
-- 3+ participants (mesh signaling, audio 2-pairs puis extension)
+- VAD (Voice Activity Detection) sur le pipeline Opus
+- Reconnexion robuste après changement réseau
+- 3+ participants
+- Chiffrement applicatif LAN (évaluer)
 - Workload Identity Federation pour CI deploy
 
 ## Moyen terme
 
-- Groupes mesh WebRTC (petits groupes)
 - Profils audio (vent, extérieur)
 - Wear OS (exploration)
 - Gestion groupes / invitations

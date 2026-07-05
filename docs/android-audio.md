@@ -2,7 +2,7 @@
 
 ## Règle fondamentale
 
-Un seul pipeline WebRTC pour tous les modes :
+Un seul pipeline Opus pour tous les modes :
 
 ```text
 shouldTransmit =
@@ -11,7 +11,19 @@ shouldTransmit =
     OR (mode == VOICE_ACTIVATED AND vadDetectsSpeech)
 ```
 
-Pas de second flux micro. Pas d'enregistrement fichier. Pas d'upload backend.
+Pas de second flux micro. Pas d'enregistrement fichier. Pas d'upload backend (sauf relais binaire opaque en dernier recours cloud).
+
+## Pipeline production
+
+```text
+AudioRecord → OpusCodec (Concentus, 20 ms frames) → PeerLink.send
+                                                         ↓
+                                              FrameTransport (LAN / UDP / relay)
+                                                         ↓
+PeerLink.incomingAudio → AudioPlayback (Opus decode)
+```
+
+Implémenté dans `lanlink/` : `AudioCapture`, `AudioPlayback`, `OpusCodec`, `PeerLink`.
 
 ## Interface TransmissionPolicy
 
@@ -46,23 +58,14 @@ enum class TransmissionMode {
 
 ```text
 capture → traitement acoustique → VAD fenêtres 10–20 ms
-    → lissage → shouldTransmit → même AudioTrack WebRTC
+    → lissage → shouldTransmit → même AudioCapture
 ```
 
 Paramètres futurs : seuil, hangover, pré-buffer, profils (calme, extérieur, vent).
 
-## Intégration WebRTC
+## Intégration LanIntercomEngine
 
-```kotlin
-// WebRtcSession observe shouldTransmit
-policy.shouldTransmit
-    .onEach { transmit ->
-        localAudioTrack.setEnabled(transmit)
-    }
-    .launchIn(scope)
-```
-
-Le module WebRTC ne connaît pas l'UI ; seulement `shouldTransmit`.
+`LanIntercomEngine` observe `TransmissionPolicy.shouldTransmit` et active/désactive la capture Opus en conséquence. Le module audio ne connaît pas l'UI.
 
 ## Permissions
 
@@ -73,18 +76,17 @@ Le module WebRTC ne connaît pas l'UI ; seulement `shouldTransmit`.
 
 Priorité MVP : écouteur, haut-parleur, Bluetooth si disponible.
 
-`AudioManager.MODE_IN_COMMUNICATION` pour la session.
+Flux **multimédia** (`AudioManager.STREAM_MUSIC`) pour le playback intercom.
 
-## Diagnostics (panneau repliable)
+## Diagnostics (UI principale)
 
-- État `PeerConnection`, ICE
-- Candidat sélectionné : `host` / `srflx` / `relay`
-- Codec, paquets, jitter, RTT, pertes, débit
+- RTT et label de chemin (Local / Internet direct / Relais cloud)
+- Backlog audio non accusé (`PeerLink.backlogMs`, jauge plafonnée à 10 s)
 
-## Foreground service (Phase 11)
+## Foreground service
 
-- Type `microphone`
-- Notification persistante avec action Quitter
+- `SessionForegroundService` permanent pendant l'intercom
+- Notification persistante avec état VOX et liaison
 - Maintien session écran verrouillé (sous réserve restrictions OEM)
 
 ## Ce qui n'est pas dans le MVP

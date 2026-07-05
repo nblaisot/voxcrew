@@ -61,7 +61,6 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.nblaisot.voxcrew.BuildConfig
 import com.nblaisot.voxcrew.roster.CrewMember
 import com.nblaisot.voxcrew.roster.MemberAvailability
 import com.nblaisot.voxcrew.ui.permissions.RequestAppPermissions
@@ -75,7 +74,6 @@ import com.nblaisot.voxcrew.ui.theme.VoxPttIdle
 fun MainScreen(
     viewModel: MainViewModel,
     onSignOut: () -> Unit,
-    onOpenDebug: () -> Unit,
 ) {
     val state by viewModel.uiState.collectAsState()
     val haptic = LocalHapticFeedback.current
@@ -102,15 +100,6 @@ fun MainScreen(
                                 onSignOut()
                             },
                         )
-                        if (BuildConfig.DEBUG) {
-                            DropdownMenuItem(
-                                text = { Text("Outils développeur") },
-                                onClick = {
-                                    menuExpanded = false
-                                    onOpenDebug()
-                                },
-                            )
-                        }
                     }
                 },
                 title = {

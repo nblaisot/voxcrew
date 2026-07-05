@@ -7,13 +7,11 @@ import {
   buildServerMessage,
   clientMessageSchema,
   createSessionPayloadSchema,
-  icePayloadSchema,
   joinSessionPayloadSchema,
   p2pEndpointsPayloadSchema,
   pingPayloadSchema,
   presenceHeartbeatPayloadSchema,
   presenceRegisterPayloadSchema,
-  sdpPayloadSchema,
   type ClientMessage,
   type Envelope,
 } from "../protocol/messages.js";
@@ -181,11 +179,6 @@ export class WsConnectionHandler {
       case "leave_session":
         this.handleLeaveSession(socket, state, message);
         break;
-      case "offer":
-      case "answer":
-      case "ice_candidate":
-        this.handleWebRtc(socket, state, message);
-        break;
       case "ping":
         this.handlePing(socket, state, message);
         break;
@@ -343,46 +336,6 @@ export class WsConnectionHandler {
       participantId: uid,
       reason: "leave",
     }, { sessionId, senderId: uid }), uid);
-  }
-
-  private handleWebRtc(socket: WebSocket, state: ClientState, message: ClientMessage): void {
-    if (!state.uid || !state.sessionId) {
-      this.sendError(socket, state, "NOT_IN_SESSION", "Not in a session", message.requestId);
-      return;
-    }
-
-    if (!message.recipientId) {
-      this.sendError(socket, state, "INVALID_MESSAGE", "recipientId required", message.requestId);
-      return;
-    }
-
-    const session = this.deps.sessionStore.get(state.sessionId);
-    if (!session?.participants.has(state.uid) || !session.participants.has(message.recipientId)) {
-      this.sendError(socket, state, "UNAUTHORIZED", "Recipient not in session", message.requestId);
-      return;
-    }
-
-    const schema =
-      message.type === "ice_candidate" ? icePayloadSchema : sdpPayloadSchema;
-    const payload = schema.safeParse(message.payload);
-    if (!payload.success) {
-      this.sendError(socket, state, "INVALID_MESSAGE", "Invalid WebRTC payload", message.requestId);
-      return;
-    }
-
-    const delivered = this.sendToUid(message.recipientId, {
-      version: 1,
-      type: message.type,
-      requestId: message.requestId,
-      sessionId: state.sessionId,
-      senderId: state.uid,
-      recipientId: message.recipientId,
-      payload: message.payload,
-    });
-
-    if (!delivered) {
-      this.sendError(socket, state, "RECIPIENT_OFFLINE", "Recipient not connected", message.requestId);
-    }
   }
 
   private handlePresenceRegister(socket: WebSocket, state: ClientState, message: ClientMessage): void {
