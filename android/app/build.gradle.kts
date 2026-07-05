@@ -31,7 +31,6 @@ android {
         versionName = "0.1.0"
 
         buildConfigField("String", "SIGNALING_BASE_URL", "\"$signalingBaseUrl\"")
-        buildConfigField("String", "STUN_SERVER_URL", "\"stun:stun.l.google.com:19302\"")
     }
 
     buildFeatures {
@@ -73,11 +72,6 @@ dependencies {
     implementation(libs.okhttp)
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.auth.ktx)
-    implementation(libs.stream.webrtc)
-    implementation(libs.ktor.server.core)
-    implementation(libs.ktor.server.cio)
-    implementation(libs.ktor.server.websockets)
-    implementation(libs.zxing.embedded)
     implementation(libs.concentus)
 
     testImplementation(libs.junit)

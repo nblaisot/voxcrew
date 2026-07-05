@@ -72,7 +72,7 @@ describe("WebSocket signaling", () => {
     ws.close();
   });
 
-  it("creates session, joins, and relays offer", async () => {
+  it("creates session and joins participants", async () => {
     const wsA = new WebSocket(baseUrl);
     const wsB = new WebSocket(baseUrl);
     await Promise.all([
@@ -93,39 +93,12 @@ describe("WebSocket signaling", () => {
     await waitForMessage(wsB, "session_joined");
     await waitForMessage(wsA, "participant_joined");
 
-    const offerPromise = waitForMessage(wsB, "offer");
-    send(wsA, "offer", { sdp: "v=0", sdpType: "offer" }, {
-      sessionId,
-      recipientId: "user-b",
-    });
-    const offer = await offerPromise;
-    expect(offer.senderId).toBe("user-a");
-
     send(wsA, "ping", { timestamp: Date.now() });
     const pong = await waitForMessage(wsA, "pong");
     expect(pong.type).toBe("pong");
 
     wsA.close();
     wsB.close();
-  });
-
-  it("blocks offer to user outside session", async () => {
-    const wsA = new WebSocket(baseUrl);
-    await new Promise<void>((resolve) => wsA.on("open", () => resolve()));
-    send(wsA, "authenticate", { token: "token-user-a" });
-    await waitForMessage(wsA, "authenticated");
-
-    send(wsA, "create_session", {});
-    const created = await waitForMessage(wsA, "session_created");
-    const sessionId = created.payload.sessionId as string;
-
-    send(wsA, "offer", { sdp: "v=0", sdpType: "offer" }, {
-      sessionId,
-      recipientId: "user-b",
-    });
-    const err = await waitForMessage(wsA, "error");
-    expect(err.payload.code).toBe("UNAUTHORIZED");
-    wsA.close();
   });
 
   it("accepts presence_register without email", async () => {
@@ -168,34 +141,6 @@ describe("WebSocket signaling", () => {
     wsB.close();
   }, 25_000);
 
-  it("returns error when relaying offer to disconnected recipient", async () => {
-    const wsA = new WebSocket(baseUrl);
-    const wsB = new WebSocket(baseUrl);
-    await Promise.all([
-      new Promise<void>((r) => wsA.on("open", () => r())),
-      new Promise<void>((r) => wsB.on("open", () => r())),
-    ]);
-    send(wsA, "authenticate", { token: "token-user-a" });
-    send(wsB, "authenticate", { token: "token-user-b" });
-    await waitForMessage(wsA, "authenticated");
-    await waitForMessage(wsB, "authenticated");
-
-    send(wsA, "create_session", { name: "solo" });
-    const created = await waitForMessage(wsA, "session_created");
-    const sessionId = created.payload.sessionId as string;
-    send(wsB, "join_session", { sessionId });
-    await waitForMessage(wsB, "session_joined");
-    wsB.close();
-    await new Promise((r) => setTimeout(r, 100));
-
-    send(wsA, "offer", { sdp: "v=0", sdpType: "offer" }, {
-      sessionId,
-      recipientId: "user-b",
-    });
-    const err = await waitForMessage(wsA, "error");
-    expect(err.payload.code).toBe("RECIPIENT_OFFLINE");
-    wsA.close();
-  });
 
   it("forwards p2p_connect_request and p2p_endpoints uid-to-uid without a session", async () => {
     const wsA = new WebSocket(baseUrl);
@@ -300,12 +245,9 @@ describe("WebSocket signaling", () => {
     wsA1.close();
     await new Promise((r) => setTimeout(r, 200));
 
-    send(wsA2, "offer", { sdp: "v=0", sdpType: "offer" }, {
-      sessionId,
-      recipientId: "user-b",
-    });
-    const offer = await waitForMessage(wsB, "offer");
-    expect(offer.senderId).toBe("user-a");
+    send(wsA2, "ping", { timestamp: Date.now() });
+    const pong = await waitForMessage(wsA2, "pong");
+    expect(pong.type).toBe("pong");
 
     wsA2.close();
     wsB.close();

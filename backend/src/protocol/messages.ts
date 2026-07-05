@@ -12,9 +12,6 @@ export const messageTypeSchema = z.enum([
   "session_joined",
   "participant_joined",
   "participant_left",
-  "offer",
-  "answer",
-  "ice_candidate",
   "leave_session",
   "ping",
   "pong",
@@ -60,17 +57,6 @@ export const createSessionPayloadSchema = z.object({
 
 export const joinSessionPayloadSchema = z.object({
   sessionId: z.string().min(1).max(128),
-});
-
-export const sdpPayloadSchema = z.object({
-  sdp: z.string().min(1).max(65536),
-  sdpType: z.enum(["offer", "answer"]),
-});
-
-export const icePayloadSchema = z.object({
-  candidate: z.string().min(1).max(8192),
-  sdpMid: z.string().nullable().optional(),
-  sdpMLineIndex: z.number().int().nullable().optional(),
 });
 
 export const pingPayloadSchema = z.object({

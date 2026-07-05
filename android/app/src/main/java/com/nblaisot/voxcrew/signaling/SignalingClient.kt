@@ -181,61 +181,6 @@ class SignalingClient(
         _state.update { it.copy(sessionId = null, participants = emptyList()) }
     }
 
-    suspend fun sendOffer(recipientId: String, sdp: String, generation: Long? = null) {
-        sendWebRtc(SignalingMessageTypes.OFFER, recipientId, sdp, "offer", generation)
-    }
-
-    suspend fun sendAnswer(recipientId: String, sdp: String, generation: Long? = null) {
-        sendWebRtc(SignalingMessageTypes.ANSWER, recipientId, sdp, "answer", generation)
-    }
-
-    suspend fun sendIceCandidate(
-        recipientId: String,
-        candidate: String,
-        sdpMid: String?,
-        sdpMLineIndex: Int?,
-        generation: Long? = null,
-    ) {
-        val sessionId = _state.value.sessionId ?: return
-        transport.send(
-            SignalingEnvelope(
-                type = SignalingMessageTypes.ICE_CANDIDATE,
-                requestId = UUID.randomUUID().toString(),
-                sessionId = sessionId,
-                recipientId = recipientId,
-                payload = buildJsonObject {
-                    put("candidate", JsonPrimitive(candidate))
-                    sdpMid?.let { put("sdpMid", JsonPrimitive(it)) }
-                    sdpMLineIndex?.let { put("sdpMLineIndex", JsonPrimitive(it)) }
-                    generation?.let { put("generation", JsonPrimitive(it)) }
-                },
-            ),
-        )
-    }
-
-    private suspend fun sendWebRtc(
-        type: String,
-        recipientId: String,
-        sdp: String,
-        sdpType: String,
-        generation: Long?,
-    ) {
-        val sessionId = _state.value.sessionId ?: return
-        transport.send(
-            SignalingEnvelope(
-                type = type,
-                requestId = UUID.randomUUID().toString(),
-                sessionId = sessionId,
-                recipientId = recipientId,
-                payload = buildJsonObject {
-                    put("sdp", JsonPrimitive(sdp))
-                    put("sdpType", JsonPrimitive(sdpType))
-                    generation?.let { put("generation", JsonPrimitive(it)) }
-                },
-            ),
-        )
-    }
-
     private suspend fun waitForSessionId(requestId: String): Result<String> {
         val msg = withTimeoutOrNull(10_000) {
             incoming.first {

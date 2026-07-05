@@ -1,4 +1,4 @@
-# Tests manuels bascule local/cloud
+# Tests manuels bascule local / repli cloud
 
 Appareils cibles : Samsung Galaxy Z Fold 5 (hôte hotspot) + Galaxy S25.
 
@@ -7,7 +7,7 @@ Appareils cibles : Samsung Galaxy Z Fold 5 (hôte hotspot) + Galaxy S25.
 - [ ] Même build debug/release sur les deux téléphones
 - [ ] Comptes Firebase dans l'allowlist
 - [ ] `google-services.json` installé dans `android/app/`
-- [ ] Permissions : micro, notifications, caméra (QR), Wi‑Fi
+- [ ] Permissions : micro, notifications, Wi‑Fi
 - [ ] Désactiver optimisation batterie agressive si possible
 - [ ] Noter les UID Firebase (non secrets)
 
@@ -25,57 +25,38 @@ Lister les appareils : `adb devices`. **Ne pas installer sur téléphones réels
 ### Logs expurgés
 
 ```bash
-adb logcat -s VoxCrew ConnectivityOrchestrator SignalingClient WebRtcConnectionSwitcher \
-  | grep -v -E 'token|localToken|secret|Bearer'
+adb logcat -s VoxCrew LanIntercomEngine SignalingClient PeerLink \
+  | grep -v -E 'token|secret|Bearer'
 ```
 
 ## A — Hotspot local avec Internet
 
 1. Activer hotspot sur Fold 5
 2. Connecter S25 au hotspot
-3. Créer session locale sur Fold 5
-4. Vérifier NSD ou scanner QR sur S25
-5. Établir WebRTC ; badge **Local**
-6. Tester micro ouvert et PTT
-7. Couper données mobiles du Fold 5
-8. Vérifier audio continue ; badge **Local — hors ligne**
+3. Lancer VoxCrew sur les deux, se connecter
+4. Sélectionner l'équipier sur chaque appareil
+5. Vérifier chemin **Local** (icône Wifi)
+6. Tester PTT et Vox
+7. Couper données mobiles du Fold 5 (garder hotspot actif)
+8. Vérifier que le lien LAN reste actif
 
-## B — Local vers cloud
+## B — Perte LAN → repli cloud
 
-1. Réactiver Internet sur les deux
-2. Session en mode local
-3. Éloigner S25 ou couper son Wi‑Fi
-4. Observer transition **Transition** puis **Internet direct**
-5. Vérifier absence de double audio
-6. Exporter diagnostics expurgés
+1. Depuis le scénario A, couper le hotspot ou éloigner les appareils du LAN
+2. Attendre la bascule (5–10 s)
+3. Vérifier chemin **Internet direct** ou **Relais cloud**
+4. Confirmer audio bidirectionnel via le repli
+5. Revenir sur le même LAN → reprise **Local** automatique
 
-## C — Cloud vers local
+## C — Deux réseaux distincts (cloud only)
 
-1. Démarrer session cloud (réseau mobile)
-2. Activer hotspot ; reconnecter S25
-3. Attendre validation locale (4+ s)
-4. Badge **Local** sans recréer session
+1. Chaque téléphone sur un réseau différent (ex. 4G + Wi-Fi domicile)
+2. Connexion Firebase + présence cloud
+3. Sélection mutuelle des équipiers
+4. Vérifier rendez-vous P2P puis relais si le hole punch échoue
 
-## D — Bord de portée
+## Critères de succès
 
-- Limite hotspot ; vérifier pas de bascule permanente
-- Noter RTT, pertes, raison dernière bascule
-
-## E — Callback obsolète
-
-- Basculer rapidement ; vérifier dans logs `obsolete_generation_event_ignored`
-
-## F — Écran verrouillé
-
-- Avec foreground service actif : verrouiller, tester PTT si possible
-
-## Collecte en cas d'échec
-
-- Modèle, version Android, horodatage
-- Badge transport, génération active/candidate
-- Export diagnostics (sans tokens)
-- Type candidat ICE
-
-## Limites CI
-
-NSD et Wi‑Fi réel non testés en CI unitaire — cette checklist est obligatoire avant validation MVP.
+- Aucune perte d'audio permanente (backlog acceptable temporairement)
+- Bascule local ↔ cloud sans action utilisateur
+- RTT et label de chemin cohérents avec le transport réel

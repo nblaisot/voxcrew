@@ -6,9 +6,8 @@ Application Android privée de communication vocale de groupe pour activités ex
 
 - **Mode local (priorité)** : intercom LAN direct entre participants — découverte par broadcast UDP, audio sur socket TCP. Aucun signaling, aucun transit par le backend tant que le LAN fonctionne. Voir [Mode local (LAN intercom)](#mode-local-lan-intercom) ci-dessous.
 - **Repli cloud (fallback)** : quand le LAN est indisponible ou se dégrade, le même protocole (`PeerLink`) bascule sur un chemin assisté par le backend — hole punching UDP (STUN + rendez-vous via WebSocket) puis, en dernier recours, relais WebSocket binaire. Le backend ne relaie jamais l'audio en clair sauf sur ce dernier chemin, et uniquement des trames opaques (non stockées, non parsées). Voir [Repli cloud](#repli-cloud-fallback) ci-dessous.
-- **Mode WebRTC (parqué)** : ancien chemin peer-to-peer WebRTC avec signaling Cloud Run — code conservé dans le dépôt et accessible depuis les outils développeur, mais plus sur le chemin par défaut de l'écran principal (remplacé par le repli cloud ci-dessus).
-- **Backend** : Node.js / TypeScript / Fastify sur Google Cloud Run — signaling WebSocket, auth Firebase, rendez-vous P2P (`p2p_connect_request`/`p2p_endpoints`) et relais binaire pour le repli cloud, sessions WebRTC parquées.
-- **Android** : Kotlin, Jetpack Compose, Firebase Authentication, sockets TCP/UDP natifs + codec Opus pour le mode local et le repli cloud, WebRTC natif pour le mode parqué.
+- **Backend** : Node.js / TypeScript / Fastify sur Google Cloud Run — signaling WebSocket, auth Firebase, présence, rendez-vous P2P (`p2p_connect_request`/`p2p_endpoints`) et relais binaire pour le repli cloud.
+- **Android** : Kotlin, Jetpack Compose, Firebase Authentication, sockets TCP/UDP natifs + codec Opus pour le mode local et le repli cloud.
 
 ```
 LAN (priorité) :
@@ -19,11 +18,6 @@ Galaxy A <== UDP hole-punch (STUN) ==> Galaxy B         [1er repli]
 Galaxy A <====== relais WebSocket (Cloud Run) ======> Galaxy B   [dernier recours]
      \                                              /
       \---- WSS signaling + rendez-vous (Cloud Run) ----/
-
-Mode WebRTC parqué :
-Galaxy A <====== WebRTC audio ======> Galaxy B
-     \                              /
-      \---- WSS signaling (Cloud Run) ----/
 ```
 
 ## Mode local (LAN intercom)
@@ -58,7 +52,6 @@ L'UI affiche, à côté de l'e-mail de l'équipier sélectionné, le RTT courant
 | Terraform / GCP | Configuration prête, déploiement manuel |
 | Android — mode local | Intercom LAN (UDP beacon + TCP audio Opus), reprise sur coupure, service permanent, PTT/Vox |
 | Android — repli cloud | Hole punching UDP (STUN) + relais WebSocket, bascule auto vers/depuis le local, RTT + backlog affichés |
-| Android — mode WebRTC | Compose, auth, signaling, WebRTC (parqué, accessible via outils développeur) |
 | CI GitHub | Workflows backend, Android, Terraform |
 
 ## Prérequis
