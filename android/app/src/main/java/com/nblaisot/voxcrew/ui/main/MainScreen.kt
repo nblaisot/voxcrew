@@ -6,8 +6,9 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,6 +26,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
@@ -60,10 +62,13 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.nblaisot.voxcrew.R
 import com.nblaisot.voxcrew.audio.VoxSensitivity
+import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.roster.CrewMember
 import com.nblaisot.voxcrew.roster.MemberAvailability
 import com.nblaisot.voxcrew.ui.permissions.RequestAppPermissions
@@ -76,6 +81,7 @@ import kotlin.math.roundToInt
 @Composable
 fun MainScreen(
     viewModel: MainViewModel,
+    onNavigateToAbout: () -> Unit,
     onSignOut: () -> Unit,
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -96,6 +102,13 @@ fun MainScreen(
                         onDismissRequest = { menuExpanded = false },
                     ) {
                         DropdownMenuItem(
+                            text = { Text(stringResource(R.string.menu_about)) },
+                            onClick = {
+                                menuExpanded = false
+                                onNavigateToAbout()
+                            },
+                        )
+                        DropdownMenuItem(
                             text = { Text("Déconnexion") },
                             onClick = {
                                 menuExpanded = false
@@ -106,19 +119,20 @@ fun MainScreen(
                     }
                 },
                 title = {
-                    Text(
-                        "VoxCrew",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                },
-                actions = {
-                    Text(
-                        state.statusMessage,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(end = 16.dp),
-                    )
+                    Column(modifier = Modifier.padding(end = 8.dp)) {
+                        Text(
+                            "VoxCrew",
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Text(
+                            state.statusMessage,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface,
@@ -142,22 +156,30 @@ fun MainScreen(
             }
 
             Text(
-                "Équipiers",
+                "Participants",
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                "Toucher pour activer/désactiver · Appui long = envoi privé",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             LazyColumn(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(state.crew, key = { it.uid }) { member ->
+                    val metrics = state.peerMetrics[member.uid]
                     CrewMemberRow(
                         member = member,
                         isReceivingAudio = state.receivingAudioFromUid == member.uid,
-                        rttMs = state.selectedPeerRttMs.takeIf { member.uid == state.selectedPeerUid },
-                        pathLabel = state.selectedPeerPathLabel.takeIf { member.uid == state.selectedPeerUid },
-                        backlogMs = state.selectedPeerBacklogMs.takeIf { member.uid == state.selectedPeerUid },
-                        onClick = { viewModel.selectCrewMember(member) },
+                        rttMs = metrics?.rttMs,
+                        pathLabel = metrics?.pathLabel,
+                        linkState = metrics?.linkState,
+                        backlogMs = metrics?.backlogMs?.takeIf { it > 0L },
+                        onClick = { viewModel.toggleRecipient(member) },
+                        onLongClick = { viewModel.soloRecipient(member) },
                     )
                 }
             }
@@ -273,18 +295,22 @@ private fun voxSensitivityLabel(level: Int): String = when (level) {
     else -> "Maximale"
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun CrewMemberRow(
     member: CrewMember,
     isReceivingAudio: Boolean,
     rttMs: Long?,
     pathLabel: String?,
+    linkState: PeerLink.LinkState?,
     backlogMs: Long?,
     onClick: () -> Unit,
+    onLongClick: () -> Unit,
 ) {
+    val inactiveAlpha = if (member.isActiveRecipient) 1f else 0.45f
     val bg = when {
         isReceivingAudio -> audioShimmerBrush()
-        member.isSelected -> Brush.linearGradient(
+        member.isActiveRecipient -> Brush.linearGradient(
             listOf(
                 MaterialTheme.colorScheme.primaryContainer,
                 MaterialTheme.colorScheme.primaryContainer,
@@ -292,15 +318,18 @@ private fun CrewMemberRow(
         )
         else -> Brush.linearGradient(
             listOf(
-                MaterialTheme.colorScheme.surfaceVariant,
-                MaterialTheme.colorScheme.surfaceVariant,
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
             ),
         )
     }
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick,
+            ),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
     ) {
         Box(
@@ -314,19 +343,30 @@ private fun CrewMemberRow(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    AvailabilityIcon(member.availability)
+                    Icon(
+                        imageVector = Icons.Filled.CheckCircle,
+                        contentDescription = if (member.isActiveRecipient) "Destinataire actif" else "Destinataire inactif",
+                        tint = if (member.isActiveRecipient) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                        },
+                        modifier = Modifier.size(22.dp),
+                    )
+                    AvailabilityIcon(displayAvailability(member.availability, pathLabel, linkState))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = if (rttMs != null) "${member.email} (${rttMs} ms)" else member.email,
                             style = MaterialTheme.typography.bodyLarge,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = inactiveAlpha),
                         )
                         if (pathLabel != null) {
                             Text(
                                 text = pathLabel,
                                 style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = inactiveAlpha),
                             )
                         }
                     }
