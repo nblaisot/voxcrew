@@ -1,0 +1,7 @@
+{
+  "uniqueId": "io.github.jaredmdobson:concentus",
+  "name": "Concentus (Opus)",
+  "website": "https://github.com/lostromb/concentus",
+  "description": "Portable Java implementation of the Opus audio codec (libopus).",
+  "licenses": ["793a4cf6f6c2a2511f55feeb3c74eeb2"]
+}

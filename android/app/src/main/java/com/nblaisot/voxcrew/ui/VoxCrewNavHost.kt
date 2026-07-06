@@ -9,6 +9,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.nblaisot.voxcrew.di.AppContainer
+import com.nblaisot.voxcrew.ui.about.AboutScreen
 import com.nblaisot.voxcrew.ui.login.LoginScreen
 import com.nblaisot.voxcrew.ui.login.LoginViewModel
 import com.nblaisot.voxcrew.ui.main.MainScreen
@@ -41,8 +42,12 @@ fun VoxCrewNavHost(container: AppContainer) {
             })
             MainScreen(
                 viewModel = vm,
+                onNavigateToAbout = { navController.navigate(Routes.ABOUT) },
                 onSignOut = { navController.navigate(Routes.LOGIN) { popUpTo(0) } },
             )
+        }
+        composable(Routes.ABOUT) {
+            AboutScreen(onBack = { navController.popBackStack() })
         }
     }
 }

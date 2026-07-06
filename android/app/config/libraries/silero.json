@@ -1,0 +1,7 @@
+{
+  "uniqueId": "com.github.gkonovalov.android-vad:silero",
+  "name": "android-vad (Silero VAD)",
+  "website": "https://github.com/gkonovalov/android-vad",
+  "description": "Voice Activity Detection using the Silero VAD model (https://github.com/snakers4/silero-vad) and ONNX Runtime Mobile.",
+  "licenses": ["MIT"]
+}

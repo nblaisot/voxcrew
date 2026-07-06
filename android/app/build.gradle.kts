@@ -3,6 +3,7 @@ plugins {
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.aboutlibraries.plugin.android)
 }
 
 import java.util.Properties
@@ -54,6 +55,21 @@ android {
     }
 }
 
+aboutLibraries {
+    collect {
+        configPath = file("config")
+        filterVariants.addAll("debug", "release")
+    }
+}
+
+configurations.configureEach {
+    resolutionStrategy {
+        // AboutLibraries transitively pulls core-ktx 1.17+ which requires AGP 8.9 / compileSdk 36.
+        force("androidx.core:core-ktx:${libs.versions.coreKtx.get()}")
+        force("androidx.core:core:${libs.versions.coreKtx.get()}")
+    }
+}
+
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation("androidx.core:core-splashscreen:1.0.1")
@@ -77,6 +93,8 @@ dependencies {
     // over an RMS/energy gate or WebRTC's GMM VAD for robustness to outdoor noise (wind,
     // traffic). See docs/android-audio.md.
     implementation(libs.android.vad.silero)
+    // OSS license attribution screen (About → licenses). Scans release/debug runtime classpath at build time.
+    implementation(libs.aboutlibraries.compose.m3)
 
     testImplementation(libs.junit)
     testImplementation(libs.concentus)
