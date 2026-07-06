@@ -1,6 +1,7 @@
 package com.nblaisot.voxcrew.lanlink
 
 import android.content.Context
+import com.nblaisot.voxcrew.audio.IntercomAudioSession
 import com.nblaisot.voxcrew.audio.PushToTalkTransmissionPolicy
 import com.nblaisot.voxcrew.audio.SileroVoiceDetector
 import com.nblaisot.voxcrew.audio.TransmissionPolicy
@@ -47,6 +48,7 @@ class LanIntercomEngine(
     private val cloudTransport: CloudRunSignalingTransport,
     private val signalingClient: SignalingClient? = null,
     private val networkMonitor: NetworkMonitor = NetworkMonitor(context),
+    private val intercomAudioSession: IntercomAudioSession = IntercomAudioSession(context),
 ) {
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -122,6 +124,9 @@ class LanIntercomEngine(
         sharedUdp.open()
         startSharedUdpReceiver()
         startReceivingSweep()
+
+        intercomAudioSession.enter()
+        playback.warmUp()
 
         val restoreVoxEnabled = prefs.getBoolean(KEY_VOX_ENABLED, false)
         if (restoreVoxEnabled) {
@@ -383,6 +388,7 @@ class LanIntercomEngine(
             gate = VoxGate(),
             onTransmittingChanged = { transmitting -> voxPolicy.setSpeechDetected(transmitting) },
             onFrame = { payload -> fanOut(payload) },
+            isReceiving = { playback.isReceiving.value },
         )
     }
 

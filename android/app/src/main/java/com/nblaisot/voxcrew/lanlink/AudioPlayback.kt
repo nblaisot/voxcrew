@@ -27,6 +27,14 @@ class AudioPlayback(private val scope: CoroutineScope) {
     private val _isReceiving = MutableStateFlow(false)
     val isReceiving: StateFlow<Boolean> = _isReceiving.asStateFlow()
 
+    /** Creates and starts the playback track so platform AEC has a far-end reference before capture. */
+    fun warmUp() {
+        ensureTrack()
+    }
+
+    val audioSessionId: Int?
+        get() = track?.audioSessionId
+
     fun play(payload: ByteArray) {
         val pcm = runCatching { decoder.decode(payload) }
             .onFailure { Log.w(TAG, "Opus decode failed: ${it.message}") }
@@ -59,7 +67,7 @@ class AudioPlayback(private val scope: CoroutineScope) {
             AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build(),
                 )

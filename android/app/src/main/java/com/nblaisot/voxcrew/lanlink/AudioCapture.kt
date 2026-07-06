@@ -5,6 +5,8 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.SystemClock
 import android.util.Log
+import com.nblaisot.voxcrew.audio.CaptureAudioEffects
+import com.nblaisot.voxcrew.audio.VoxEchoGuard
 import com.nblaisot.voxcrew.audio.VoxGate
 import com.nblaisot.voxcrew.audio.VoiceDetector
 import kotlinx.coroutines.CoroutineScope
@@ -63,10 +65,19 @@ class AudioCapture(private val scope: CoroutineScope) {
         gate: VoxGate,
         onTransmittingChanged: (Boolean) -> Unit,
         onFrame: (ByteArray) -> Unit,
+        isReceiving: () -> Boolean = { false },
+        echoGuard: VoxEchoGuard = VoxEchoGuard(),
     ): Job {
         detach()
         val job = scope.launch(Dispatchers.IO) {
-            voxCaptureLoop(voiceDetectorFactory(), gate, onTransmittingChanged, onFrame)
+            voxCaptureLoop(
+                voiceDetectorFactory(),
+                gate,
+                onTransmittingChanged,
+                onFrame,
+                isReceiving,
+                echoGuard,
+            )
         }
         recordJob = job
         return job
@@ -82,6 +93,7 @@ class AudioCapture(private val scope: CoroutineScope) {
     private suspend fun captureLoop(onFrame: (ByteArray) -> Unit) {
         val frameBytes = SAMPLE_RATE / 1000 * FRAME_MS * BYTES_PER_SAMPLE
         val recorder = openRecorder(frameBytes) ?: return
+        val effects = CaptureAudioEffects.attach(recorder.audioSessionId)
         val encoder = OpusCodec.Encoder()
         try {
             recorder.startRecording()
@@ -101,6 +113,7 @@ class AudioCapture(private val scope: CoroutineScope) {
             }
         } finally {
             runCatching { recorder.stop() }
+            effects.release()
             recorder.release()
         }
     }
@@ -110,9 +123,12 @@ class AudioCapture(private val scope: CoroutineScope) {
         gate: VoxGate,
         onTransmittingChanged: (Boolean) -> Unit,
         onFrame: (ByteArray) -> Unit,
+        isReceiving: () -> Boolean,
+        echoGuard: VoxEchoGuard,
     ) {
         val frameBytes = SAMPLE_RATE / 1000 * FRAME_MS * BYTES_PER_SAMPLE
         val recorder = openRecorder(frameBytes) ?: return
+        val effects = CaptureAudioEffects.attach(recorder.audioSessionId)
         val encoder = OpusCodec.Encoder()
         // Frames captured while the gate is closed, replayed the instant it opens so the
         // first syllable of a talkspurt isn't clipped while the detector was still deciding.
@@ -130,10 +146,13 @@ class AudioCapture(private val scope: CoroutineScope) {
                     .onFailure { Log.w(TAG, "Opus encode failed: ${it.message}") }
                     .getOrNull() ?: continue
 
+                val nowMs = SystemClock.elapsedRealtime()
+                echoGuard.onReceivingChanged(isReceiving(), nowMs)
                 val decision = runCatching { voiceDetector.accept(bytesToShorts(frame)) }
                     .onFailure { Log.w(TAG, "VAD inference failed: ${it.message}") }
                     .getOrNull()
-                val result = gate.update(decision, SystemClock.elapsedRealtime())
+                val filteredDecision = echoGuard.filterSpeechDecision(decision, nowMs)
+                val result = gate.update(filteredDecision, nowMs)
                 onTransmittingChanged(result.transmitting)
 
                 if (result.transmitting) {
@@ -148,8 +167,10 @@ class AudioCapture(private val scope: CoroutineScope) {
             }
         } finally {
             runCatching { recorder.stop() }
+            effects.release()
             recorder.release()
             voiceDetector.close()
+            echoGuard.reset()
             onTransmittingChanged(false)
         }
     }
@@ -163,7 +184,7 @@ class AudioCapture(private val scope: CoroutineScope) {
         val bufferSize = maxOf(minBuf, frameBytes * 4)
         val recorder = try {
             AudioRecord(
-                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
