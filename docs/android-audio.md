@@ -80,7 +80,9 @@ AudioRecord (continu) → frame PCM 20 ms ────────────�
 
 Implémenté dans `audio/` :
 
-- `IntercomAudioSession` — mode communication, routage haut-parleur/casque.
+- `IntercomAudioSession` — façade de session audio, routage dynamique et état `AudioRouteState`.
+- `AudioRouteSelector` — politique pure de sélection micro/sortie, permissions et priorité des périphériques.
+- `VoiceCommunicationAudioFocus` — focus audio VoIP pendant la session.
 - `CaptureAudioEffects` — AEC, NS, AGC sur la session capture.
 - `VoxEchoGuard` — garde anti faux-déclenchement VOX pendant la réception.
 - `VoiceDetector` — interface pour le modèle acoustique (découplée du reste du pipeline).
@@ -127,16 +129,88 @@ connaît pas l'UI. L'état Vox actif/inactif et la sensibilité sont persistés 
 ## Permissions
 
 - `RECORD_AUDIO` demandée avant capture
+- `BLUETOOTH_CONNECT` demandée à l'exécution (API 31+) pour le routage BT
 - Refus → message clair, pas de crash
 
 ## Routes audio
 
-Priorité MVP : haut-parleur mains libres, écouteurs filaires, Bluetooth si disponible.
+Objectif : choisir le micro **avant** `AudioRecord`, VOX et garde d'écho, puis garder
+l'état visible pendant les branchements/débranchements. La sortie audio n'est pas
+affichée à l'utilisateur ; seul le micro actif peut produire une icône dans la zone PTT.
 
-Flux **communication** (`AudioAttributes.USAGE_VOICE_COMMUNICATION`) pour le playback
-intercom, avec `AudioManager.MODE_IN_COMMUNICATION` pendant la session. Le haut-parleur
-est activé explicitement quand aucun casque n'est branché ; le routage se met à jour
-automatiquement au branchement/débranchement (`IntercomAudioSession`).
+### Politique déterministe (`AudioRouteSelector.resolve`)
+
+`AudioRouteState` expose `micKind`, `captureDevice`, `outputDevice`, `playbackUsage`,
+`audioMode`, `routeReady` et `permissionIssue`.
+
+| Situation | Capture | Sortie | Mode / usage | Icône PTT |
+|---|---|---|---|---|
+| Aucun périphérique externe | Micro téléphone | Haut-parleur téléphone | `MODE_NORMAL` / `USAGE_MEDIA` | Aucune |
+| Bluetooth avec micro | Micro Bluetooth | Bluetooth | `MODE_IN_COMMUNICATION` / `USAGE_VOICE_COMMUNICATION` | Bluetooth |
+| Bluetooth sortie seule | Micro téléphone | Bluetooth | `MODE_NORMAL` / `USAGE_MEDIA` | Aucune |
+| USB avec micro | Micro USB | USB si disponible | `MODE_NORMAL` / `USAGE_MEDIA` | USB |
+| USB sortie seule | Micro téléphone | USB | `MODE_NORMAL` / `USAGE_MEDIA` | Aucune |
+| USB entrée seule | Micro USB | Meilleure sortie disponible | `MODE_NORMAL` / `USAGE_MEDIA` | USB |
+| Bluetooth + USB avec micros | Micro Bluetooth | Bluetooth | `MODE_IN_COMMUNICATION` / `USAGE_VOICE_COMMUNICATION` | Bluetooth |
+
+Bluetooth gagne sur USB quand les deux micros sont disponibles. Les cas filaires
+analogiques/USB-C exposés par Android comme `WIRED_*` restent supportés comme sortie
+média, mais ne produisent pas de nouvelle icône micro.
+
+### Application plateforme (`IntercomAudioSession` / `AndroidAudioRouter`)
+
+- `AudioDeviceCallback` est enregistré pour ré-appliquer la politique à chaque ajout ou
+  retrait de périphérique.
+- API 31+ : les routes Bluetooth micro utilisent `availableCommunicationDevices`,
+  `setCommunicationDevice` et `OnCommunicationDeviceChangedListener`. `routeReady=false`
+  tant que `communicationDevice()` ne confirme pas le périphérique demandé.
+- API 26–30 : le repli `startBluetoothSco()` est conservé uniquement pour les routes
+  Bluetooth micro.
+- Routes média : `clearCommunicationDevice()` si nécessaire, arrêt SCO, abandon focus,
+  `MODE_NORMAL`, `USAGE_MEDIA`.
+- Routes Bluetooth micro : `MODE_IN_COMMUNICATION`, focus VoIP idempotent,
+  `USAGE_VOICE_COMMUNICATION`.
+- Échec `setCommunicationDevice(false)` ou périphérique communication absent :
+  re-sélection sans micro Bluetooth, sans crash.
+
+### Capture et lecture
+
+- `AudioCapture` attend `routeReady` avant d'ouvrir `AudioRecord`.
+- `AudioCapture` utilise `AudioRecord.setPreferredDevice` seulement pour les micros
+  Bluetooth/USB explicites ; le micro téléphone reste le défaut plateforme.
+- `AudioCapture` lit `AudioRecord.routedDevice` après `startRecording()` et corrige
+  l'état si Android route finalement vers une autre entrée.
+- `AudioPlayback` construit `AudioTrack` depuis `AudioRouteState.playbackUsage`.
+- `AudioPlayback` utilise `AudioTrack.setPreferredDevice` pour les sorties média
+  explicites (USB/Bluetooth sortie seule) quand Android l'expose.
+- Les redémarrages capture/lecture sont sérialisés dans `LanIntercomEngine` quand la
+  clé de route change.
+
+### Bluetooth et écouteurs sans fil
+
+- Micro Bluetooth reconnu : `BLE_HEADSET`, `BLUETOOTH_SCO`, `HEARING_AID`.
+- Sortie Bluetooth reconnue : `BLE_HEADSET`, `BLUETOOTH_SCO`, `BLUETOOTH_A2DP`,
+  `BLE_SPEAKER`, `HEARING_AID`.
+- API 31+ : `BLUETOOTH_CONNECT` manquant devient `AudioPermissionIssue.BLUETOOTH_CONNECT`
+  dès qu'une route Bluetooth micro est nécessaire ou qu'une API lève `SecurityException`.
+- Le temps d'activation Bluetooth n'est pas supposé fixe : l'UI peut afficher une route
+  non prête, et la capture reste désactivée jusqu'à confirmation.
+
+### Indicateurs UI (écran principal)
+
+Sur le bouton PTT : icône Bluetooth si `micKind == BLUETOOTH` et `routeReady`, icône USB
+si `micKind == USB` et `routeReady`, aucune icône pour le micro téléphone ou une sortie
+externe sans micro. Aucun état de sortie n'est affiché.
+
+Permissions :
+
+- `RECORD_AUDIO` manquant désactive PTT/VOX capture et affiche une action pour accorder
+  le micro.
+- `BLUETOOTH_CONNECT` (API 31+) est demandé à la demande pour les routes Bluetooth micro.
+- Les permissions sont revérifiées au retour app et après chaque résultat de permission,
+  puis le routage est ré-appliqué.
+
+Diagnostics logcat : `IntercomAudioSession`, `AudioCapture`, `VoiceCommunicationAudioFocus`.
 
 ## Annulation d'écho (AEC)
 
@@ -147,9 +221,9 @@ Solution : chemin VoIP natif Android, sans dépendance tierce :
 
 ```text
 LanIntercomEngine.start()
-  → IntercomAudioSession.enter()     (MODE_IN_COMMUNICATION + routage)
-  → AudioPlayback.warmUp()           (session playback avant capture)
-  → AudioCapture                     (VOICE_COMMUNICATION + effets)
+  → IntercomAudioSession.enter()     (sélection et application AudioRouteState)
+  → AudioPlayback.warmUp()           (route playback avant capture)
+  → AudioCapture                     (source audio de la route + effets disponibles)
 ```
 
 Effets attachés sur la session [AudioRecord] quand disponibles (`CaptureAudioEffects`) :

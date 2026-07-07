@@ -1,9 +1,17 @@
 package com.nblaisot.voxcrew.ui.main
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.nblaisot.voxcrew.audio.AudioPermissionIssue
+import com.nblaisot.voxcrew.audio.AudioRoute
+import com.nblaisot.voxcrew.audio.AudioRouteSelector
+import com.nblaisot.voxcrew.audio.CaptureInputKind
 import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.auth.AuthRepository
 import com.nblaisot.voxcrew.lanlink.LanIntercomEngine
@@ -32,6 +40,10 @@ data class MainUiState(
     val isTransmitting: Boolean = false,
     val pttEnabled: Boolean = true,
     val micPermissionGranted: Boolean = false,
+    val bluetoothConnectGranted: Boolean = true,
+    val audioRouteReady: Boolean = false,
+    val permissionPrompt: AudioPermissionIssue? = null,
+    val pttMicIconKind: CaptureInputKind? = null,
 )
 
 /**
@@ -86,7 +98,7 @@ class MainViewModel(
         }
         viewModelScope.launch {
             lanEngine.voxEnabled.collect { enabled ->
-                _uiState.update { it.copy(voxEnabled = enabled, pttEnabled = !enabled) }
+                _uiState.update { it.copy(voxEnabled = enabled).withPttEnabled() }
             }
         }
         viewModelScope.launch {
@@ -94,8 +106,56 @@ class MainViewModel(
                 _uiState.update { it.copy(voxSensitivity = sensitivity.level) }
             }
         }
+        viewModelScope.launch {
+            lanEngine.audioRoute.collect { route ->
+                _uiState.update {
+                    it.copy(
+                        pttMicIconKind = pttMicIconKind(route),
+                        audioRouteReady = route.routeReady,
+                        permissionPrompt = route.permissionIssue
+                            ?: it.permissionPrompt?.takeIf { prompt ->
+                                prompt == AudioPermissionIssue.RECORD_AUDIO && !it.micPermissionGranted
+                            },
+                    ).withPttEnabled()
+                }
+            }
+        }
+        refreshPermissions()
         startIntercom()
     }
+
+    fun refreshPermissions() {
+        val micGranted = hasPermission(Manifest.permission.RECORD_AUDIO)
+        val btGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
+        _uiState.update {
+            it.copy(
+                micPermissionGranted = micGranted,
+                bluetoothConnectGranted = btGranted,
+                permissionPrompt = when {
+                    !micGranted -> AudioPermissionIssue.RECORD_AUDIO
+                    it.permissionPrompt == AudioPermissionIssue.BLUETOOTH_CONNECT && btGranted -> null
+                    else -> it.permissionPrompt
+                },
+            ).withPttEnabled()
+        }
+        if (micGranted) {
+            startForegroundIfAllowed()
+            lanEngine.onMicrophonePermissionGranted()
+        }
+        lanEngine.refreshAudioRouting()
+    }
+
+    private fun hasPermission(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(appContext, permission) == PackageManager.PERMISSION_GRANTED
+
+    private fun MainUiState.withPttEnabled(): MainUiState =
+        copy(
+            pttEnabled = !voxEnabled &&
+                micPermissionGranted &&
+                audioRouteReady &&
+                permissionPrompt == null,
+        )
 
     private fun startIntercom() {
         if (intercomStarted) return
@@ -111,9 +171,67 @@ class MainViewModel(
     }
 
     fun onPermissionsResult(results: Map<String, Boolean>) {
-        val micGranted = results[android.Manifest.permission.RECORD_AUDIO] == true
-        _uiState.update { it.copy(micPermissionGranted = micGranted) }
-        if (micGranted) startForegroundIfAllowed()
+        val micGranted = results[Manifest.permission.RECORD_AUDIO]
+            ?: hasPermission(Manifest.permission.RECORD_AUDIO)
+        val btGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            results[Manifest.permission.BLUETOOTH_CONNECT]
+                ?: hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            true
+        }
+        _uiState.update {
+            it.copy(
+                micPermissionGranted = micGranted,
+                bluetoothConnectGranted = btGranted,
+                permissionPrompt = when {
+                    !micGranted -> AudioPermissionIssue.RECORD_AUDIO
+                    it.permissionPrompt == AudioPermissionIssue.BLUETOOTH_CONNECT && btGranted -> null
+                    else -> it.permissionPrompt
+                },
+            ).withPttEnabled()
+        }
+        if (micGranted) {
+            startForegroundIfAllowed()
+            lanEngine.onMicrophonePermissionGranted()
+        }
+        if (btGranted) {
+            lanEngine.onBluetoothPermissionGranted()
+        } else {
+            lanEngine.refreshAudioRouting()
+        }
+    }
+
+    fun onBluetoothPermissionResult(granted: Boolean) {
+        _uiState.update {
+            it.copy(
+                bluetoothConnectGranted = granted,
+                permissionPrompt = if (granted) null else AudioPermissionIssue.BLUETOOTH_CONNECT,
+            ).withPttEnabled()
+        }
+        if (granted) {
+            lanEngine.onBluetoothPermissionGranted()
+        } else {
+            lanEngine.refreshAudioRouting()
+        }
+    }
+
+    fun onMicrophonePermissionResult(granted: Boolean) {
+        _uiState.update {
+            it.copy(
+                micPermissionGranted = granted,
+                permissionPrompt = if (granted) null else AudioPermissionIssue.RECORD_AUDIO,
+            ).withPttEnabled()
+        }
+        if (granted) {
+            startForegroundIfAllowed()
+            lanEngine.onMicrophonePermissionGranted()
+        } else {
+            lanEngine.refreshAudioRouting()
+        }
+    }
+
+    fun dismissPermissionPrompt() {
+        _uiState.update { it.copy(permissionPrompt = null).withPttEnabled() }
     }
 
     fun toggleRecipient(member: CrewMember) {
@@ -159,5 +277,8 @@ class MainViewModel(
 
     private companion object {
         const val TAG = "VoxCrewVM"
+
+        fun pttMicIconKind(route: AudioRoute): CaptureInputKind? =
+            AudioRouteSelector.pttMicIconKind(route)
     }
 }
