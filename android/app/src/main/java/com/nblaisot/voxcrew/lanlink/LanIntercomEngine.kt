@@ -358,19 +358,33 @@ class LanIntercomEngine(
     private fun releaseAudioWhenIdle(delayMs: Long = AUDIO_IDLE_RELEASE_DELAY_MS) {
         releaseAudioJob?.cancel()
         releaseAudioJob = scope.launch(Dispatchers.IO) {
-            delay(delayMs)
-            runCatching {
-                audioInitMutex.withLock {
-                    if (_voxEnabled.value || pttPolicy.shouldTransmit.value || playback.isReceiving.value) {
-                        return@withLock
+            var nextDelayMs = delayMs
+            while (currentCoroutineContext().isActive) {
+                delay(nextDelayMs)
+                var keepWaitingForPlayback = false
+                var released = false
+                runCatching {
+                    audioInitMutex.withLock {
+                        if (_voxEnabled.value || pttPolicy.shouldTransmit.value) {
+                            return@withLock
+                        }
+                        if (playback.isReceiving.value) {
+                            keepWaitingForPlayback = true
+                            return@withLock
+                        }
+                        capture.detach()
+                        playback.stop()
+                        audioPrepared = false
+                        intercomAudioSession.deactivateAudio()
+                        released = true
                     }
-                    capture.detach()
-                    playback.stop()
-                    audioPrepared = false
-                    intercomAudioSession.deactivateAudio()
+                }.onFailure { error ->
+                    Log.e(TAG, "audio idle release failed: ${error.message}", error)
                 }
-            }.onFailure { error ->
-                Log.e(TAG, "audio idle release failed: ${error.message}", error)
+                if (released || !keepWaitingForPlayback) {
+                    return@launch
+                }
+                nextDelayMs = AUDIO_IDLE_RELEASE_DELAY_MS
             }
         }
     }
