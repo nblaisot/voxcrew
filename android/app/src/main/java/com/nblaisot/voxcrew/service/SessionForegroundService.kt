@@ -1,6 +1,5 @@
 package com.nblaisot.voxcrew.service
 
-import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,11 +7,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
 import com.nblaisot.voxcrew.MainActivity
 import com.nblaisot.voxcrew.R
 import com.nblaisot.voxcrew.VoxCrewApp
@@ -25,7 +22,7 @@ import kotlinx.coroutines.launch
 
 /**
  * Permanent foreground service for the whole signed-in session, started as soon as
- * the mic permission is granted and only stopped at sign-out. The notification is
+ * the user is signed in and only stopped at sign-out. The notification is
  * kept continuously in sync with [com.nblaisot.voxcrew.lanlink.LanIntercomEngine]
  * (link/discovery status + VOX on/off), so the intercom remains visible and
  * trustworthy whether the app is backgrounded or the screen is off.
@@ -115,7 +112,7 @@ class SessionForegroundService : Service() {
             .setContentIntent(openIntent)
             .setOngoing(true)
             .addAction(0, getString(R.string.action_leave_session), stopIntent)
-            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
     }
 
@@ -136,11 +133,6 @@ class SessionForegroundService : Service() {
         const val EXTRA_TRANSPORT = "transport"
 
         fun start(context: Context, transportLabel: String? = null) {
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                return
-            }
             val intent = Intent(context, SessionForegroundService::class.java)
             transportLabel?.let { intent.putExtra(EXTRA_TRANSPORT, it) }
             context.startForegroundService(intent)

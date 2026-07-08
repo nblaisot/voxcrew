@@ -271,7 +271,6 @@ class MainViewModel(
     }
 
     private fun startForegroundIfAllowed() {
-        if (!_uiState.value.micPermissionGranted) return
         SessionForegroundService.start(appContext)
     }
 

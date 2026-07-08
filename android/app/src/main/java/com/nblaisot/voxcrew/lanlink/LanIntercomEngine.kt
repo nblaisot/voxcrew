@@ -113,6 +113,7 @@ class LanIntercomEngine(
     private var receivingSweepJob: Job? = null
     private var metricsJob: Job? = null
     private var routeWatchJob: Job? = null
+    private var releaseAudioJob: Job? = null
     private val audioInitMutex = Mutex()
     private var audioPrepared = false
     private var lastFanOutDiagMs = 0L
@@ -168,6 +169,7 @@ class LanIntercomEngine(
 
         loadPersistedActiveRecipients()
         startMetricsWatcher()
+        ensureAudioRoutingMonitor()
     }
 
     fun syncCrewPeers(crewUids: Set<String>) {
@@ -208,7 +210,7 @@ class LanIntercomEngine(
 
     fun onMicrophonePermissionGranted() {
         if (!started) return
-        prepareAudioAndCapture()
+        ensureAudioRoutingMonitor()
     }
 
     fun setVoxEnabled(enabled: Boolean) {
@@ -218,29 +220,36 @@ class LanIntercomEngine(
             pttPolicy.cancel()
             activePolicy = voxPolicy
             watchPolicy(activePolicy)
-            startVoxCapture()
+            prepareAudioAndCapture()
         } else {
             stopVoxCapture()
             activePolicy = pttPolicy
             watchPolicy(activePolicy)
-            capture.attach(activePolicy.shouldTransmit) { payload -> fanOut(payload) }
+            releaseAudioWhenIdle(delayMs = 0L)
         }
     }
 
     fun setVoxSensitivity(sensitivity: VoxSensitivity) {
         _voxSensitivity.value = sensitivity
         prefs.edit().putInt(KEY_VOX_SENSITIVITY, sensitivity.level).apply()
-        if (_voxEnabled.value) startVoxCapture()
+        if (_voxEnabled.value) {
+            stopVoxCapture()
+            audioPrepared = false
+            prepareAudioAndCapture()
+        }
     }
 
     fun pttPress() {
         if (_voxEnabled.value) return
+        prepareAudioAndCapture()
+        logPttRouteSummary()
         pttPolicy.onPress()
     }
 
     fun pttRelease() {
         if (_voxEnabled.value) return
         pttPolicy.onRelease()
+        releaseAudioWhenIdle()
     }
 
     fun onBluetoothPermissionGranted() {
@@ -252,10 +261,30 @@ class LanIntercomEngine(
         scope.launch(Dispatchers.IO) {
             runCatching {
                 audioInitMutex.withLock {
-                    intercomAudioSession.refreshRouting()
+                    ensureAudioRoutingMonitorLocked()
                 }
             }
         }
+    }
+
+    private fun ensureAudioRoutingMonitor() {
+        if (!started) return
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                audioInitMutex.withLock {
+                    ensureAudioRoutingMonitorLocked()
+                }
+            }
+        }
+    }
+
+    private fun ensureAudioRoutingMonitorLocked() {
+        if (!intercomAudioSession.isActive) {
+            intercomAudioSession.enter()
+        } else {
+            intercomAudioSession.reapplyRouting()
+        }
+        watchAudioRoute()
     }
 
     private fun fanOut(payload: ByteArray) {
@@ -287,29 +316,61 @@ class LanIntercomEngine(
         }
     }
 
+    private fun logPttRouteSummary() {
+        val route = intercomAudioSession.currentRoute()
+        val active = _activeRecipientUids.value ?: emptySet()
+        val connected = active.count { uid ->
+            connections[uid]?.linkState?.value is PeerLink.LinkState.Connected
+        }
+        Log.i(
+            TAG,
+            "ptt route mic=${route.micKind} output=${route.outputKind} ready=${route.routeReady} " +
+                "mode=${route.audioMode} usage=${route.playbackUsage} captureType=${route.captureDevice?.type} " +
+                "outputType=${route.outputDevice?.type} recipients=${active.size} connected=$connected",
+        )
+    }
+
     private fun prepareAudioAndCapture() {
         scope.launch(Dispatchers.IO) {
             runCatching {
                 audioInitMutex.withLock {
-                    if (!intercomAudioSession.isActive) {
-                        intercomAudioSession.enter()
-                    } else {
-                        intercomAudioSession.retryAudioFocus()
-                    }
-                    if (!intercomAudioSession.isAudioFocusGranted()) {
-                        Log.w(TAG, "audio focus not granted — capture may be unreliable")
-                    }
-                    audioPrepared = true
-                    watchAudioRoute()
+                    releaseAudioJob?.cancel()
+                    ensureAudioRoutingMonitorLocked()
+                    intercomAudioSession.activateAudio()
                     if (!intercomAudioSession.awaitRouteReady()) {
                         Log.w(TAG, "audio route not ready; capture/playback deferred")
                         return@withLock
                     }
+                    if (!intercomAudioSession.isAudioFocusGranted()) {
+                        Log.w(TAG, "audio focus not granted — capture may be unreliable")
+                    }
+                    if (audioPrepared) return@withLock
                     playback.warmUp()
                     attachCaptureForCurrentMode()
+                    audioPrepared = true
                 }
             }.onFailure { error ->
                 Log.e(TAG, "audio session init failed: ${error.message}", error)
+            }
+        }
+    }
+
+    private fun releaseAudioWhenIdle(delayMs: Long = AUDIO_IDLE_RELEASE_DELAY_MS) {
+        releaseAudioJob?.cancel()
+        releaseAudioJob = scope.launch(Dispatchers.IO) {
+            delay(delayMs)
+            runCatching {
+                audioInitMutex.withLock {
+                    if (_voxEnabled.value || pttPolicy.shouldTransmit.value || playback.isReceiving.value) {
+                        return@withLock
+                    }
+                    capture.detach()
+                    playback.stop()
+                    audioPrepared = false
+                    intercomAudioSession.deactivateAudio()
+                }
+            }.onFailure { error ->
+                Log.e(TAG, "audio idle release failed: ${error.message}", error)
             }
         }
     }
@@ -456,6 +517,7 @@ class LanIntercomEngine(
         if (audioCollectJobs.containsKey(conn.peerUid)) return
         audioCollectJobs[conn.peerUid] = scope.launch(Dispatchers.IO) {
             conn.peerLink.incomingAudio.collect { payload ->
+                ensureAudioRoutingMonitor()
                 playback.play(payload)
                 receivingUntilMs[conn.peerUid] = System.currentTimeMillis() + RECEIVING_IDLE_MS
                 refreshReceivingUids()
@@ -639,6 +701,7 @@ class LanIntercomEngine(
     companion object {
         private const val TAG = "LanIntercomEngine"
         private const val RECEIVING_IDLE_MS = 500L
+        private const val AUDIO_IDLE_RELEASE_DELAY_MS = 900L
         private const val PREFS_NAME = "voxcrew_lanlink"
         private const val KEY_ACTIVE_RECIPIENTS = "active_recipient_uids"
         private const val KEY_VOX_ENABLED = "vox_enabled"

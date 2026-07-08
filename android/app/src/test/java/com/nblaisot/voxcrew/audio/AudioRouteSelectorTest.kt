@@ -124,6 +124,45 @@ class AudioRouteSelectorTest {
     }
 
     @Test
+    fun resolve_disabledBluetoothMic_usesBluetoothOutputAndDeviceMic() {
+        val ble = device(AudioDeviceInfo.TYPE_BLE_HEADSET, sink = true, source = true)
+        val selection = AudioRouteSelector.resolve(
+            outputs = listOf(ble),
+            inputs = listOf(ble),
+            availableCommunicationDevices = listOf(ble),
+            activeCommunicationDevice = ble,
+            supportsCommunicationDeviceApi = true,
+            recordAudioGranted = true,
+            bluetoothConnectGranted = true,
+            disabledBluetoothMicrophoneIdentities = setOf(AudioRouteSelector.deviceIdentity(ble)!!),
+        )
+
+        assertEquals(CaptureInputKind.BUILTIN, selection.route.micKind)
+        assertEquals(OutputKind.BLUETOOTH, selection.route.outputKind)
+        assertEquals(AudioAttributes.USAGE_MEDIA, selection.route.playbackUsage)
+        assertNull(selection.route.captureDevice)
+        assertNull(selection.communicationDevice)
+    }
+
+    @Test
+    fun resolve_disabledBluetoothMicByType_usesBluetoothOutputAndDeviceMic() {
+        val ble = device(AudioDeviceInfo.TYPE_BLE_HEADSET, sink = true, source = true, address = "")
+        val selection = AudioRouteSelector.resolve(
+            outputs = listOf(ble),
+            inputs = listOf(ble),
+            availableCommunicationDevices = listOf(ble),
+            activeCommunicationDevice = ble,
+            supportsCommunicationDeviceApi = true,
+            recordAudioGranted = true,
+            bluetoothConnectGranted = true,
+            disabledBluetoothMicrophoneIdentities = setOf("${AudioDeviceInfo.TYPE_BLE_HEADSET}:"),
+        )
+
+        assertEquals(CaptureInputKind.BUILTIN, selection.route.micKind)
+        assertEquals(OutputKind.BLUETOOTH, selection.route.outputKind)
+    }
+
+    @Test
     fun resolve_missingRecordPermission_blocksRoute() {
         val selection = resolve(
             outputs = listOf(device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, sink = true)),

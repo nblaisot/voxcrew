@@ -169,18 +169,25 @@ média, mais ne produisent pas de nouvelle icône micro.
 - Routes média : `clearCommunicationDevice()` si nécessaire, arrêt SCO, abandon focus,
   `MODE_NORMAL`, `USAGE_MEDIA`.
 - Routes Bluetooth micro : `MODE_IN_COMMUNICATION`, focus VoIP idempotent,
-  `USAGE_VOICE_COMMUNICATION`.
+  `USAGE_VOICE_COMMUNICATION`. Sur API 31+, `setCommunicationDevice()` est l'autorité
+  unique pour la route Bluetooth bidirectionnelle ; `AudioRecord.setPreferredDevice`
+  n'est pas utilisé pour les micros Bluetooth.
 - Échec `setCommunicationDevice(false)` ou périphérique communication absent :
   re-sélection sans micro Bluetooth, sans crash.
 
 ### Capture et lecture
 
 - `AudioCapture` attend `routeReady` avant d'ouvrir `AudioRecord`.
-- `AudioCapture` utilise `AudioRecord.setPreferredDevice` seulement pour les micros
-  Bluetooth/USB explicites ; le micro téléphone reste le défaut plateforme.
+- `AudioCapture` utilise `AudioRecord.setPreferredDevice` seulement pour les micros USB
+  explicites ; les routes Bluetooth suivent la route communication Android.
 - `AudioCapture` lit `AudioRecord.routedDevice` après `startRecording()` et corrige
   l'état si Android route finalement vers une autre entrée.
+- Si une route micro Bluetooth produit uniquement du PCM nul pendant ~800 ms,
+  `AudioCapture` signale la route comme cassée : la session garde la sortie Bluetooth
+  quand possible, retombe sur le micro téléphone, et supprime l'icône micro Bluetooth.
 - `AudioPlayback` construit `AudioTrack` depuis `AudioRouteState.playbackUsage`.
+- `AudioPlayback` vérifie la première route de sortie effective et force une ré-application
+  unique si une route Bluetooth communication n'est pas respectée.
 - `AudioPlayback` utilise `AudioTrack.setPreferredDevice` pour les sorties média
   explicites (USB/Bluetooth sortie seule) quand Android l'expose.
 - Les redémarrages capture/lecture sont sérialisés dans `LanIntercomEngine` quand la

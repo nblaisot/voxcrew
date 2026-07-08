@@ -9,6 +9,7 @@ import android.util.Log
 import com.nblaisot.voxcrew.audio.CaptureAudioEffects
 import com.nblaisot.voxcrew.audio.CaptureInputKind
 import com.nblaisot.voxcrew.audio.IntercomAudioSession
+import com.nblaisot.voxcrew.audio.AudioRouteState
 import com.nblaisot.voxcrew.audio.VoxEchoGuard
 import com.nblaisot.voxcrew.audio.VoxGate
 import com.nblaisot.voxcrew.audio.VoiceDetector
@@ -74,6 +75,8 @@ class AudioCapture(
         val encoder = OpusCodec.Encoder()
         var encodedFrames = 0
         var zeroReads = 0
+        var fullFrames = 0
+        val silenceDetector = BluetoothCaptureSilenceDetector()
         try {
             recorder.startRecording()
             logRecorderRoute(recorder, opened)
@@ -82,6 +85,13 @@ class AudioCapture(
                 val read = recorder.read(frame, 0, frame.size)
                 if (read == frame.size) {
                     zeroReads = 0
+                    fullFrames++
+                    logInitialFrame(fullFrames, frame, opened, recorder)
+                    if (silenceDetector.observe(frame, opened.route.micKind)) {
+                        Log.w(TAG, "Bluetooth capture produced exact zero PCM for ${silenceDetector.observedMs} ms")
+                        intercomAudioSession?.onBluetoothCaptureSilence(routedDevice(recorder))
+                        return
+                    }
                     val encoded = runCatching { encoder.encode(frame) }
                         .onFailure { Log.w(TAG, "Opus encode failed: ${it.message}") }
                         .getOrNull()
@@ -162,6 +172,8 @@ class AudioCapture(
         val effects = CaptureAudioEffects.attach(recorder.audioSessionId)
         val encoder = OpusCodec.Encoder()
         val preRoll = ArrayDeque<ByteArray>()
+        var fullFrames = 0
+        val silenceDetector = BluetoothCaptureSilenceDetector()
         try {
             recorder.startRecording()
             logRecorderRoute(recorder, opened)
@@ -172,6 +184,13 @@ class AudioCapture(
                     if (read > 0) Log.d(TAG, "dropping short read ($read/$frameBytes bytes)")
                     else if (read < 0) Log.w(TAG, "AudioRecord.read error code=$read")
                     continue
+                }
+                fullFrames++
+                logInitialFrame(fullFrames, frame, opened, recorder)
+                if (silenceDetector.observe(frame, opened.route.micKind)) {
+                    Log.w(TAG, "Bluetooth Vox capture produced exact zero PCM for ${silenceDetector.observedMs} ms")
+                    intercomAudioSession?.onBluetoothCaptureSilence(routedDevice(recorder))
+                    return
                 }
                 val encoded = runCatching { encoder.encode(frame) }
                     .onFailure { Log.w(TAG, "Opus encode failed: ${it.message}") }
@@ -252,19 +271,37 @@ class AudioCapture(
         } else {
             Log.i(TAG, "AudioRecord opened with platform default input source=$audioSource")
         }
-        return OpenedRecorder(recorder, preferredInput, audioSource)
+        return OpenedRecorder(recorder, preferredInput, audioSource, route ?: AudioRouteState.builtIn())
     }
 
     private fun logRecorderRoute(recorder: AudioRecord, opened: OpenedRecorder) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
-        val routedDevice = recorder.routedDevice
+        val routedDevice = routedDevice(recorder)
         Log.i(
             TAG,
             "AudioRecord recording source=${opened.audioSource} " +
-                "preferredType=${opened.preferredInput?.type} routedType=${routedDevice?.type}",
+                "routeMic=${opened.route.micKind} preferredType=${opened.preferredInput?.type} " +
+                "routedType=${routedDevice?.type}",
         )
         intercomAudioSession?.onCaptureRouteObserved(routedDevice)
     }
+
+    private fun logInitialFrame(
+        frameNumber: Int,
+        frame: ByteArray,
+        opened: OpenedRecorder,
+        recorder: AudioRecord,
+    ) {
+        if (frameNumber > INITIAL_CAPTURE_DIAGNOSTIC_FRAMES) return
+        Log.i(
+            TAG,
+            "capture frame=$frameNumber source=${opened.audioSource} routeMic=${opened.route.micKind} " +
+                "preferredType=${opened.preferredInput?.type} routedType=${routedDevice(recorder)?.type} " +
+                "pcmRms=${pcmRms(frame)} allZero=${isAllZeroPcm(frame)}",
+        )
+    }
+
+    private fun routedDevice(recorder: AudioRecord): AudioDeviceInfo? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) recorder.routedDevice else null
 
     private fun bytesToShorts(bytes: ByteArray): ShortArray {
         val shorts = ShortArray(bytes.size / 2)
@@ -283,11 +320,15 @@ class AudioCapture(
         return kotlin.math.sqrt(sum / shorts.size).toInt()
     }
 
+    private fun isAllZeroPcm(frame: ByteArray): Boolean = frame.all { it == 0.toByte() }
+
     companion object {
         private const val TAG = "AudioCapture"
         const val SAMPLE_RATE = 16_000
         const val FRAME_MS = 20
         const val BYTES_PER_SAMPLE = 2
+        private const val INITIAL_CAPTURE_DIAGNOSTIC_FRAMES = 5
+        private const val BLUETOOTH_SILENCE_FALLBACK_MS = 800
 
         /** ~200 ms of pre-roll (10 frames at 20 ms) — see [voxCaptureLoop]. */
         private const val PRE_ROLL_FRAMES = 10
@@ -297,5 +338,27 @@ class AudioCapture(
         val recorder: AudioRecord,
         val preferredInput: AudioDeviceInfo?,
         val audioSource: Int,
+        val route: AudioRouteState,
     )
+
+    internal class BluetoothCaptureSilenceDetector(
+        private val framesToObserve: Int = BLUETOOTH_SILENCE_FALLBACK_MS / FRAME_MS,
+    ) {
+        private var observing = true
+        private var framesObserved = 0
+
+        val observedMs: Int get() = framesObserved * FRAME_MS
+
+        fun observe(frame: ByteArray, micKind: CaptureInputKind): Boolean {
+            if (!observing || micKind != CaptureInputKind.BLUETOOTH) return false
+            framesObserved++
+            if (!frame.all { it == 0.toByte() }) {
+                observing = false
+                return false
+            }
+            if (framesObserved < framesToObserve) return false
+            observing = false
+            return true
+        }
+    }
 }

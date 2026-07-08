@@ -154,6 +154,7 @@ object AudioRouteSelector {
         recordAudioGranted: Boolean,
         bluetoothConnectGranted: Boolean,
         ignoreBluetoothMicrophones: Boolean = false,
+        disabledBluetoothMicrophoneIdentities: Set<String> = emptySet(),
     ): AudioRouteSelection {
         if (!recordAudioGranted) {
             return AudioRouteSelection(
@@ -175,6 +176,7 @@ object AudioRouteSelector {
                 activeCommunicationDevice = activeCommunicationDevice,
                 supportsCommunicationDeviceApi = supportsCommunicationDeviceApi,
                 bluetoothConnectGranted = bluetoothConnectGranted,
+                disabledBluetoothMicrophoneIdentities = disabledBluetoothMicrophoneIdentities,
             )
             if (bluetoothSelection != null) return bluetoothSelection
         }
@@ -237,10 +239,13 @@ object AudioRouteSelector {
         activeCommunicationDevice: AudioDeviceInfo?,
         supportsCommunicationDeviceApi: Boolean,
         bluetoothConnectGranted: Boolean,
+        disabledBluetoothMicrophoneIdentities: Set<String>,
     ): AudioRouteSelection? {
         val bluetoothInput = pickBluetoothInput(inputSources)
+            ?.takeUnless { isBluetoothMicrophoneDisabled(it, disabledBluetoothMicrophoneIdentities) }
         val communicationDevice = if (supportsCommunicationDeviceApi) {
             pickBluetoothCommunicationDevice(availableCommunicationDevices)
+                ?.takeUnless { isBluetoothMicrophoneDisabled(it, disabledBluetoothMicrophoneIdentities) }
         } else {
             null
         }
@@ -339,4 +344,13 @@ object AudioRouteSelector {
             in USB_TYPES -> OutputKind.USB
             else -> OutputKind.WIRED
         }
+
+    private fun isBluetoothMicrophoneDisabled(
+        device: AudioDeviceInfo,
+        disabledBluetoothMicrophoneIdentities: Set<String>,
+    ): Boolean {
+        if (disabledBluetoothMicrophoneIdentities.isEmpty()) return false
+        val identity = deviceIdentity(device)
+        return identity in disabledBluetoothMicrophoneIdentities || "${device.type}:" in disabledBluetoothMicrophoneIdentities
+    }
 }

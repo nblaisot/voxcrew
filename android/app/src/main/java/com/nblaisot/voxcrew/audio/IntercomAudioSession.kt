@@ -79,7 +79,9 @@ class IntercomAudioSession(
     private var savedMode: Int? = null
     private var savedSpeakerphoneOn: Boolean? = null
     private var active = false
+    private var audioActive = false
     private val routeReadyAwaiters = CopyOnWriteArrayList<CountDownLatch>()
+    private val disabledBluetoothMicrophoneIdentities = mutableSetOf<String>()
 
     private val _audioRoute = MutableStateFlow(AudioRouteState.builtIn(routeReady = false))
     val audioRoute: StateFlow<AudioRouteState> = _audioRoute.asStateFlow()
@@ -98,11 +100,17 @@ class IntercomAudioSession(
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
-            postOnRoutingThread { applyRoutingInternal() }
+            postOnRoutingThread {
+                clearDisabledBluetoothMicrophones()
+                applyRoutingInternal()
+            }
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
-            postOnRoutingThread { applyRoutingInternal() }
+            postOnRoutingThread {
+                clearDisabledBluetoothMicrophones()
+                applyRoutingInternal()
+            }
         }
     }
 
@@ -115,6 +123,8 @@ class IntercomAudioSession(
     fun enter() {
         if (active) return
         active = true
+        audioActive = false
+        disabledBluetoothMicrophoneIdentities.clear()
         savedMode = audioManager.mode
         savedSpeakerphoneOn = audioManager.isSpeakerphoneOn
         audioManager.registerAudioDeviceCallback(deviceCallback, routing.callbackHandler)
@@ -128,7 +138,7 @@ class IntercomAudioSession(
     }
 
     fun retryAudioFocus(): Boolean {
-        if (!active) return false
+        if (!active || !audioActive) return false
         return if (_audioRoute.value.audioMode == AudioManager.MODE_IN_COMMUNICATION) {
             audioFocus.request()
         } else {
@@ -137,17 +147,19 @@ class IntercomAudioSession(
     }
 
     fun isAudioFocusGranted(): Boolean =
-        _audioRoute.value.audioMode != AudioManager.MODE_IN_COMMUNICATION || audioFocus.isGranted()
+        !audioActive || _audioRoute.value.audioMode != AudioManager.MODE_IN_COMMUNICATION || audioFocus.isGranted()
 
     fun exit() {
         if (!active) return
         active = false
+        audioActive = false
         runOnRoutingThread {
             runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
             if (supportsCommunicationDeviceApi) {
                 audioManager.setOnCommunicationDeviceChangedListener(null)
             }
             router.release()
+            disabledBluetoothMicrophoneIdentities.clear()
             publishRoute(AudioRouteState.builtIn(routeReady = false))
             releaseRouteReadyAwaiters()
             logInfo(TAG, "routing thread cleaned up")
@@ -157,6 +169,23 @@ class IntercomAudioSession(
         savedMode = null
         savedSpeakerphoneOn = null
         logInfo(TAG, "restored previous audio mode")
+    }
+
+    fun activateAudio() {
+        if (!active) enter()
+        runOnRoutingThread {
+            audioActive = true
+            applyRoutingInternal()
+        }
+    }
+
+    fun deactivateAudio() {
+        if (!active) return
+        runOnRoutingThread {
+            audioActive = false
+            router.release()
+            applyRoutingInternal()
+        }
     }
 
     fun awaitRoutingApplied() {
@@ -186,9 +215,28 @@ class IntercomAudioSession(
     fun preferredCaptureDevice(): AudioDeviceInfo? {
         if (!active || !_routeReady.value) return null
         val route = runOnRoutingThread { _audioRoute.value }
-        return route.captureDevice?.takeIf {
-            it.isSource && route.micKind != CaptureInputKind.BUILTIN
+        val capture = route.captureDevice?.takeIf { it.isSource } ?: return null
+        return when (route.micKind) {
+            CaptureInputKind.USB -> capture.takeIf { preferredCaptureMatchesOutput(it, route.outputDevice) }
+            CaptureInputKind.BUILTIN -> null
+            CaptureInputKind.BLUETOOTH -> null
         }
+    }
+
+    private fun preferredCaptureMatchesOutput(
+        capture: AudioDeviceInfo,
+        output: AudioDeviceInfo?,
+    ): Boolean {
+        if (output == null) return true
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return capture.type == output.type
+        }
+        val outputAddress = output.address
+        val captureAddress = capture.address
+        if (outputAddress.isEmpty() || captureAddress.isEmpty()) {
+            return capture.type == output.type
+        }
+        return outputAddress == captureAddress
     }
 
     fun onRecordAudioPermissionMissing() {
@@ -217,6 +265,12 @@ class IntercomAudioSession(
                 -> CaptureInputKind.USB
                 else -> CaptureInputKind.BUILTIN
             }
+            if (observedKind == CaptureInputKind.BLUETOOTH &&
+                AudioRouteSelector.deviceIdentity(routedDevice) in disabledBluetoothMicrophoneIdentities
+            ) {
+                logWarn(TAG, "ignoring disabled Bluetooth routed input type=${routedDevice.type}")
+                return@postOnRoutingThread
+            }
             if (current.micKind != CaptureInputKind.BUILTIN && observedKind == CaptureInputKind.BUILTIN) {
                 publishRoute(
                     current.copy(
@@ -239,7 +293,32 @@ class IntercomAudioSession(
 
     fun refreshRouting() {
         if (!active) return
+        postOnRoutingThread {
+            clearDisabledBluetoothMicrophones()
+            applyRoutingInternal()
+        }
+    }
+
+    fun reapplyRouting() {
+        if (!active) return
         postOnRoutingThread { applyRoutingInternal() }
+    }
+
+    fun onBluetoothCaptureSilence(routedDevice: AudioDeviceInfo?) {
+        postOnRoutingThread {
+            val current = _audioRoute.value
+            if (current.micKind != CaptureInputKind.BLUETOOTH) return@postOnRoutingThread
+            val identities = listOf(routedDevice, current.captureDevice, current.outputDevice)
+                .mapNotNull { AudioRouteSelector.deviceIdentity(it) }
+                .toSet()
+            if (identities.isEmpty()) return@postOnRoutingThread
+            disabledBluetoothMicrophoneIdentities += identities
+            logWarn(
+                TAG,
+                "Bluetooth capture stayed silent; disabling mic identities=$identities and re-routing",
+            )
+            applyRoutingInternal()
+        }
     }
 
     private fun postOnRoutingThread(block: () -> Unit) {
@@ -270,7 +349,11 @@ class IntercomAudioSession(
 
     private fun applyRoutingInternal() {
         if (!active) return
-        val route = router.applyRouting(permissionChecker)
+        val route = router.applyRouting(
+            permissionChecker = permissionChecker,
+            disabledBluetoothMicrophoneIdentities = disabledBluetoothMicrophoneIdentities,
+            audioActive = audioActive,
+        )
         publishRoute(route)
     }
 
@@ -304,6 +387,13 @@ class IntercomAudioSession(
         routeReadyAwaiters.clear()
     }
 
+    private fun clearDisabledBluetoothMicrophones() {
+        if (disabledBluetoothMicrophoneIdentities.isNotEmpty()) {
+            logInfo(TAG, "clearing disabled Bluetooth mic identities")
+            disabledBluetoothMicrophoneIdentities.clear()
+        }
+    }
+
     companion object {
         private const val TAG = "IntercomAudioSession"
         private const val ROUTING_OPERATION_TIMEOUT_MS = 3_000L
@@ -321,12 +411,16 @@ private class AndroidAudioRouter(
 ) {
     private var scoStarted = false
 
-    fun applyRouting(permissionChecker: AudioPermissionChecker): AudioRouteState {
+    fun applyRouting(
+        permissionChecker: AudioPermissionChecker,
+        disabledBluetoothMicrophoneIdentities: Set<String>,
+        audioActive: Boolean,
+    ): AudioRouteState {
         val recordAudioGranted = permissionChecker.hasRecordAudioPermission()
         val bluetoothConnectGranted = permissionChecker.hasBluetoothConnectPermission()
         val outputs = getDevices(AudioManager.GET_DEVICES_OUTPUTS)
         val inputs = getDevices(AudioManager.GET_DEVICES_INPUTS)
-        val availableCommunicationDevices = if (supportsCommunicationDeviceApi && bluetoothConnectGranted) {
+        val availableCommunicationDevices = if (audioActive && supportsCommunicationDeviceApi && bluetoothConnectGranted) {
             runCatching { audioManager.availableCommunicationDevices() }
                 .getOrElse { error ->
                     if (error is SecurityException) {
@@ -338,7 +432,7 @@ private class AndroidAudioRouter(
         } else {
             emptyList()
         }
-        val activeCommunicationDevice = if (supportsCommunicationDeviceApi && bluetoothConnectGranted) {
+        val activeCommunicationDevice = if (audioActive && supportsCommunicationDeviceApi && bluetoothConnectGranted) {
             runCatching { audioManager.communicationDevice() }
                 .getOrElse { error ->
                     if (error is SecurityException) {
@@ -359,6 +453,8 @@ private class AndroidAudioRouter(
             supportsCommunicationDeviceApi = supportsCommunicationDeviceApi,
             recordAudioGranted = recordAudioGranted,
             bluetoothConnectGranted = bluetoothConnectGranted,
+            ignoreBluetoothMicrophones = !audioActive,
+            disabledBluetoothMicrophoneIdentities = disabledBluetoothMicrophoneIdentities,
         )
         return applySelection(
             selection = selection,
