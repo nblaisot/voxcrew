@@ -9,10 +9,14 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.nblaisot.voxcrew.audio.AudioPermissionIssue
-import com.nblaisot.voxcrew.audio.AudioRoute
-import com.nblaisot.voxcrew.audio.AudioRouteSelector
+import com.nblaisot.voxcrew.audio.AudioPipelineState
+import com.nblaisot.voxcrew.audio.AudioRouteChoice
+import com.nblaisot.voxcrew.audio.AudioSessionIssue
 import com.nblaisot.voxcrew.audio.CaptureInputKind
+import com.nblaisot.voxcrew.audio.RouteRequestWarning
 import com.nblaisot.voxcrew.audio.VoxSensitivity
+import com.nblaisot.voxcrew.audio.deviceAudioRouteChoice
+import com.nblaisot.voxcrew.audio.isConfirmedDuplexReady
 import com.nblaisot.voxcrew.auth.AuthRepository
 import com.nblaisot.voxcrew.lanlink.LanIntercomEngine
 import com.nblaisot.voxcrew.lanlink.PeerMetrics
@@ -31,6 +35,7 @@ data class MainUiState(
     val localEmail: String? = null,
     val statusMessage: String = "Recherche de coéquipiers…",
     val bannerMessage: String? = null,
+    val showAudioRetry: Boolean = false,
     val crew: List<CrewMember> = emptyList(),
     val activeRecipientUids: Set<String> = emptySet(),
     val receivingAudioFromUid: String? = null,
@@ -38,12 +43,17 @@ data class MainUiState(
     val voxEnabled: Boolean = false,
     val voxSensitivity: Int = VoxSensitivity.DEFAULT.level,
     val isTransmitting: Boolean = false,
-    val pttEnabled: Boolean = true,
+    val pttEnabled: Boolean = false,
+    val appForeground: Boolean = false,
     val micPermissionGranted: Boolean = false,
     val bluetoothConnectGranted: Boolean = true,
     val audioRouteReady: Boolean = false,
+    val audioStartAllowed: Boolean = true,
     val permissionPrompt: AudioPermissionIssue? = null,
-    val pttMicIconKind: CaptureInputKind? = null,
+    val audioRouteChoices: List<AudioRouteChoice> = listOf(deviceAudioRouteChoice()),
+    val selectedAudioRoute: AudioRouteChoice = deviceAudioRouteChoice(),
+    val audioRoutePending: Boolean = false,
+    val pttMicIconKind: CaptureInputKind = CaptureInputKind.BUILTIN,
 )
 
 /**
@@ -107,15 +117,42 @@ class MainViewModel(
             }
         }
         viewModelScope.launch {
-            lanEngine.audioRoute.collect { route ->
+            combine(
+                lanEngine.audioRouteSelection,
+                lanEngine.audioRoute,
+                lanEngine.audioPipelineState,
+                lanEngine.captureInputKind,
+                lanEngine.appForeground,
+            ) { selection, route, pipeline, input, appForeground ->
+                AudioUiSnapshot(selection, route, pipeline, input, appForeground)
+            }.collect { snapshot ->
+                val selection = snapshot.selection
+                val route = snapshot.route
+                val pipeline = snapshot.pipeline
+                val input = snapshot.input
+                val appForeground = snapshot.appForeground
+                val ready = isConfirmedDuplexReady(route, pipeline)
+                val pipelineFailure = pipeline as? AudioPipelineState.Failed
+                val startAllowed = route.sessionIssue == null && pipelineFailure == null
                 _uiState.update {
                     it.copy(
-                        pttMicIconKind = pttMicIconKind(route),
-                        audioRouteReady = route.routeReady,
-                        permissionPrompt = route.permissionIssue
-                            ?: it.permissionPrompt?.takeIf { prompt ->
-                                prompt == AudioPermissionIssue.RECORD_AUDIO && !it.micPermissionGranted
-                            },
+                        audioRouteChoices = selection.availableChoices,
+                        selectedAudioRoute = selection.selectedChoice,
+                        appForeground = appForeground,
+                        audioRoutePending = appForeground &&
+                            !it.voxEnabled &&
+                            it.micPermissionGranted &&
+                            startAllowed &&
+                            !ready,
+                        pttMicIconKind = if (ready) input else selection.selectedChoice.inputKind,
+                        audioRouteReady = ready,
+                        audioStartAllowed = startAllowed,
+                        bannerMessage = route.sessionIssue?.toUserMessage()
+                            ?: pipelineFailure?.let { failure ->
+                                "Audio indisponible : ${failure.reason}"
+                            }
+                            ?: route.routeRequestWarning?.toUserMessage(),
+                        showAudioRetry = !startAllowed,
                     ).withPttEnabled()
                 }
             }
@@ -143,6 +180,8 @@ class MainViewModel(
             startForegroundIfAllowed()
             SessionForegroundService.refreshForegroundTypes(appContext)
             lanEngine.onMicrophonePermissionGranted()
+        } else {
+            lanEngine.onMicrophonePermissionDenied()
         }
         lanEngine.refreshAudioRouting()
     }
@@ -152,9 +191,13 @@ class MainViewModel(
 
     private fun MainUiState.withPttEnabled(): MainUiState =
         copy(
-            pttEnabled = !voxEnabled &&
-                micPermissionGranted &&
-                permissionPrompt == null,
+            pttEnabled = computePttEnabled(
+                voxEnabled = voxEnabled,
+                appForeground = appForeground,
+                micPermissionGranted = micPermissionGranted,
+                audioRouteReady = audioRouteReady,
+                audioStartAllowed = audioStartAllowed,
+            ),
         )
 
     private fun startIntercom() {
@@ -185,6 +228,7 @@ class MainViewModel(
                 bluetoothConnectGranted = btGranted,
                 permissionPrompt = when {
                     !micGranted -> AudioPermissionIssue.RECORD_AUDIO
+                    !btGranted -> AudioPermissionIssue.BLUETOOTH_CONNECT
                     it.permissionPrompt == AudioPermissionIssue.BLUETOOTH_CONNECT && btGranted -> null
                     else -> it.permissionPrompt
                 },
@@ -194,6 +238,8 @@ class MainViewModel(
             startForegroundIfAllowed()
             SessionForegroundService.refreshForegroundTypes(appContext)
             lanEngine.onMicrophonePermissionGranted()
+        } else {
+            lanEngine.onMicrophonePermissionDenied()
         }
         if (btGranted) {
             lanEngine.onBluetoothPermissionGranted()
@@ -227,12 +273,20 @@ class MainViewModel(
             startForegroundIfAllowed()
             lanEngine.onMicrophonePermissionGranted()
         } else {
-            lanEngine.refreshAudioRouting()
+            lanEngine.onMicrophonePermissionDenied()
         }
     }
 
     fun dismissPermissionPrompt() {
         _uiState.update { it.copy(permissionPrompt = null).withPttEnabled() }
+    }
+
+    fun retryAudio() {
+        lanEngine.retryAudioPipeline()
+    }
+
+    fun selectAudioRoute(key: String) {
+        lanEngine.selectAudioRoute(key)
     }
 
     fun toggleRecipient(member: CrewMember) {
@@ -261,7 +315,6 @@ class MainViewModel(
 
     fun pttRelease() {
         Log.d(TAG, "pttRelease (enabled=${_uiState.value.pttEnabled})")
-        if (!_uiState.value.pttEnabled) return
         lanEngine.pttRelease()
     }
 
@@ -279,7 +332,34 @@ class MainViewModel(
     private companion object {
         const val TAG = "VoxCrewVM"
 
-        fun pttMicIconKind(route: AudioRoute): CaptureInputKind? =
-            AudioRouteSelector.pttMicIconKind(route)
+        fun AudioSessionIssue.toUserMessage(): String = when (this) {
+            AudioSessionIssue.TELECOM_UNAVAILABLE -> "Session audio Android indisponible"
+            AudioSessionIssue.AUDIO_PIPELINE_FAILED -> "Le pipeline audio a rencontré une erreur"
+        }
+
+        fun RouteRequestWarning.toUserMessage(): String = when (this) {
+            RouteRequestWarning.ENDPOINT_CHANGE_FAILED ->
+                "La sortie audio sélectionnée n'a pas pu être activée; aucun son n'est transmis"
+        }
     }
 }
+
+private data class AudioUiSnapshot(
+    val selection: com.nblaisot.voxcrew.audio.AudioRouteSelectionState,
+    val route: com.nblaisot.voxcrew.audio.TelecomCallState,
+    val pipeline: AudioPipelineState,
+    val input: CaptureInputKind,
+    val appForeground: Boolean,
+)
+
+internal fun computePttEnabled(
+    voxEnabled: Boolean,
+    appForeground: Boolean,
+    micPermissionGranted: Boolean,
+    audioRouteReady: Boolean,
+    audioStartAllowed: Boolean,
+): Boolean = !voxEnabled &&
+    appForeground &&
+    micPermissionGranted &&
+    audioRouteReady &&
+    audioStartAllowed

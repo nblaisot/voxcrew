@@ -73,6 +73,24 @@ class SendBufferTest {
     }
 
     @Test
+    fun `media activity is replayed but excluded from audio backlog count`() {
+        val buffer = SendBuffer()
+        buffer.add(0, ByteArray(0), kind = SendBuffer.Kind.MEDIA_ACTIVE)
+        buffer.add(1, byteArrayOf(7))
+        buffer.add(2, ByteArray(0), kind = SendBuffer.Kind.MEDIA_INACTIVE)
+
+        assertEquals(1, buffer.audioFrameCount())
+        assertEquals(
+            listOf(
+                LanFrame.MediaActivity(0, true)::class,
+                LanFrame.Audio(1, byteArrayOf(7))::class,
+                LanFrame.MediaActivity(2, false)::class,
+            ),
+            buffer.replayFrom(-1).map { it.toFrame()::class },
+        )
+    }
+
+    @Test
     fun `expireOlderThan keeps frames younger than max age`() {
         val buffer = SendBuffer()
         val now = 1_000_000L

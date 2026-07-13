@@ -2,6 +2,11 @@ package com.nblaisot.voxcrew.lanlink
 
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -28,6 +33,67 @@ class PeerLinkTest {
         }
 
         fun sentAudio(): List<LanFrame.Audio> = sent.filterIsInstance<LanFrame.Audio>()
+        fun sentActivity(): List<LanFrame.MediaActivity> = sent.filterIsInstance<LanFrame.MediaActivity>()
+    }
+
+    @Test
+    fun `media activity is sequenced buffered and replayed with audio`() {
+        val peerLink = newPeerLink()
+        peerLink.resetFor("peer-b")
+        peerLink.sendMediaActivity(true)
+        peerLink.send(byteArrayOf(3))
+        peerLink.sendMediaActivity(false)
+
+        val transport = FakeTransport("A")
+        peerLink.onHandshakeComplete(transport, "peer-b", -1)
+
+        assertEquals(
+            listOf(
+                LanFrame.MediaActivity(0, true),
+                LanFrame.Audio(1, byteArrayOf(3)),
+                LanFrame.MediaActivity(2, false),
+            ).map { it::class },
+            transport.sent.map { it::class },
+        )
+        assertEquals(listOf(true, false), transport.sentActivity().map { it.active })
+        peerLink.clear()
+    }
+
+    @Test
+    fun `out of order sequenced media waits for the missing frame`() {
+        val peerLink = newPeerLink()
+        peerLink.resetFor("peer-b")
+        val transport = FakeTransport("A")
+        peerLink.onHandshakeComplete(transport, "peer-b", -1)
+
+        peerLink.onFrameReceived(transport, LanFrame.Audio(1, byteArrayOf(2)))
+        assertEquals(-1L, peerLink.lastContiguousInSeq())
+        peerLink.onFrameReceived(transport, LanFrame.MediaActivity(0, true))
+
+        assertEquals(1L, peerLink.lastContiguousInSeq())
+        peerLink.clear()
+    }
+
+    @Test
+    fun `incoming talk boundaries and audio are emitted in sequence order`() = runTest {
+        val peerLink = PeerLink(this)
+        peerLink.resetFor("peer-b")
+        val transport = FakeTransport("A")
+        peerLink.onHandshakeComplete(transport, "peer-b", -1)
+        val events = mutableListOf<IncomingMediaEvent>()
+        val collectJob = launch(UnconfinedTestDispatcher(testScheduler)) {
+            peerLink.incomingMedia.take(3).toList(events)
+        }
+
+        peerLink.onFrameReceived(transport, LanFrame.Audio(1, byteArrayOf(9)))
+        peerLink.onFrameReceived(transport, LanFrame.MediaActivity(0, true))
+        peerLink.onFrameReceived(transport, LanFrame.MediaActivity(2, false))
+        collectJob.join()
+
+        assertEquals(IncomingMediaEvent.Activity(true), events[0])
+        assertTrue(events[1] is IncomingMediaEvent.Audio)
+        assertEquals(IncomingMediaEvent.Activity(false), events[2])
+        peerLink.clear()
     }
 
     private fun newPeerLink(): PeerLink {

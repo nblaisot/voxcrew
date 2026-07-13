@@ -13,6 +13,12 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.TreeMap
+
+sealed interface IncomingMediaEvent {
+    data class Audio(val payload: ByteArray) : IncomingMediaEvent
+    data class Activity(val active: Boolean) : IncomingMediaEvent
+}
 
 /**
  * Transport-agnostic core of the intercom link with one peer: owns the
@@ -43,6 +49,8 @@ class PeerLink(private val scope: CoroutineScope) {
 
     private val _incomingAudio = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
     val incomingAudio: SharedFlow<ByteArray> = _incomingAudio.asSharedFlow()
+    private val _incomingMedia = MutableSharedFlow<IncomingMediaEvent>(extraBufferCapacity = 256)
+    val incomingMedia: SharedFlow<IncomingMediaEvent> = _incomingMedia.asSharedFlow()
 
     private val _rttMs = MutableStateFlow<Long?>(null)
     val rttMs: StateFlow<Long?> = _rttMs.asStateFlow()
@@ -61,6 +69,7 @@ class PeerLink(private val scope: CoroutineScope) {
     private val sendBuffer = SendBuffer()
     @Volatile private var outSeq = 0L
     @Volatile private var lastContiguousInSeq = -1L
+    private val pendingInbound = TreeMap<Long, LanFrame>()
     @Volatile private var lastActivityMs = System.currentTimeMillis()
     @Volatile private var lastPingSentMs = 0L
     @Volatile private var awaitingPongSinceMs: Long? = null
@@ -91,6 +100,7 @@ class PeerLink(private val scope: CoroutineScope) {
         sendBuffer.clear()
         outSeq = 0
         lastContiguousInSeq = -1
+        pendingInbound.clear()
         lastActivityMs = System.currentTimeMillis()
         awaitingPongSinceMs = null
         lastPingSentMs = 0L
@@ -109,6 +119,7 @@ class PeerLink(private val scope: CoroutineScope) {
         sendBuffer.clear()
         outSeq = 0
         lastContiguousInSeq = -1
+        pendingInbound.clear()
         awaitingPongSinceMs = null
         lastPingSentMs = 0L
         _backlogMs.value = 0
@@ -123,11 +134,20 @@ class PeerLink(private val scope: CoroutineScope) {
     }
 
     /** Buffers immediately; flushes over the active transport right away if there is one. */
+    @Synchronized
     fun send(payload: ByteArray) {
         val seq = outSeq++
         sendBuffer.add(seq, payload)
         updateBacklog()
         activeTransport?.sendFrame(LanFrame.Audio(seq, payload))
+    }
+
+    @Synchronized
+    fun sendMediaActivity(active: Boolean) {
+        val seq = outSeq++
+        val kind = if (active) SendBuffer.Kind.MEDIA_ACTIVE else SendBuffer.Kind.MEDIA_INACTIVE
+        sendBuffer.add(seq, ByteArray(0), kind = kind)
+        activeTransport?.sendFrame(LanFrame.MediaActivity(seq, active))
     }
 
     /** Called by a transport once its own Hello/resume exchange with [peerUid] has succeeded. */
@@ -144,7 +164,7 @@ class PeerLink(private val scope: CoroutineScope) {
         updateBacklog()
         _state.value = LinkState.Connected(peerUid, transport.label)
         sendBuffer.replayFrom(peerAnnouncedLastContiguousSeq).forEach {
-            transport.sendFrame(LanFrame.Audio(it.seq, it.data))
+            transport.sendFrame(it.toFrame())
         }
     }
 
@@ -153,12 +173,8 @@ class PeerLink(private val scope: CoroutineScope) {
         if (activeTransport !== transport) return
         lastActivityMs = System.currentTimeMillis()
         when (frame) {
-            is LanFrame.Audio -> {
-                if (frame.seq > lastContiguousInSeq) {
-                    lastContiguousInSeq = frame.seq
-                    _incomingAudio.tryEmit(frame.payload)
-                }
-            }
+            is LanFrame.Audio -> acceptSequenced(frame.seq, frame)
+            is LanFrame.MediaActivity -> acceptSequenced(frame.seq, frame)
             is LanFrame.Ack -> {
                 sendBuffer.trimTo(frame.lastContiguousSeq)
                 updateBacklog()
@@ -250,7 +266,28 @@ class PeerLink(private val scope: CoroutineScope) {
     }
 
     private fun updateBacklog() {
-        _backlogMs.value = sendBuffer.size().toLong() * AudioCapture.FRAME_MS
+        _backlogMs.value = sendBuffer.audioFrameCount().toLong() * AudioCapture.FRAME_MS
+    }
+
+    @Synchronized
+    private fun acceptSequenced(seq: Long, frame: LanFrame) {
+        if (seq <= lastContiguousInSeq || pendingInbound.containsKey(seq)) return
+        if (pendingInbound.size >= MAX_PENDING_INBOUND_FRAMES) return
+        pendingInbound[seq] = frame
+        while (true) {
+            val nextSeq = lastContiguousInSeq + 1
+            val next = pendingInbound.remove(nextSeq) ?: break
+            lastContiguousInSeq = nextSeq
+            when (next) {
+                is LanFrame.Audio -> {
+                    _incomingAudio.tryEmit(next.payload)
+                    _incomingMedia.tryEmit(IncomingMediaEvent.Audio(next.payload))
+                }
+                is LanFrame.MediaActivity ->
+                    _incomingMedia.tryEmit(IncomingMediaEvent.Activity(next.active))
+                else -> Unit
+            }
+        }
     }
 
     companion object {
@@ -262,5 +299,6 @@ class PeerLink(private val scope: CoroutineScope) {
         /** Threshold used by the path manager to consider a connected local link "degraded". */
         const val DEGRADED_RTT_MS = 2_000L
         const val DEGRADED_UNACKED_AGE_MS = 1_000L
+        private const val MAX_PENDING_INBOUND_FRAMES = 512
     }
 }

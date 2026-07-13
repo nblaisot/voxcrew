@@ -31,10 +31,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Headset
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
@@ -69,6 +72,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -103,6 +107,7 @@ fun MainScreen(
     val haptic = LocalHapticFeedback.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var menuExpanded by remember { mutableStateOf(false) }
+    var audioMenuExpanded by remember { mutableStateOf(false) }
 
     RequestAppPermissions(onResult = viewModel::onPermissionsResult)
 
@@ -204,6 +209,44 @@ fun MainScreen(
                         )
                     }
                 },
+                actions = {
+                    IconButton(onClick = { audioMenuExpanded = true }) {
+                        Icon(
+                            imageVector = audioRouteIcon(state.selectedAudioRoute.inputKind),
+                            contentDescription = "Audio : ${state.selectedAudioRoute.name}",
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = audioMenuExpanded,
+                        onDismissRequest = { audioMenuExpanded = false },
+                    ) {
+                        state.audioRouteChoices.forEach { choice ->
+                            DropdownMenuItem(
+                                text = { Text(choice.name) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = audioRouteIcon(choice.inputKind),
+                                        contentDescription = null,
+                                    )
+                                },
+                                trailingIcon = if (choice.key == state.selectedAudioRoute.key) {
+                                    {
+                                        Icon(
+                                            imageVector = Icons.Filled.Check,
+                                            contentDescription = "Sélectionné",
+                                        )
+                                    }
+                                } else {
+                                    null
+                                },
+                                onClick = {
+                                    audioMenuExpanded = false
+                                    viewModel.selectAudioRoute(choice.key)
+                                },
+                            )
+                        }
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface,
                 ),
@@ -218,11 +261,17 @@ fun MainScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             state.bannerMessage?.let { banner ->
-                Text(
-                    banner,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        banner,
+                        modifier = Modifier.weight(1f),
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    if (state.showAudioRetry) {
+                        TextButton(onClick = viewModel::retryAudio) { Text("Réessayer") }
+                    }
+                }
             }
 
             Text(
@@ -278,12 +327,18 @@ fun MainScreen(
                 )
             }
 
-            val pttColor = if (state.isTransmitting) VoxPttActive else VoxPttIdle
-            val micIcon = when (state.pttMicIconKind) {
-                CaptureInputKind.BLUETOOTH -> Icons.Filled.Bluetooth
-                CaptureInputKind.USB -> Icons.Filled.Usb
-                CaptureInputKind.BUILTIN, null -> null
+            val pttPreparing = !state.voxEnabled && !state.pttEnabled
+            val pttColor = when {
+                state.isTransmitting -> VoxPttActive
+                pttPreparing -> MaterialTheme.colorScheme.surfaceVariant
+                else -> VoxPttIdle
             }
+            val pttContentColor = if (pttPreparing) {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            } else {
+                MaterialTheme.colorScheme.onPrimary
+            }
+            val micIcon = audioRouteIcon(state.pttMicIconKind)
             // Deliberately NOT a material Button: its internal clickable consumes
             // the down event, which prevents detectTapGestures.onPress from ever
             // firing (press-and-hold would be dead).
@@ -313,24 +368,24 @@ fun MainScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center,
                 ) {
-                    if (micIcon != null) {
-                        Icon(
-                            imageVector = micIcon,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onPrimary,
-                            modifier = Modifier
-                                .size(28.dp)
-                                .padding(end = 8.dp),
-                        )
-                    }
+                    Icon(
+                        imageVector = micIcon,
+                        contentDescription = null,
+                        tint = pttContentColor,
+                        modifier = Modifier
+                            .size(28.dp)
+                            .padding(end = 8.dp),
+                    )
                     Text(
                         when {
+                            state.audioRoutePending ->
+                                "Connexion audio — ${state.selectedAudioRoute.name}…"
                             state.voxEnabled && state.isTransmitting -> "Vox — transmission…"
                             state.voxEnabled -> "Vox actif — en écoute"
                             state.isTransmitting -> "Transmission…"
                             else -> "PTT — maintenir pour parler"
                         },
-                        color = MaterialTheme.colorScheme.onPrimary,
+                        color = pttContentColor,
                         fontWeight = FontWeight.SemiBold,
                     )
                 }
@@ -338,6 +393,13 @@ fun MainScreen(
             Spacer(modifier = Modifier.height(8.dp))
         }
     }
+}
+
+private fun audioRouteIcon(kind: CaptureInputKind): ImageVector = when (kind) {
+    CaptureInputKind.BUILTIN -> Icons.Filled.PhoneAndroid
+    CaptureInputKind.BLUETOOTH -> Icons.Filled.Bluetooth
+    CaptureInputKind.USB -> Icons.Filled.Usb
+    CaptureInputKind.WIRED -> Icons.Filled.Headset
 }
 
 /**

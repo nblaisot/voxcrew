@@ -1,14 +1,12 @@
 package com.nblaisot.voxcrew.lanlink
 
 import android.content.Context
-import com.nblaisot.voxcrew.audio.AudioPathPreparer
-import com.nblaisot.voxcrew.audio.AudioPermissionIssue
-import com.nblaisot.voxcrew.audio.AudioRouteSelector
-import com.nblaisot.voxcrew.audio.AudioRouteState
+import com.nblaisot.voxcrew.audio.AudioPipelineState
 import com.nblaisot.voxcrew.audio.CaptureInputKind
-import com.nblaisot.voxcrew.audio.IntercomAudioSession
 import com.nblaisot.voxcrew.audio.IntercomTelecomSession
+import com.nblaisot.voxcrew.audio.ObservedAudioDeviceKind
 import com.nblaisot.voxcrew.audio.OutputKind
+import com.nblaisot.voxcrew.audio.isConfirmedDuplexReady
 import com.nblaisot.voxcrew.audio.PushToTalkTransmissionPolicy
 import com.nblaisot.voxcrew.audio.SileroVoiceDetector
 import com.nblaisot.voxcrew.audio.TransmissionPolicy
@@ -31,6 +29,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -58,7 +57,6 @@ class LanIntercomEngine(
     private val cloudTransport: CloudRunSignalingTransport,
     private val signalingClient: SignalingClient? = null,
     private val networkMonitor: NetworkMonitor = NetworkMonitor(context),
-    private val intercomAudioSession: IntercomAudioSession = IntercomAudioSession(context),
     telecomSession: IntercomTelecomSession? = null,
 ) {
     private val appContext = context.applicationContext
@@ -70,10 +68,9 @@ class LanIntercomEngine(
     private val sharedUdp = SharedUdpSocket()
     private val capture = AudioCapture(
         scope = scope,
-        intercomAudioSession = intercomAudioSession,
-        playbackSessionIdProvider = { playback.audioSessionId },
+        telecomSession = this.telecomSession,
     )
-    private val playback = AudioPlayback(scope, intercomAudioSession)
+    private val playback = AudioPlayback(scope)
     private val uiFeedback = UiFeedbackPlayer(scope)
 
     private val connections = ConcurrentHashMap<String, PeerConnection>()
@@ -102,6 +99,9 @@ class LanIntercomEngine(
     private val _voxEnabled = MutableStateFlow(false)
     val voxEnabled: StateFlow<Boolean> = _voxEnabled.asStateFlow()
 
+    private val _appForeground = MutableStateFlow(false)
+    val appForeground: StateFlow<Boolean> = _appForeground.asStateFlow()
+
     private val _voxSensitivity = MutableStateFlow(
         VoxSensitivity.coerce(prefs.getInt(KEY_VOX_SENSITIVITY, VoxSensitivity.DEFAULT.level)),
     )
@@ -110,19 +110,40 @@ class LanIntercomEngine(
     private val _isTransmitting = MutableStateFlow(false)
     val isTransmitting: StateFlow<Boolean> = _isTransmitting.asStateFlow()
 
-    val captureInputKind: StateFlow<CaptureInputKind> = intercomAudioSession.captureInputKind
-    val outputKind: StateFlow<OutputKind> = intercomAudioSession.outputKind
-    val routeReady: StateFlow<Boolean> = intercomAudioSession.routeReady
-    val audioRoute = intercomAudioSession.audioRoute
-    val audioPermissionIssue: StateFlow<AudioPermissionIssue?> = intercomAudioSession.permissionIssue
+    val audioRoute = this.telecomSession.callState
+    val audioRouteSelection = this.telecomSession.routeSelection
+    private val _audioPipelineState = MutableStateFlow<AudioPipelineState>(AudioPipelineState.Closed)
+    val audioPipelineState: StateFlow<AudioPipelineState> = _audioPipelineState.asStateFlow()
+    val captureInputKind: StateFlow<CaptureInputKind> = audioRoute
+        .combine(audioPipelineState) { route, pipeline ->
+            when ((pipeline as? AudioPipelineState.Ready)?.observedInput) {
+                ObservedAudioDeviceKind.BLUETOOTH -> CaptureInputKind.BLUETOOTH
+                ObservedAudioDeviceKind.USB -> CaptureInputKind.USB
+                ObservedAudioDeviceKind.WIRED -> CaptureInputKind.WIRED
+                ObservedAudioDeviceKind.BUILTIN -> CaptureInputKind.BUILTIN
+                else -> route.micKind
+            }
+        }
+        .stateIn(scope, SharingStarted.Eagerly, audioRoute.value.micKind)
+    val outputKind: StateFlow<OutputKind> = audioRoute
+        .map { route -> route.outputKind }
+        .stateIn(scope, SharingStarted.Eagerly, audioRoute.value.outputKind)
+    val routeReady: StateFlow<Boolean> = audioRoute
+        .combine(audioPipelineState) { call, pipeline ->
+            isConfirmedDuplexReady(call, pipeline)
+        }
+        .stateIn(scope, SharingStarted.Eagerly, false)
 
     private var voxJob: Job? = null
     private var udpReceiveJob: Job? = null
     private var receivingSweepJob: Job? = null
     private var metricsJob: Job? = null
     private var routeWatchJob: Job? = null
-    private var routeRestartJob: Job? = null
     private val audioInitMutex = Mutex()
+    private val mediaDemandMutex = Mutex()
+    private val mediaDemandState = MediaDemandState()
+    private val incomingMediaMutex = Mutex()
+    private val pendingIncomingMedia = mutableMapOf<String, ArrayDeque<IncomingMediaEvent>>()
     private var audioPrepared = false
     private var lastFanOutDiagMs = 0L
 
@@ -130,6 +151,16 @@ class LanIntercomEngine(
     private var localUid: String = ""
     private var displayName: String = ""
     private var knownCrewUids: Set<String> = emptySet()
+
+    init {
+        this.telecomSession.setMediaLifecycleCallbacks(
+            onInactive = { closeAudioForTelecomLifecycle() },
+            onActive = { reconcileAudioForTelecomLifecycle() },
+            onDisconnected = { preserveTransmission ->
+                closeAudioForTelecomLifecycle(cancelTransmission = !preserveTransmission)
+            },
+        )
+    }
 
     val statusText: StateFlow<String> = combine(
         _activeRecipientUids,
@@ -139,7 +170,11 @@ class LanIntercomEngine(
     }.stateIn(scope, SharingStarted.Eagerly, "Recherche de coéquipiers…")
 
     fun start(uid: String, displayName: String) {
-        if (started) return
+        if (started) {
+            if (mediaDemandState.setSessionActive(true)) scheduleMediaDemandReconciliation()
+            ensureAudioRoutingMonitor()
+            return
+        }
         started = true
         localUid = uid
         this.displayName = displayName
@@ -158,6 +193,8 @@ class LanIntercomEngine(
             activePolicy = voxPolicy
             _voxEnabled.value = true
         }
+        mediaDemandState.setVoxEnabled(restoreVoxEnabled)
+        mediaDemandState.setSessionActive(true)
         watchPolicy(activePolicy)
 
         scope.launch {
@@ -178,6 +215,7 @@ class LanIntercomEngine(
         loadPersistedActiveRecipients()
         startMetricsWatcher()
         ensureAudioRoutingMonitor()
+        scheduleMediaDemandReconciliation()
     }
 
     fun syncCrewPeers(crewUids: Set<String>) {
@@ -211,14 +249,32 @@ class LanIntercomEngine(
 
     fun setActiveRecipients(uids: Set<String>, persist: Boolean = false) {
         val filtered = uids.filter { it != localUid }.toSet()
+        val added = filtered - _activeRecipientUids.value
         _activeRecipientUids.value = filtered
         if (persist) saveActiveRecipients(filtered)
         filtered.forEach { ensureConnection(it).start() }
+        if (isOutboundMediaActive()) {
+            added.forEach { uid -> connections[uid]?.sendMediaActivity(true) }
+        }
     }
 
     fun onMicrophonePermissionGranted() {
+        if (mediaDemandState.setMicrophonePermissionGranted(true)) {
+            scheduleMediaDemandReconciliation()
+        }
         if (!started) return
         ensureAudioRoutingMonitor()
+    }
+
+    fun onMicrophonePermissionDenied() {
+        mediaDemandState.setMicrophonePermissionGranted(false)
+        pttPolicy.cancel()
+        setOutboundMediaActive(false)
+        if (!started) return
+        telecomSession.stop()
+        scope.launch(Dispatchers.IO) {
+            audioInitMutex.withLock { closeAudioPathLocked(AudioPipelineState.Closed) }
+        }
     }
 
     fun setVoxEnabled(enabled: Boolean) {
@@ -226,14 +282,28 @@ class LanIntercomEngine(
         prefs.edit().putBoolean(KEY_VOX_ENABLED, enabled).apply()
         if (enabled) {
             pttPolicy.cancel()
+            stopVoxCapture()
+            setOutboundMediaActive(false)
             activePolicy = voxPolicy
             watchPolicy(activePolicy)
-            prepareAudioPath()
         } else {
             stopVoxCapture()
+            setOutboundMediaActive(false)
             activePolicy = pttPolicy
             watchPolicy(activePolicy)
-            prepareAudioPath()
+        }
+        if (mediaDemandState.setVoxEnabled(enabled)) scheduleMediaDemandReconciliation()
+        if (mediaDemanded()) prepareAudioPath()
+    }
+
+    fun setAppForeground(foreground: Boolean) {
+        _appForeground.value = foreground
+        if (!foreground && !_voxEnabled.value) {
+            pttPolicy.cancel()
+            setOutboundMediaActive(false)
+        }
+        if (mediaDemandState.setAppForeground(foreground)) {
+            scheduleMediaDemandReconciliation()
         }
     }
 
@@ -259,7 +329,12 @@ class LanIntercomEngine(
     }
 
     fun onBluetoothPermissionGranted() {
+        telecomSession.refreshEndpointCatalog()
         refreshAudioRouting()
+    }
+
+    fun selectAudioRoute(key: String) {
+        telecomSession.selectAudioRoute(key)
     }
 
     fun refreshAudioRouting() {
@@ -285,14 +360,8 @@ class LanIntercomEngine(
     }
 
     private fun ensureAudioRoutingMonitorLocked() {
-        if (!intercomAudioSession.isActive) {
-            intercomAudioSession.enter()
-            telecomSession.start()
-        } else {
-            intercomAudioSession.reapplyRouting()
-        }
         watchAudioRoute()
-        prepareAudioPathLocked()
+        if (mediaDemanded()) telecomSession.refresh()
     }
 
     private fun prepareAudioPath() {
@@ -308,32 +377,148 @@ class LanIntercomEngine(
     }
 
     private fun prepareAudioPathLocked(forceReattach: Boolean = false) {
-        val result = AudioPathPreparer.prepare(
-            isSessionActive = intercomAudioSession.isActive,
-            awaitRouteReady = {
-                val ready = intercomAudioSession.awaitRouteReady()
-                if (!ready) {
-                    Log.w(TAG, "audio route not ready; capture/playback deferred")
-                }
-                ready
-            },
-            awaitRoutingApplied = { intercomAudioSession.awaitRoutingApplied() },
-            warmUpPlayback = {
-                if (!intercomAudioSession.isAudioFocusGranted()) {
-                    Log.w(TAG, "audio focus not granted — capture may be unreliable")
-                }
-                playback.warmUp()
-            },
-            detachCapture = {
-                stopVoxCapture()
-                capture.detach()
-            },
-            attachCapture = { attachCaptureForCurrentMode() },
-            audioPrepared = audioPrepared,
-            forceReattach = forceReattach,
+        val call = telecomSession.currentState
+        val endpointKey = call.endpointKey
+        if (!call.mediaActive || endpointKey == null) {
+            closeAudioPathLocked(AudioPipelineState.Closed, cancelTransmission = false)
+            return
+        }
+        val ready = _audioPipelineState.value as? AudioPipelineState.Ready
+        if (!forceReattach && ready?.endpointKey == endpointKey) return
+
+        _audioPipelineState.value = AudioPipelineState.Opening(endpointKey)
+        stopVoxCapture()
+        playback.stop()
+        audioPrepared = false
+
+        val playbackResult = playback.open(call)
+        if (playbackResult is PlaybackStartResult.Failure) {
+            failAudioPathLocked(playbackResult.reason)
+            return
+        }
+        val captureResult = attachCaptureForCurrentMode()
+        if (captureResult is CaptureStartResult.Failure) {
+            failAudioPathLocked(captureResult.reason)
+            return
+        }
+        playbackResult as PlaybackStartResult.Success
+        captureResult as CaptureStartResult.Success
+        audioPrepared = true
+        _audioPipelineState.value = AudioPipelineState.Ready(
+            endpointKey = endpointKey,
+            observedInput = captureResult.observedInput,
+            observedOutput = playbackResult.observedOutput,
         )
-        if (result.captureAttached) {
-            audioPrepared = true
+        Log.i(
+            TAG,
+            "duplex ready endpoint=${call.currentEndpoint?.name} key=$endpointKey " +
+                "input=${captureResult.observedInput} output=${playbackResult.observedOutput}",
+        )
+        drainPendingIncomingMedia()
+    }
+
+    private fun closeAudioPathLocked(
+        state: AudioPipelineState,
+        cancelTransmission: Boolean = true,
+    ) {
+        if (cancelTransmission) pttPolicy.cancel()
+        stopVoxCapture()
+        playback.stop()
+        audioPrepared = false
+        _audioPipelineState.value = state
+        if (cancelTransmission) {
+            setOutboundMediaActive(false)
+        }
+    }
+
+    private fun failAudioPathLocked(reason: String) {
+        Log.e(TAG, "duplex pipeline failed: $reason")
+        closeAudioPathLocked(AudioPipelineState.Failed(reason))
+        mediaDemandState.setPipelineUsable(false)
+        scheduleMediaDemandReconciliation()
+    }
+
+    private suspend fun closeAudioForTelecomLifecycle(cancelTransmission: Boolean = true) {
+        audioInitMutex.withLock {
+            val state = _audioPipelineState.value
+            closeAudioPathLocked(
+                if (state is AudioPipelineState.Failed) state else AudioPipelineState.Closed,
+                cancelTransmission = cancelTransmission,
+            )
+        }
+    }
+
+    private suspend fun reconcileAudioForTelecomLifecycle() {
+        audioInitMutex.withLock { prepareAudioPathLocked() }
+    }
+
+    private fun onAudioPipelineFailure(reason: String) {
+        scope.launch(Dispatchers.IO) {
+            audioInitMutex.withLock { failAudioPathLocked(reason) }
+        }
+    }
+
+    fun retryAudioPipeline() {
+        scope.launch(Dispatchers.IO) {
+            telecomSession.retrySelectedRoute()
+            mediaDemandState.setPipelineUsable(true)
+            val pendingPeers = incomingMediaMutex.withLock {
+                pendingIncomingMedia.filterValues { it.isNotEmpty() }.keys.toList()
+            }
+            pendingPeers.forEach { setRemoteTelecomDemand(it, true) }
+            if (mediaDemanded()) {
+                reconcileMediaDemand()
+                audioInitMutex.withLock { prepareAudioPathLocked(forceReattach = true) }
+            } else {
+                audioInitMutex.withLock { _audioPipelineState.value = AudioPipelineState.Closed }
+            }
+        }
+    }
+
+    private fun setRemoteTelecomDemand(peerUid: String, active: Boolean) {
+        val changed = mediaDemandState.setRemote(peerUid, active)
+        if (changed) scheduleMediaDemandReconciliation()
+    }
+
+    private fun setOutboundMediaActive(active: Boolean) {
+        val changed = mediaDemandState.setOutbound(active)
+        if (!changed) return
+        _activeRecipientUids.value.forEach { uid ->
+            ensureConnection(uid).apply {
+                start()
+                sendMediaActivity(active)
+            }
+        }
+        Log.i(TAG, "outbound media activity=$active recipients=${_activeRecipientUids.value.size}")
+    }
+
+    private fun isOutboundMediaActive(): Boolean =
+        mediaDemandState.isOutbound()
+
+    private fun mediaDemanded(): Boolean = mediaDemandState.isDemanded()
+
+    private fun scheduleMediaDemandReconciliation() {
+        scope.launch(Dispatchers.IO) { reconcileMediaDemand() }
+    }
+
+    private suspend fun reconcileMediaDemand() {
+        mediaDemandMutex.withLock {
+            while (true) {
+                val demanded = mediaDemanded()
+                when (telecomDemandAction(demanded, telecomSession.isActive, telecomSession.hasCall)) {
+                    TelecomDemandAction.NONE -> return
+                    TelecomDemandAction.ACTIVATE -> {
+                        if (!telecomSession.activate()) {
+                            telecomSession.stop()
+                            audioInitMutex.withLock {
+                                failAudioPathLocked("Telecom could not activate media")
+                            }
+                            return
+                        }
+                    }
+                    TelecomDemandAction.DISCONNECT -> telecomSession.disconnect()
+                }
+            }
         }
     }
 
@@ -343,21 +528,19 @@ class LanIntercomEngine(
             Log.w(TAG, "fanOut: no active recipients — audio frame dropped")
             return
         }
-        var missingConnection = 0
-        var notConnected = 0
-        val notConnectedUids = mutableListOf<String>()
-        var sent = 0
+        var deliveredImmediately = 0
+        var queuedForConnection = 0
+        val queuedUids = mutableListOf<String>()
         active.forEach { uid ->
-            val conn = connections[uid]
-            if (conn == null) {
-                missingConnection++
-                ensureConnection(uid).start()
-            } else if (conn.linkState.value !is PeerLink.LinkState.Connected) {
-                notConnected++
-                notConnectedUids.add(uid)
+            val conn = ensureConnection(uid)
+            conn.start()
+            val connected = conn.linkState.value is PeerLink.LinkState.Connected
+            conn.send(payload)
+            if (connected) {
+                deliveredImmediately++
             } else {
-                conn.send(payload)
-                sent++
+                queuedForConnection++
+                queuedUids.add(uid)
             }
         }
         val now = System.currentTimeMillis()
@@ -365,131 +548,64 @@ class LanIntercomEngine(
             lastFanOutDiagMs = now
             Log.i(
                 TAG,
-                "fanOut: recipients=${active.size} sent=$sent bytes=${payload.size} " +
-                    "missingConnection=$missingConnection notConnected=$notConnected " +
-                    "notConnectedUids=$notConnectedUids",
+                "fanOut: recipients=${active.size} deliveredImmediately=$deliveredImmediately " +
+                    "queuedForConnection=$queuedForConnection bytes=${payload.size} queuedUids=$queuedUids",
             )
         }
     }
 
     private fun logPttRouteSummary() {
-        val route = intercomAudioSession.currentRoute()
+        val route = telecomSession.currentState
         val active = _activeRecipientUids.value ?: emptySet()
         val connected = active.count { uid ->
             connections[uid]?.linkState?.value is PeerLink.LinkState.Connected
         }
         Log.i(
             TAG,
-            "ptt route mic=${route.micKind} output=${route.outputKind} ready=${route.routeReady} " +
-                "mode=${route.audioMode} usage=${route.playbackUsage} captureType=${route.captureDevice?.type} " +
-                "outputType=${route.outputDevice?.type} recipients=${active.size} connected=$connected",
+            "ptt endpoint=${route.currentEndpoint?.name} endpointType=${route.currentEndpoint?.type} " +
+                "pipeline=${_audioPipelineState.value} recipients=${active.size} connected=$connected",
         )
     }
 
     private fun watchAudioRoute() {
         if (routeWatchJob?.isActive == true) return
-        routeWatchJob = scope.launch {
-            var previousPlaybackKey: String? = null
-            var previousCaptureKey: String? = null
-            var wasRouteReady = false
-            combine(
-                intercomAudioSession.routeReady,
-                intercomAudioSession.audioRoute,
-            ) { ready, route ->
-                ready to route
-            }.collect { (ready, route) ->
-                val becameReady = ready && !wasRouteReady
-                wasRouteReady = ready
-
-                if (!audioPrepared || becameReady) {
-                    scope.launch(Dispatchers.IO) {
-                        runCatching {
-                            audioInitMutex.withLock {
-                                prepareAudioPathLocked(forceReattach = audioPrepared && becameReady)
+        routeWatchJob = scope.launch(Dispatchers.IO) {
+            audioRoute.collect { route ->
+                runCatching {
+                    audioInitMutex.withLock {
+                        if (!route.mediaActive) {
+                            if (_audioPipelineState.value !is AudioPipelineState.Closed &&
+                                _audioPipelineState.value !is AudioPipelineState.Failed
+                            ) {
+                                closeAudioPathLocked(
+                                    AudioPipelineState.Closed,
+                                    cancelTransmission = false,
+                                )
                             }
+                            return@withLock
                         }
+                        prepareAudioPathLocked()
                     }
+                }.onFailure { error ->
+                    Log.e(TAG, "audio endpoint transition failed: ${error.message}", error)
                 }
-
-                val playbackKey = playbackKey(route)
-                val captureKey = captureKey(route)
-                if (previousPlaybackKey == null || previousCaptureKey == null) {
-                    previousPlaybackKey = playbackKey
-                    previousCaptureKey = captureKey
-                    if (!ready) {
-                        Log.i(
-                            TAG,
-                            "audio route not ready; capture/playback started to unlock platform routing",
-                        )
-                    }
-                    return@collect
-                }
-
-                if (!ready) return@collect
-
-                val playbackChanged = previousPlaybackKey != playbackKey
-                val captureChanged = previousCaptureKey != captureKey
-                if (!playbackChanged && !captureChanged) return@collect
-                previousPlaybackKey = playbackKey
-                previousCaptureKey = captureKey
-                Log.i(
-                    TAG,
-                    "audio route changed — playbackChanged=$playbackChanged captureChanged=$captureChanged",
-                )
-                scheduleRestartAudioPath(route, playbackChanged, captureChanged)
             }
         }
     }
 
-    private fun scheduleRestartAudioPath(
-        route: AudioRouteState,
-        playbackChanged: Boolean,
-        captureChanged: Boolean,
-    ) {
-        routeRestartJob?.cancel()
-        routeRestartJob = scope.launch(Dispatchers.IO) {
-            delay(ROUTE_RESTART_DEBOUNCE_MS)
-            runCatching {
-                audioInitMutex.withLock {
-                    if (!intercomAudioSession.awaitRouteReady()) return@withLock
-                    intercomAudioSession.awaitRoutingApplied()
-                    if (playbackChanged) playback.refreshRoute(route)
-                    if (captureChanged) {
-                        playback.warmUp()
-                        if (_voxEnabled.value) {
-                            stopVoxCapture()
-                            startVoxCapture()
-                        } else {
-                            capture.detach()
-                            capture.attach(activePolicy.shouldTransmit) { payload -> fanOut(payload) }
-                        }
-                    }
-                }
-            }.onFailure { error ->
-                Log.e(TAG, "audio path restart failed: ${error.message}", error)
-            }
-        }
-    }
-
-    private fun playbackKey(route: AudioRouteState): String =
-        "${route.playbackUsage}:${route.audioMode}:${AudioRouteSelector.deviceIdentity(route.outputDevice)}"
-
-    private fun captureKey(route: AudioRouteState): String {
-        if (route.micKind == CaptureInputKind.BLUETOOTH &&
-            !AudioRouteSelector.isBluetoothCaptureDevice(route.captureDevice)
-        ) {
-            return "BT_PENDING:${AudioRouteSelector.deviceIdentity(route.outputDevice)}:${route.captureAudioSource}"
-        }
-        return "${route.micKind}:${AudioRouteSelector.deviceIdentity(route.captureDevice)}:${route.captureAudioSource}"
-    }
-
-    private fun attachCaptureForCurrentMode() {
+    private fun attachCaptureForCurrentMode(): CaptureStartResult =
         if (_voxEnabled.value) {
             startVoxCapture()
         } else {
-            capture.attach(activePolicy.shouldTransmit) { payload -> fanOut(payload) }
+            capture.attach(
+                shouldTransmit = activePolicy.shouldTransmit,
+                onFrame = { payload -> fanOut(payload) },
+                onTransmissionStopped = {
+                    setOutboundMediaActive(false)
+                },
+                onFailure = ::onAudioPipelineFailure,
+            )
         }
-    }
 
     private fun ensureConnection(peerUid: String): PeerConnection {
         return connections.getOrPut(peerUid) {
@@ -526,6 +642,10 @@ class LanIntercomEngine(
         audioCollectJobs.remove(peerUid)?.cancel()
         feedbackWatchJobs.remove(peerUid)?.cancel()
         connections.remove(peerUid)?.stop()
+        setRemoteTelecomDemand(peerUid, false)
+        scope.launch(Dispatchers.IO) {
+            incomingMediaMutex.withLock { pendingIncomingMedia.remove(peerUid) }
+        }
         receivingUntilMs.remove(peerUid)
         refreshReceivingUids()
     }
@@ -537,12 +657,21 @@ class LanIntercomEngine(
             conn.linkState.collect { state ->
                 if (state == previous) return@collect
                 val activeRecipients = _activeRecipientUids.value
+                if (previous is PeerLink.LinkState.Connected &&
+                    state is PeerLink.LinkState.Disconnected
+                ) {
+                    setRemoteTelecomDemand(conn.peerUid, false)
+                    incomingMediaMutex.withLock { pendingIncomingMedia.remove(conn.peerUid) }
+                }
                 if (conn.peerUid in activeRecipients) {
                     when {
                         previous !is PeerLink.LinkState.Connected && state is PeerLink.LinkState.Connected ->
-                            uiFeedback.playConnected()
-                        previous is PeerLink.LinkState.Connected && state is PeerLink.LinkState.Disconnected ->
+                            uiFeedback.playConnected().also {
+                                if (isOutboundMediaActive()) conn.sendMediaActivity(true)
+                            }
+                        previous is PeerLink.LinkState.Connected && state is PeerLink.LinkState.Disconnected -> {
                             uiFeedback.playDisconnected()
+                        }
                     }
                 }
                 previous = state
@@ -553,12 +682,88 @@ class LanIntercomEngine(
     private fun startAudioCollection(conn: PeerConnection) {
         if (audioCollectJobs.containsKey(conn.peerUid)) return
         audioCollectJobs[conn.peerUid] = scope.launch(Dispatchers.IO) {
-            conn.peerLink.incomingAudio.collect { payload ->
-                playback.play(payload)
-                receivingUntilMs[conn.peerUid] = System.currentTimeMillis() + RECEIVING_IDLE_MS
-                refreshReceivingUids()
+            conn.peerLink.incomingMedia.collect { event -> handleIncomingMedia(conn.peerUid, event) }
+        }
+    }
+
+    private suspend fun handleIncomingMedia(peerUid: String, event: IncomingMediaEvent) {
+        incomingMediaMutex.withLock {
+            when (event) {
+                is IncomingMediaEvent.Activity -> {
+                    if (event.active) {
+                        if (_audioPipelineState.value is AudioPipelineState.Failed) {
+                            enqueueIncomingLocked(peerUid, event)
+                        } else {
+                            setRemoteTelecomDemand(peerUid, true)
+                        }
+                    } else if (pendingIncomingMedia[peerUid].isNullOrEmpty()) {
+                        setRemoteTelecomDemand(peerUid, false)
+                    } else {
+                        enqueueIncomingLocked(peerUid, event)
+                    }
+                }
+                is IncomingMediaEvent.Audio -> {
+                    if (_audioPipelineState.value is AudioPipelineState.Failed) {
+                        enqueueIncomingLocked(peerUid, event)
+                    } else if (isConfirmedDuplexReady(
+                            telecomSession.currentState,
+                            _audioPipelineState.value,
+                        )
+                    ) {
+                        setRemoteTelecomDemand(peerUid, true)
+                        playIncomingLocked(peerUid, event.payload)
+                    } else {
+                        setRemoteTelecomDemand(peerUid, true)
+                        enqueueIncomingLocked(peerUid, event)
+                    }
+                }
             }
         }
+    }
+
+    private fun enqueueIncomingLocked(peerUid: String, event: IncomingMediaEvent) {
+        val queue = pendingIncomingMedia.getOrPut(peerUid) { ArrayDeque() }
+        if (queue.size >= MAX_PENDING_INCOMING_EVENTS) {
+            val audioIndex = queue.indexOfFirst { it is IncomingMediaEvent.Audio }
+            if (audioIndex >= 0) queue.removeAt(audioIndex) else queue.removeFirst()
+            Log.w(TAG, "incoming activation buffer full; oldest event dropped peer=$peerUid")
+        }
+        queue.addLast(event)
+    }
+
+    private fun drainPendingIncomingMedia() {
+        scope.launch(Dispatchers.IO) {
+            incomingMediaMutex.withLock {
+                pendingIncomingMedia.keys.toList().forEach { peerUid ->
+                    val queue = pendingIncomingMedia[peerUid] ?: return@forEach
+                    while (queue.isNotEmpty() &&
+                        isConfirmedDuplexReady(telecomSession.currentState, _audioPipelineState.value)
+                    ) {
+                        when (val event = queue.removeFirst()) {
+                            is IncomingMediaEvent.Audio -> {
+                                setRemoteTelecomDemand(peerUid, true)
+                                if (!playIncomingLocked(peerUid, event.payload)) break
+                            }
+                            is IncomingMediaEvent.Activity ->
+                                setRemoteTelecomDemand(peerUid, event.active)
+                        }
+                    }
+                    if (queue.isEmpty()) pendingIncomingMedia.remove(peerUid)
+                }
+            }
+        }
+    }
+
+    private fun playIncomingLocked(peerUid: String, payload: ByteArray): Boolean {
+        if (!playback.play(payload)) {
+            if (_audioPipelineState.value is AudioPipelineState.Ready) {
+                onAudioPipelineFailure("AudioTrack could not play a received frame")
+            }
+            return false
+        }
+        receivingUntilMs[peerUid] = System.currentTimeMillis() + RECEIVING_IDLE_MS
+        refreshReceivingUids()
+        return true
     }
 
     private fun startReceivingSweep() {
@@ -644,15 +849,21 @@ class LanIntercomEngine(
         connections.values.forEach { it.onNetworkChanged() }
     }
 
-    private fun startVoxCapture() {
+    private fun startVoxCapture(): CaptureStartResult {
         val sensitivity = _voxSensitivity.value
-        voxJob = capture.attachVox(
+        val result = capture.attachVox(
             voiceDetectorFactory = { SileroVoiceDetector(appContext, sensitivity) },
             gate = VoxGate(),
-            onTransmittingChanged = { transmitting -> voxPolicy.setSpeechDetected(transmitting) },
+            onTransmittingChanged = { transmitting ->
+                voxPolicy.setSpeechDetected(transmitting)
+                setOutboundMediaActive(transmitting)
+            },
             onFrame = { payload -> fanOut(payload) },
             isReceiving = { playback.isReceiving.value },
+            onFailure = ::onAudioPipelineFailure,
         )
+        if (result is CaptureStartResult.Success) voxJob = result.job
+        return result
     }
 
     private fun stopVoxCapture() {
@@ -665,7 +876,15 @@ class LanIntercomEngine(
     private fun watchPolicy(policy: TransmissionPolicy) {
         policyWatchJob?.cancel()
         policyWatchJob = scope.launch {
-            policy.shouldTransmit.collect { _isTransmitting.value = it }
+            policy.shouldTransmit.collect { transmitting ->
+                _isTransmitting.value = transmitting
+                if (_voxEnabled.value) return@collect
+                if (transmitting) {
+                    setOutboundMediaActive(true)
+                } else if (_audioPipelineState.value !is AudioPipelineState.Ready) {
+                    setOutboundMediaActive(false)
+                }
+            }
         }
     }
 
@@ -737,17 +956,20 @@ class LanIntercomEngine(
     fun releaseAudioSession() {
         routeWatchJob?.cancel()
         routeWatchJob = null
-        telecomSession.stop()
+        pttPolicy.cancel()
         stopVoxCapture()
-        capture.detach()
+        setOutboundMediaActive(false)
+        mediaDemandState.endSession()
+        playback.stop()
+        telecomSession.stop()
         audioPrepared = false
-        intercomAudioSession.exit()
+        _audioPipelineState.value = AudioPipelineState.Closed
     }
 
     companion object {
         private const val TAG = "LanIntercomEngine"
         private const val RECEIVING_IDLE_MS = 500L
-        private const val ROUTE_RESTART_DEBOUNCE_MS = 400L
+        private const val MAX_PENDING_INCOMING_EVENTS = 250
         private const val PREFS_NAME = "voxcrew_lanlink"
         private const val KEY_ACTIVE_RECIPIENTS = "active_recipient_uids"
         private const val KEY_VOX_ENABLED = "vox_enabled"
