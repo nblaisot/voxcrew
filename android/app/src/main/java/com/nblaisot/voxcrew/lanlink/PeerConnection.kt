@@ -104,6 +104,11 @@ class PeerConnection(
         peerLink.send(payload)
     }
 
+    fun sendMediaActivity(active: Boolean) {
+        if (!started) return
+        peerLink.sendMediaActivity(active)
+    }
+
     fun handleCloudMessage(envelope: SignalingEnvelope) {
         if (!started || envelope.senderId != peerUid) return
         when (envelope.type) {

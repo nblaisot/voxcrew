@@ -225,7 +225,7 @@ class UdpP2pTransport(
                 lastResendMs = now
                 val address = confirmedAddress ?: continue
                 peerLink.unacknowledgedFrames().forEach { entry ->
-                    sendTo(LanFrame.Audio(entry.seq, entry.data), address)
+                    sendTo(entry.toFrame(), address)
                 }
             }
         }

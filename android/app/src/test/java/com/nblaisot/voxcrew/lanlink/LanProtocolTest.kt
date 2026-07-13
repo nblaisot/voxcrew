@@ -53,6 +53,12 @@ class LanProtocolTest {
     }
 
     @Test
+    fun `media activity frames round trip`() {
+        assertEquals(LanFrame.MediaActivity(7L, true), roundTrip(LanFrame.MediaActivity(7L, true)))
+        assertEquals(LanFrame.MediaActivity(8L, false), roundTrip(LanFrame.MediaActivity(8L, false)))
+    }
+
+    @Test
     fun `multiple frames can be written and read sequentially from the same stream`() {
         val buffer = ByteArrayOutputStream()
         val out = DataOutputStream(buffer)

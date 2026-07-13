@@ -1,24 +1,42 @@
 package com.nblaisot.voxcrew.lanlink
 
 /**
- * Ring buffer of sent-but-possibly-unacknowledged audio frames for a single peer
+ * Ring buffer of sent-but-possibly-unacknowledged audio and media-boundary frames for a single peer
  * conversation. This is the heart of the "progressive download" resume model:
  * while disconnected, frames keep accumulating here (capture never blocks); once
  * reconnected, everything past the peer's last-known contiguous seq is replayed.
  * Frames older than [DEFAULT_MAX_AGE_MS] or beyond the byte cap are evicted.
  */
 class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
-    data class Entry(val seq: Long, val data: ByteArray, val enqueuedAtMs: Long = System.currentTimeMillis())
+    enum class Kind { AUDIO, MEDIA_ACTIVE, MEDIA_INACTIVE }
+
+    data class Entry(
+        val seq: Long,
+        val data: ByteArray,
+        val kind: Kind = Kind.AUDIO,
+        val enqueuedAtMs: Long = System.currentTimeMillis(),
+    ) {
+        fun toFrame(): LanFrame = when (kind) {
+            Kind.AUDIO -> LanFrame.Audio(seq, data)
+            Kind.MEDIA_ACTIVE -> LanFrame.MediaActivity(seq, true)
+            Kind.MEDIA_INACTIVE -> LanFrame.MediaActivity(seq, false)
+        }
+    }
 
     private val frames = ArrayDeque<Entry>()
     private var totalBytes = 0L
 
     @Synchronized
-    fun add(seq: Long, data: ByteArray, enqueuedAtMs: Long = System.currentTimeMillis()) {
-        frames.addLast(Entry(seq, data, enqueuedAtMs))
-        totalBytes += data.size
+    fun add(
+        seq: Long,
+        data: ByteArray,
+        enqueuedAtMs: Long = System.currentTimeMillis(),
+        kind: Kind = Kind.AUDIO,
+    ) {
+        frames.addLast(Entry(seq, data, kind, enqueuedAtMs))
+        totalBytes += entrySize(data, kind)
         while (totalBytes > maxBytes && frames.size > 1) {
-            totalBytes -= frames.removeFirst().data.size
+            totalBytes -= sizeOf(frames.removeFirst())
         }
     }
 
@@ -30,7 +48,7 @@ class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
     @Synchronized
     fun trimTo(ackedSeq: Long) {
         while (frames.isNotEmpty() && frames.first().seq <= ackedSeq) {
-            totalBytes -= frames.removeFirst().data.size
+            totalBytes -= sizeOf(frames.removeFirst())
         }
     }
 
@@ -48,6 +66,9 @@ class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
     fun size(): Int = frames.size
 
     @Synchronized
+    fun audioFrameCount(): Int = frames.count { it.kind == Kind.AUDIO }
+
+    @Synchronized
     fun byteSize(): Long = totalBytes
 
     /** Drops frames enqueued before [nowMs] - [maxAgeMs]. Returns the number removed. */
@@ -56,7 +77,7 @@ class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
         val cutoff = nowMs - maxAgeMs
         var dropped = 0
         while (frames.isNotEmpty() && frames.first().enqueuedAtMs < cutoff) {
-            totalBytes -= frames.removeFirst().data.size
+            totalBytes -= sizeOf(frames.removeFirst())
             dropped++
         }
         return dropped
@@ -69,4 +90,9 @@ class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
         /** Unacknowledged frames older than this are discarded (see [expireOlderThan]). */
         const val DEFAULT_MAX_AGE_MS = 30_000L
     }
+
+    private fun sizeOf(entry: Entry): Int = entrySize(entry.data, entry.kind)
+
+    private fun entrySize(data: ByteArray, kind: Kind): Int =
+        if (kind == Kind.AUDIO) data.size else 1
 }

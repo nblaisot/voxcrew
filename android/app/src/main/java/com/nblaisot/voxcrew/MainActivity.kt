@@ -9,6 +9,9 @@ import com.nblaisot.voxcrew.ui.VoxCrewNavHost
 import com.nblaisot.voxcrew.ui.theme.VoxCrewTheme
 
 class MainActivity : ComponentActivity() {
+    private val intercomEngine
+        get() = (application as VoxCrewApp).container.lanIntercomEngine
+
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
@@ -19,5 +22,15 @@ class MainActivity : ComponentActivity() {
                 VoxCrewNavHost(container = container)
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        intercomEngine.setAppForeground(true)
+    }
+
+    override fun onStop() {
+        if (!isChangingConfigurations) intercomEngine.setAppForeground(false)
+        super.onStop()
     }
 }

@@ -24,11 +24,21 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import android.Manifest
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Headset
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -47,9 +57,11 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,6 +72,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -67,7 +80,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.nblaisot.voxcrew.R
+import com.nblaisot.voxcrew.audio.AudioPermissionIssue
+import com.nblaisot.voxcrew.audio.CaptureInputKind
 import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.roster.CrewMember
@@ -76,6 +92,8 @@ import com.nblaisot.voxcrew.ui.permissions.RequestAppPermissions
 import com.nblaisot.voxcrew.ui.theme.VoxOrangeLight
 import com.nblaisot.voxcrew.ui.theme.VoxPttActive
 import com.nblaisot.voxcrew.ui.theme.VoxPttIdle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -87,9 +105,65 @@ fun MainScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val haptic = LocalHapticFeedback.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     var menuExpanded by remember { mutableStateOf(false) }
+    var audioMenuExpanded by remember { mutableStateOf(false) }
 
     RequestAppPermissions(onResult = viewModel::onPermissionsResult)
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.refreshPermissions()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val micLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+        viewModel::onMicrophonePermissionResult,
+    )
+    val btLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+        viewModel::onBluetoothPermissionResult,
+    )
+
+    state.permissionPrompt?.let { issue ->
+        val isBluetoothIssue = issue == AudioPermissionIssue.BLUETOOTH_CONNECT
+        AlertDialog(
+            onDismissRequest = viewModel::dismissPermissionPrompt,
+            title = {
+                Text(if (isBluetoothIssue) "Autorisation Bluetooth" else "Autorisation micro")
+            },
+            text = {
+                Text(
+                    if (isBluetoothIssue) {
+                        "Pour utiliser un casque ou des écouteurs Bluetooth, autorisez la connexion Bluetooth."
+                    } else {
+                        "Pour transmettre votre voix, autorisez l'accès au micro."
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (isBluetoothIssue && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            btLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+                        } else {
+                            micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    },
+                ) {
+                    Text("Autoriser")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = viewModel::dismissPermissionPrompt) {
+                    Text("Plus tard")
+                }
+            },
+        )
+    }
 
     Scaffold(
         topBar = {
@@ -135,6 +209,44 @@ fun MainScreen(
                         )
                     }
                 },
+                actions = {
+                    IconButton(onClick = { audioMenuExpanded = true }) {
+                        Icon(
+                            imageVector = audioRouteIcon(state.selectedAudioRoute.inputKind),
+                            contentDescription = "Audio : ${state.selectedAudioRoute.name}",
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = audioMenuExpanded,
+                        onDismissRequest = { audioMenuExpanded = false },
+                    ) {
+                        state.audioRouteChoices.forEach { choice ->
+                            DropdownMenuItem(
+                                text = { Text(choice.name) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = audioRouteIcon(choice.inputKind),
+                                        contentDescription = null,
+                                    )
+                                },
+                                trailingIcon = if (choice.key == state.selectedAudioRoute.key) {
+                                    {
+                                        Icon(
+                                            imageVector = Icons.Filled.Check,
+                                            contentDescription = "Sélectionné",
+                                        )
+                                    }
+                                } else {
+                                    null
+                                },
+                                onClick = {
+                                    audioMenuExpanded = false
+                                    viewModel.selectAudioRoute(choice.key)
+                                },
+                            )
+                        }
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface,
                 ),
@@ -149,11 +261,17 @@ fun MainScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             state.bannerMessage?.let { banner ->
-                Text(
-                    banner,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        banner,
+                        modifier = Modifier.weight(1f),
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    if (state.showAudioRetry) {
+                        TextButton(onClick = viewModel::retryAudio) { Text("Réessayer") }
+                    }
+                }
             }
 
             Text(
@@ -209,7 +327,18 @@ fun MainScreen(
                 )
             }
 
-            val pttColor = if (state.isTransmitting) VoxPttActive else VoxPttIdle
+            val pttPreparing = !state.voxEnabled && !state.pttEnabled
+            val pttColor = when {
+                state.isTransmitting -> VoxPttActive
+                pttPreparing -> MaterialTheme.colorScheme.surfaceVariant
+                else -> VoxPttIdle
+            }
+            val pttContentColor = if (pttPreparing) {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            } else {
+                MaterialTheme.colorScheme.onPrimary
+            }
+            val micIcon = audioRouteIcon(state.pttMicIconKind)
             // Deliberately NOT a material Button: its internal clickable consumes
             // the down event, which prevents detectTapGestures.onPress from ever
             // firing (press-and-hold would be dead).
@@ -235,20 +364,42 @@ fun MainScreen(
                     },
                 contentAlignment = Alignment.Center,
             ) {
-                Text(
-                    when {
-                        state.voxEnabled && state.isTransmitting -> "Vox — transmission…"
-                        state.voxEnabled -> "Vox actif — en écoute"
-                        state.isTransmitting -> "Transmission…"
-                        else -> "PTT — maintenir pour parler"
-                    },
-                    color = MaterialTheme.colorScheme.onPrimary,
-                    fontWeight = FontWeight.SemiBold,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center,
+                ) {
+                    Icon(
+                        imageVector = micIcon,
+                        contentDescription = null,
+                        tint = pttContentColor,
+                        modifier = Modifier
+                            .size(28.dp)
+                            .padding(end = 8.dp),
+                    )
+                    Text(
+                        when {
+                            state.audioRoutePending ->
+                                "Connexion audio — ${state.selectedAudioRoute.name}…"
+                            state.voxEnabled && state.isTransmitting -> "Vox — transmission…"
+                            state.voxEnabled -> "Vox actif — en écoute"
+                            state.isTransmitting -> "Transmission…"
+                            else -> "PTT — maintenir pour parler"
+                        },
+                        color = pttContentColor,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
             }
             Spacer(modifier = Modifier.height(8.dp))
         }
     }
+}
+
+private fun audioRouteIcon(kind: CaptureInputKind): ImageVector = when (kind) {
+    CaptureInputKind.BUILTIN -> Icons.Filled.PhoneAndroid
+    CaptureInputKind.BLUETOOTH -> Icons.Filled.Bluetooth
+    CaptureInputKind.USB -> Icons.Filled.Usb
+    CaptureInputKind.WIRED -> Icons.Filled.Headset
 }
 
 /**

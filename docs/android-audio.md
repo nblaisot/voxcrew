@@ -80,8 +80,9 @@ AudioRecord (continu) → frame PCM 20 ms ────────────�
 
 Implémenté dans `audio/` :
 
-- `IntercomAudioSession` — mode communication, routage haut-parleur/casque.
-- `CaptureAudioEffects` — AEC, NS, AGC sur la session capture.
+- `IntercomTelecomSession` — appel self-managed, politique d'endpoint et état `TelecomCallState`.
+- `TelecomRouteCoordinator` — machine d'état pure où `currentCallEndpoint` est toujours autoritaire.
+- `PcmSpeechLeveler` — nivellement borné et déterministe des seules frames transmises.
 - `VoxEchoGuard` — garde anti faux-déclenchement VOX pendant la réception.
 - `VoiceDetector` — interface pour le modèle acoustique (découplée du reste du pipeline).
 - `SileroVoiceDetector` — implémentation par défaut, basée sur
@@ -124,48 +125,150 @@ directement `AudioCapture.attachVox` et reporte la décision de `VoxGate` dans
 connaît pas l'UI. L'état Vox actif/inactif et la sensibilité sont persistés dans les
 `SharedPreferences` (`voxcrew_lanlink`) et restaurés au démarrage.
 
-## Permissions
+## Autorité Telecom et permissions
 
-- `RECORD_AUDIO` demandée avant capture
-- Refus → message clair, pas de crash
+La session self-managed Jetpack Telecom est l'unique propriétaire du routage et du focus.
+VoxCrew n'appelle jamais `setCommunicationDevice`, `startBluetoothSco`,
+`setPreferredDevice`, ne modifie pas `AudioManager.mode` et ne demande pas le focus.
+Android choisit le profil duplex concret et le microphone associé.
 
-## Routes audio
+Références plateforme : [guide Core Telecom VoIP](https://developer.android.com/develop/connectivity/telecom/voip-app/telecom),
+[`CallControlScope`](https://developer.android.com/reference/kotlin/androidx/core/telecom/CallControlScope)
+et [prétraitement audio Android](https://source.android.com/docs/core/audio/implement-pre-processing).
 
-Priorité MVP : haut-parleur mains libres, écouteurs filaires, Bluetooth si disponible.
+- `RECORD_AUDIO` est obligatoire : son absence place la session/pipeline en erreur et
+  désactive PTT.
+- `BLUETOOTH_CONNECT` (API 31+) est recommandé, mais non bloquant. Son refus peut masquer
+  un nom ou empêcher une préférence automatique ; il ne ferme jamais une route courante
+  déjà publiée, ni le haut-parleur, l'écouteur ou l'USB.
+- `MODIFY_AUDIO_SETTINGS` n'est plus demandé par l'application.
 
-Flux **communication** (`AudioAttributes.USAGE_VOICE_COMMUNICATION`) pour le playback
-intercom, avec `AudioManager.MODE_IN_COMMUNICATION` pendant la session. Le haut-parleur
-est activé explicitement quand aucun casque n'est branché ; le routage se met à jour
-automatiquement au branchement/débranchement (`IntercomAudioSession`).
+## États audio explicites
 
-## Annulation d'écho (AEC)
+`TelecomCallState` contient la phase (`STARTING`, `ACTIVE`, `INACTIVE`, `FAILED`,
+`STOPPED`), l'endpoint courant confirmé, l'endpoint sélectionné, les endpoints disponibles,
+l'erreur fatale de session et un avertissement de demande de route.
 
-Problème : en mains libres, l'audio reçu est diffusé sur le haut-parleur, capté par le
-micro et renvoyé au correspondant (surtout en mode VOX où le micro tourne en continu).
+`AudioPipelineState` est indépendant : `CLOSED`, `OPENING`,
+`READY(endpointKey, observedInput, observedOutput)` ou `FAILED`. En mode PTT, l'entrée de
+VoxCrew au premier plan prépare Telecom et le pipeline avant toute pression. Le bouton reste
+gris et désactivé jusqu'à `ACTIVE + READY`; une fois prêt, la pression ne fait que changer
+`TransmissionPolicy` et l'encodage peut commencer sur la prochaine frame de 20 ms.
 
-Solution : chemin VoIP natif Android, sans dépendance tierce :
+`AudioRecord.routedDevice` et `AudioTrack.routedDevice` ne servent qu'aux diagnostics et
+aux icônes Bluetooth/USB/filaire. Aucun `AudioDeviceInfo` n'est conservé comme décision
+de routage.
 
-```text
-LanIntercomEngine.start()
-  → IntercomAudioSession.enter()     (MODE_IN_COMMUNICATION + routage)
-  → AudioPlayback.warmUp()           (session playback avant capture)
-  → AudioCapture                     (VOICE_COMMUNICATION + effets)
-```
+## Cycle de demande média
 
-Effets attachés sur la session [AudioRecord] quand disponibles (`CaptureAudioEffects`) :
+Une demande média existe si au moins une condition est vraie :
 
-- `AcousticEchoCanceler` (AEC)
-- `NoiseSuppressor`
-- `AutomaticGainControl`
+- VoxCrew est au premier plan en mode PTT ;
+- VOX est activé, au premier plan comme en arrière-plan, car Silero doit écouter en continu ;
+- un pair distant a annoncé une transmission active ou des frames de ce pair restent en attente.
 
-La référence écho (signal joué) est fournie par le HAL — pas de tap PCM applicatif.
+La première demande ajoute/active l'appel Telecom. Lorsque la dernière demande disparaît,
+VoxCrew libère le duplex puis termine complètement l'appel avec `disconnect(LOCAL)`.
+`setInactive()` correspond à une mise en attente et n'est pas utilisé comme état idle :
+sur certains Samsung, un appel self-managed `ON_HOLD` conserve le contexte de communication
+et peut perturber la sortie des autres applications. L'appel VoxCrew ne déclare donc plus
+la capacité hold. Il n'existe aucun délai d'inactivité ou heuristique de focus.
 
-Garde applicative VOX (`VoxEchoGuard`) : pendant ~100 ms après le début d'une réception,
-les décisions VAD sont forcées à « non-parole » pour limiter les faux déclenchements
-résiduels sur certains OEM. Le PTT n'est pas affecté.
+En PTT, chaque pression réutilise le même `AudioRecord`, `AudioTrack` et appel Telecom tant
+que VoxCrew reste au premier plan. Une pression/relâchement ne crée ni ne détruit de route.
+Le passage en arrière-plan annule une pression éventuelle et libère Telecom si aucune
+réception distante n'est active. Le retour au premier plan reconstruit le chemin et garde
+PTT désactivé jusqu'à sa confirmation. Les changements de configuration de l'activité ne
+sont pas considérés comme un passage réel en arrière-plan.
 
-Diagnostics logués au premier attach (`CaptureAudioEffects`) : disponibilité/activation
-AEC, NS, AGC. La qualité acoustique reste à valider sur téléphone physique (voir AGENTS.md).
+La création, l'activation et l'arrêt de l'appel sont sérialisés. Les demandes concurrentes
+`start`/`refresh` partagent une seule génération Telecom et un seul `addCall`. Chaque callback
+porte cette génération ; après un arrêt, un callback tardif de l'ancien appel est ignoré et
+ne peut pas remplacer l'état `ACTIVE/READY` de la session courante.
+
+`LanFrame.MediaActivity` transporte les limites début/fin de parole dans le même espace de
+séquence accusé que les frames Opus. Elles survivent donc aux reconnexions et changements
+LAN/UDP/relais. Le récepteur active Telecom sur « début », conserve au maximum 250 événements
+(environ cinq secondes de parole) pendant `OPENING`, joue toutes les frames dans l'ordre,
+puis traite « fin » et déconnecte l'appel Telecom. Les paquets UDP reçus hors ordre attendent
+désormais leur séquence manquante au lieu de faire avancer artificiellement l'ACK.
+
+En mode VOX, l'appareil local conserve nécessairement Telecom actif pendant que VOX est
+activé afin de garder le microphone duplex disponible. Ce comportement résulte d'un choix
+explicite de l'utilisateur et peut réduire, interrompre ou rerouter la musique d'une autre
+application. En PTT, cet impact est borné à la présence de VoxCrew au premier plan et aux
+réceptions distantes en arrière-plan.
+
+## Politique d'endpoints
+
+`getAvailableStartingCallEndpoints()` est collecté même sans appel actif afin d'alimenter
+le sélecteur audio du coin supérieur droit. Cette observation ne prend ni focus ni route.
+« Cet appareil » (micro intégré + haut-parleur) est toujours sélectionné au lancement.
+Chaque endpoint Bluetooth est présenté séparément par son nom et son identifiant Telecom :
+une Galaxy Watch et des Galaxy Buds ne sont donc jamais confondus. Les endpoints USB/filaire
+sont ajoutés et retirés dynamiquement. La connexion d'un accessoire ne le sélectionne jamais
+automatiquement ; sa déconnexion remet explicitement la sélection sur « Cet appareil ».
+
+Une fois l'appel actif :
+
+- `currentCallEndpoint` reste la vérité sur la route physique courante ;
+- l'endpoint sélectionné est passé comme `preferredStartingCallEndpoint`, puis demandé
+  exactement par identifiant si Telecom confirme d'abord une autre route ;
+- le duplex reste fermé tant que l'endpoint courant ne correspond pas à la sélection :
+  aucun premier paquet ne peut partir via l'écouteur ou la montre par erreur ;
+- un changement manuel pendant un appel ferme le graphe, demande une fois la nouvelle
+  route et le reconstruit uniquement après confirmation ;
+- un échec ne choisit jamais silencieusement un autre périphérique ;
+- `onSetInactive` est traité comme une demande de terminaison, et `onDisconnect` ferme
+  immédiatement le duplex et annule PTT.
+
+Le bouton PTT et l'action de barre supérieure affichent la sélection même à l'état idle ;
+pendant un appel, le bouton reflète la route confirmée. `AudioDeviceInfo` ne sert qu'à
+distinguer visuellement USB/filaire et aux diagnostics. Il n'existe aucun retry automatique,
+délai, debounce, timeout de confirmation, route SCO historique ou repli applicatif.
+
+## Pipeline duplex sérialisé
+
+Pour chaque nouvelle clé d'endpoint confirmée, sous un mutex unique :
+
+1. annulation de la transmission pendant le remplacement du graphe ;
+2. arrêt/libération des deux anciens flux ;
+3. création/démarrage de `AudioTrack` (`STREAM_VOICE_CALL`, parole, mono 16 kHz) ;
+4. création/démarrage de `AudioRecord` (`VOICE_COMMUNICATION`, mono 16 kHz) ;
+5. publication de `READY` seulement si les deux ont réussi.
+
+PTT et VOX restent des politiques sur cette capture continuellement ouverte. Les lectures
+courtes sont assemblées jusqu'à une frame PCM exacte de 20 ms ; les écritures courtes sont
+drainées entièrement. Une erreur de construction, démarrage, lecture ou écriture libère
+les deux côtés et publie `FAILED`. La reprise nécessite un nouvel événement plateforme ou
+l'action utilisateur « Réessayer ».
+
+## Prétraitement et niveau de parole
+
+`VOICE_COMMUNICATION` demande le traitement de communication calibré par Android et le
+constructeur du téléphone. VoxCrew n'ajoute plus de chaîne AEC/NS/AGC explicite.
+
+Avant Opus, `PcmSpeechLeveler` stabilise uniquement les frames émises : RMS cible 2500,
+porte de silence 64, gain borné de −6 dB à +18 dB, limiteur ±30000, attaque/relâchement
+déterministes 0,25/0,50 par frame. Il est réinitialisé au début d'une transmission et à
+chaque remplacement d'endpoint. Silero reçoit toujours le PCM brut : le niveau appliqué
+ne peut donc pas modifier une décision VOX. Le PCM reçu n'est pas modifié ; le volume
+reste celui du flux d'appel Android.
+
+`VoxEchoGuard` conserve sa garde contre les faux déclenchements VOX pendant une réception.
+Elle ne change ni le routage ni le PTT.
+
+## Diagnostics et validation physique
+
+Logcat (`IntercomTelecomSession`, `AudioCapture`, `AudioPlayback`, `LanIntercomEngine`)
+expose sans données audio : endpoint confirmé, périphériques observés, RMS brut/nivelé,
+taille Opus, livraison/file transport, frames reçues/décodées et résultat d'écriture.
+
+Matrice à valider sur appareils physiques, dans les deux sens : téléphones nus, Fold avec
+Galaxy Buds, écouteurs USB avec micro sur chaque téléphone, connexion/déconnexion pendant
+la session, Bluetooth+USB simultanés, puis déconnexion/recréation Telecom entre deux PTT. Vérifier que
+PTT ne reste jamais bloqué, que le téléphone nu utilise le haut-parleur, que les routes
+accessoires sont duplex, que le PCM parlé est non silencieux et que les écritures réussissent.
 
 ## Diagnostics (UI principale)
 

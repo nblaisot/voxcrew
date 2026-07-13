@@ -16,6 +16,8 @@ sealed class LanFrame {
 
     /** [payload] is codec-encoded audio (Opus), not raw PCM — see [AudioCapture]/[AudioPlayback]. */
     data class Audio(val seq: Long, val payload: ByteArray) : LanFrame()
+    /** Reliable, sequenced talk-spurt boundary used to drive the remote Telecom lifecycle. */
+    data class MediaActivity(val seq: Long, val active: Boolean) : LanFrame()
     data class Ack(val lastContiguousSeq: Long) : LanFrame()
     data class Ping(val timestampMs: Long) : LanFrame()
     data class Pong(val timestampMs: Long) : LanFrame()
@@ -27,6 +29,7 @@ object LanProtocol {
     private const val TYPE_ACK = 3
     private const val TYPE_PING = 4
     private const val TYPE_PONG = 5
+    private const val TYPE_MEDIA_ACTIVITY = 6
 
     /** Guards against a corrupt/malicious length prefix causing an OOM allocation. */
     const val MAX_PAYLOAD_BYTES = 64 * 1024
@@ -79,6 +82,7 @@ object LanProtocol {
         is LanFrame.Ack -> TYPE_ACK
         is LanFrame.Ping -> TYPE_PING
         is LanFrame.Pong -> TYPE_PONG
+        is LanFrame.MediaActivity -> TYPE_MEDIA_ACTIVITY
     }
 
     private fun encodePayload(frame: LanFrame): ByteArray {
@@ -96,6 +100,10 @@ object LanProtocol {
             is LanFrame.Ack -> data.writeLong(frame.lastContiguousSeq)
             is LanFrame.Ping -> data.writeLong(frame.timestampMs)
             is LanFrame.Pong -> data.writeLong(frame.timestampMs)
+            is LanFrame.MediaActivity -> {
+                data.writeLong(frame.seq)
+                data.writeBoolean(frame.active)
+            }
         }
         data.flush()
         return buffer.toByteArray()
@@ -114,6 +122,7 @@ object LanProtocol {
             TYPE_ACK -> LanFrame.Ack(data.readLong())
             TYPE_PING -> LanFrame.Ping(data.readLong())
             TYPE_PONG -> LanFrame.Pong(data.readLong())
+            TYPE_MEDIA_ACTIVITY -> LanFrame.MediaActivity(data.readLong(), data.readBoolean())
             else -> throw IOException("Unknown LAN frame type: $type")
         }
     }

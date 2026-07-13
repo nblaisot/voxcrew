@@ -2,6 +2,7 @@ package com.nblaisot.voxcrew.di
 
 import android.content.Context
 import com.nblaisot.voxcrew.BuildConfig
+import com.nblaisot.voxcrew.audio.IntercomTelecomSession
 import com.nblaisot.voxcrew.auth.AuthRepository
 import com.nblaisot.voxcrew.auth.FirebaseAuthRepository
 import com.nblaisot.voxcrew.connectivity.transport.CloudRunSignalingTransport
@@ -15,6 +16,9 @@ import kotlinx.coroutines.SupervisorJob
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    // Register with Telecom as early as possible so PhoneAccount is active before addCall().
+    private val intercomTelecomSession = IntercomTelecomSession(appContext, scope)
 
     val authRepository: AuthRepository = FirebaseAuthRepository()
 
@@ -35,6 +39,7 @@ class AppContainer(context: Context) {
         scope = scope,
         cloudTransport = cloudTransport,
         signalingClient = signalingClient,
+        telecomSession = intercomTelecomSession,
     )
 
     val rosterRepository = CrewRosterRepository(
