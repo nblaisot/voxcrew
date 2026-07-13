@@ -1,16 +1,15 @@
 package com.nblaisot.voxcrew.lanlink
 
 import android.media.AudioAttributes
-import android.media.AudioDeviceInfo
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Build
 import android.util.Log
+import android.media.AudioManager
 import com.nblaisot.voxcrew.audio.AudioRouteSelector
 import com.nblaisot.voxcrew.audio.AudioRouteState
+import com.nblaisot.voxcrew.audio.CaptureInputKind
 import com.nblaisot.voxcrew.audio.IntercomAudioSession
-import com.nblaisot.voxcrew.audio.OutputKind
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -21,45 +20,42 @@ import kotlinx.coroutines.launch
 
 /**
  * Plays back inbound Opus frames in the order they are received, decoding each with
- * [OpusCodec] before writing PCM to the track. Frames only ever arrive in order and
- * deduplicated (guaranteed by [PeerLink] regardless of transport), so playback is a
- * straight streaming write — no jitter buffer needed, backlog after a resume just
- * plays back a little behind live, which is the intended trade-off.
+ * [OpusCodec] before writing PCM to the track.
  */
 class AudioPlayback(
     private val scope: CoroutineScope,
     private val intercomAudioSession: IntercomAudioSession? = null,
 ) {
+    private val lock = Any()
     private var track: AudioTrack? = null
     private var idleJob: Job? = null
     private val decoder = OpusCodec.Decoder()
     private var loggedRoutedDevice = false
     private var loggedIncomingAudio = false
-    private var bluetoothPlaybackRetryKey: String? = null
     private var currentRoute: AudioRouteState = AudioRouteState.builtIn()
+    private var activePlaybackKey: String? = null
 
     private val _isReceiving = MutableStateFlow(false)
     val isReceiving: StateFlow<Boolean> = _isReceiving.asStateFlow()
 
     /** Creates and starts the playback track so platform AEC has a far-end reference before capture. */
     fun warmUp() {
-        if (intercomAudioSession?.awaitRouteReady() == false) return
-        currentRoute = intercomAudioSession?.currentRoute() ?: AudioRouteState.builtIn()
-        ensureTrack()
+        val route = intercomAudioSession?.currentRoute() ?: return
+        if (!canUseRoute(route)) return
+        synchronized(lock) {
+            ensureTrackForRouteLocked(route)
+        }
     }
 
     fun refreshRoute(route: AudioRouteState) {
-        if (playbackKey(route) == playbackKey(currentRoute) && track != null) return
-        if (!route.routeReady) return
-        currentRoute = route
-        releaseTrack()
-        loggedRoutedDevice = false
-        bluetoothPlaybackRetryKey = null
-        ensureTrack()
+        if (!canUseRoute(route)) return
+        synchronized(lock) {
+            ensureTrackForRouteLocked(route, forceRecreate = true)
+        }
     }
 
     val audioSessionId: Int?
-        get() = track?.audioSessionId
+        get() = synchronized(lock) { track?.audioSessionId }
 
     fun play(payload: ByteArray) {
         val pcm = runCatching { decoder.decode(payload) }
@@ -69,7 +65,14 @@ class AudioPlayback(
             loggedIncomingAudio = true
             Log.i(TAG, "incoming audio frame decoded pcmBytes=${pcm.size}")
         }
-        val activeTrack = verifyPlaybackRoute(ensureTrack() ?: return) ?: return
+        val activeTrack = synchronized(lock) {
+            val route = intercomAudioSession?.currentRoute()
+            if (route != null && canUseRoute(route)) {
+                ensureTrackForRouteLocked(route)
+            }
+            track
+        } ?: return
+        logRoutedDeviceOnce(activeTrack)
         runCatching { activeTrack.write(pcm, 0, pcm.size) }
             .onFailure { Log.w(TAG, "AudioTrack.write failed: ${it.message}") }
         _isReceiving.value = true
@@ -77,29 +80,47 @@ class AudioPlayback(
         idleJob = scope.launch {
             delay(IDLE_TIMEOUT_MS)
             _isReceiving.value = false
-            releaseTrack()
-            loggedRoutedDevice = false
         }
     }
 
     fun stop() {
         idleJob?.cancel()
         _isReceiving.value = false
-        releaseTrack()
-        loggedRoutedDevice = false
-        loggedIncomingAudio = false
-        bluetoothPlaybackRetryKey = null
+        synchronized(lock) {
+            releaseTrackLocked()
+            loggedRoutedDevice = false
+            loggedIncomingAudio = false
+            activePlaybackKey = null
+        }
     }
 
-    private fun releaseTrack() {
+    private fun canUseRoute(route: AudioRouteState): Boolean {
+        if (route.permissionIssue != null) return false
+        return route.routeReady ||
+            (route.audioMode == AudioManager.MODE_IN_COMMUNICATION &&
+                route.micKind == CaptureInputKind.BLUETOOTH)
+    }
+
+    private fun releaseTrackLocked() {
         track?.let { runCatching { it.stop() }; runCatching { it.release() } }
         track = null
     }
 
-    private fun ensureTrack(): AudioTrack? {
-        track?.let { return it }
-        if (intercomAudioSession?.awaitRouteReady() == false) return null
-        currentRoute = intercomAudioSession?.currentRoute() ?: currentRoute
+    private fun ensureTrackForRouteLocked(
+        route: AudioRouteState,
+        forceRecreate: Boolean = false,
+    ): AudioTrack? {
+        val key = playbackKey(route)
+        if (!forceRecreate && track != null && key == activePlaybackKey) {
+            return track
+        }
+        if (track != null) {
+            Log.i(TAG, "recreating AudioTrack key=$key previous=$activePlaybackKey")
+            releaseTrackLocked()
+            loggedRoutedDevice = false
+        }
+        currentRoute = route
+        activePlaybackKey = key
         val minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
         if (minBuf <= 0) {
             Log.w(TAG, "AudioTrack.getMinBufferSize failed ($minBuf)")
@@ -109,7 +130,7 @@ class AudioPlayback(
             AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(currentRoute.playbackUsage)
+                        .setUsage(route.playbackUsage)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build(),
                 )
@@ -127,71 +148,45 @@ class AudioPlayback(
             Log.w(TAG, "AudioTrack init failed: ${e.message}")
             return null
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-            currentRoute.audioMode == android.media.AudioManager.MODE_NORMAL &&
-            currentRoute.outputDevice != null
-        ) {
-            val preferred = newTrack.setPreferredDevice(currentRoute.outputDevice)
-            Log.i(
-                TAG,
-                "setPreferredDevice outputType=${currentRoute.outputDevice?.type} success=$preferred",
-            )
+        route.outputDevice?.let { output ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                route.audioMode != android.media.AudioManager.MODE_IN_COMMUNICATION
+            ) {
+                val preferred = newTrack.setPreferredDevice(output)
+                Log.i(
+                    TAG,
+                    "setPreferredDevice outputType=${output.type} mode=${route.audioMode} success=$preferred",
+                )
+            }
         }
         newTrack.play()
         track = newTrack
         Log.i(
             TAG,
-            "AudioTrack opened usage=${currentRoute.playbackUsage} " +
-                "outputKind=${currentRoute.outputKind}",
+            "AudioTrack opened usage=${route.playbackUsage} outputKind=${route.outputKind} " +
+                "outputType=${route.outputDevice?.type}",
         )
         return newTrack
     }
 
-    private fun verifyPlaybackRoute(activeTrack: AudioTrack): AudioTrack? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return activeTrack
+    private fun logRoutedDeviceOnce(activeTrack: AudioTrack) {
+        if (loggedRoutedDevice || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        loggedRoutedDevice = true
         val routedDevice = activeTrack.routedDevice
-        if (!loggedRoutedDevice) {
-            loggedRoutedDevice = true
-            Log.i(
-                TAG,
-                "playback routedType=${routedDevice?.type} expectedType=${currentRoute.outputDevice?.type} " +
-                    "outputKind=${currentRoute.outputKind} mode=${currentRoute.audioMode}",
-            )
-        }
-        if (!isBluetoothCommunicationRoute(currentRoute)) return activeTrack
-        if (isExpectedBluetoothPlaybackDevice(routedDevice, currentRoute)) return activeTrack
-
-        val key = playbackKey(currentRoute)
-        if (bluetoothPlaybackRetryKey == key) {
+        Log.i(
+            TAG,
+            "playback routedType=${routedDevice?.type} expectedType=${currentRoute.outputDevice?.type} " +
+                "outputKind=${currentRoute.outputKind} mode=${currentRoute.audioMode}",
+        )
+        if (currentRoute.outputDevice != null &&
+            !AudioRouteSelector.sameDevice(routedDevice, currentRoute.outputDevice)
+        ) {
             Log.w(
                 TAG,
-                "Bluetooth playback still routedType=${routedDevice?.type}; already retried route=$key",
+                "playback route mismatch — expected ${currentRoute.outputDevice?.type} " +
+                    "got ${routedDevice?.type}",
             )
-            return activeTrack
         }
-
-        bluetoothPlaybackRetryKey = key
-        Log.w(
-            TAG,
-            "Bluetooth playback routedType=${routedDevice?.type} expectedType=${currentRoute.outputDevice?.type}; " +
-                "re-applying route and recreating AudioTrack",
-        )
-        intercomAudioSession?.reapplyRouting()
-        releaseTrack()
-        loggedRoutedDevice = false
-        return ensureTrack()
-    }
-
-    private fun isBluetoothCommunicationRoute(route: AudioRouteState): Boolean =
-        route.audioMode == AudioManager.MODE_IN_COMMUNICATION && route.outputKind == OutputKind.BLUETOOTH
-
-    private fun isExpectedBluetoothPlaybackDevice(
-        routedDevice: AudioDeviceInfo?,
-        route: AudioRouteState,
-    ): Boolean {
-        if (routedDevice == null) return false
-        val expected = route.outputDevice
-        return expected == null || AudioRouteSelector.sameDevice(routedDevice, expected)
     }
 
     private fun playbackKey(route: AudioRouteState): String =

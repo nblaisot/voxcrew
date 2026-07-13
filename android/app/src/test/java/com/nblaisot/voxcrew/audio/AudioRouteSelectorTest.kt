@@ -6,6 +6,8 @@ import android.media.AudioManager
 import io.mockk.every
 import io.mockk.mockk
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -124,42 +126,20 @@ class AudioRouteSelectorTest {
     }
 
     @Test
-    fun resolve_disabledBluetoothMic_usesBluetoothOutputAndDeviceMic() {
-        val ble = device(AudioDeviceInfo.TYPE_BLE_HEADSET, sink = true, source = true)
-        val selection = AudioRouteSelector.resolve(
-            outputs = listOf(ble),
-            inputs = listOf(ble),
-            availableCommunicationDevices = listOf(ble),
-            activeCommunicationDevice = ble,
-            supportsCommunicationDeviceApi = true,
-            recordAudioGranted = true,
-            bluetoothConnectGranted = true,
-            disabledBluetoothMicrophoneIdentities = setOf(AudioRouteSelector.deviceIdentity(ble)!!),
+    fun pickCommunicationDeviceType_prefersBleOverSco() {
+        val available = listOf(
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
         )
-
-        assertEquals(CaptureInputKind.BUILTIN, selection.route.micKind)
-        assertEquals(OutputKind.BLUETOOTH, selection.route.outputKind)
-        assertEquals(AudioAttributes.USAGE_MEDIA, selection.route.playbackUsage)
-        assertNull(selection.route.captureDevice)
-        assertNull(selection.communicationDevice)
+        assertEquals(AudioDeviceInfo.TYPE_BLE_HEADSET, AudioRouteSelector.pickCommunicationDeviceType(available))
     }
 
     @Test
-    fun resolve_disabledBluetoothMicByType_usesBluetoothOutputAndDeviceMic() {
-        val ble = device(AudioDeviceInfo.TYPE_BLE_HEADSET, sink = true, source = true, address = "")
-        val selection = AudioRouteSelector.resolve(
-            outputs = listOf(ble),
-            inputs = listOf(ble),
-            availableCommunicationDevices = listOf(ble),
-            activeCommunicationDevice = ble,
-            supportsCommunicationDeviceApi = true,
-            recordAudioGranted = true,
-            bluetoothConnectGranted = true,
-            disabledBluetoothMicrophoneIdentities = setOf("${AudioDeviceInfo.TYPE_BLE_HEADSET}:"),
-        )
-
-        assertEquals(CaptureInputKind.BUILTIN, selection.route.micKind)
-        assertEquals(OutputKind.BLUETOOTH, selection.route.outputKind)
+    fun hasBluetoothMicInput_detectsBleHeadsetSource() {
+        val ble = device(AudioDeviceInfo.TYPE_BLE_HEADSET, sink = true, source = true)
+        val builtin = device(AudioDeviceInfo.TYPE_BUILTIN_MIC, source = true)
+        assertTrue(AudioRouteSelector.hasBluetoothMicInput(listOf(ble)))
+        assertFalse(AudioRouteSelector.hasBluetoothMicInput(listOf(builtin)))
     }
 
     @Test
@@ -172,6 +152,37 @@ class AudioRouteSelectorTest {
 
         assertEquals(AudioPermissionIssue.RECORD_AUDIO, selection.route.permissionIssue)
         assertEquals(false, selection.route.routeReady)
+    }
+
+    @Test
+    fun communicationRouteReady_acceptsScoConfirmedForBleRequestOnSameAddress() {
+        val ble = device(
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            address = "78:C1:1D:41:75:1F",
+            sink = true,
+        )
+        val sco = device(
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            address = "78:C1:1D:41:75:1F",
+            sink = true,
+        )
+        assertTrue(AudioRouteSelector.communicationRouteReady(sco, ble))
+        assertFalse(AudioRouteSelector.communicationRouteReady(ble, device(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, sink = true)))
+    }
+
+    @Test
+    fun resolve_bluetoothMic_fallsBackToOutputWhenAvailableCommListEmpty() {
+        val ble = device(AudioDeviceInfo.TYPE_BLE_HEADSET, sink = true, source = true)
+        val selection = resolve(
+            outputs = listOf(ble),
+            inputs = listOf(ble),
+            available = emptyList(),
+        )
+
+        assertEquals(CaptureInputKind.BLUETOOTH, selection.route.micKind)
+        assertFalse(selection.route.routeReady)
+        assertEquals(CaptureInputKind.BLUETOOTH, AudioRouteSelector.pttMicIconKind(selection.route))
+        assertNotNull(selection.communicationDevice)
     }
 
     @Test

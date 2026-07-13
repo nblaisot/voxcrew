@@ -1,11 +1,13 @@
 package com.nblaisot.voxcrew.lanlink
 
 import android.content.Context
+import com.nblaisot.voxcrew.audio.AudioPathPreparer
 import com.nblaisot.voxcrew.audio.AudioPermissionIssue
 import com.nblaisot.voxcrew.audio.AudioRouteSelector
 import com.nblaisot.voxcrew.audio.AudioRouteState
 import com.nblaisot.voxcrew.audio.CaptureInputKind
 import com.nblaisot.voxcrew.audio.IntercomAudioSession
+import com.nblaisot.voxcrew.audio.IntercomTelecomSession
 import com.nblaisot.voxcrew.audio.OutputKind
 import com.nblaisot.voxcrew.audio.PushToTalkTransmissionPolicy
 import com.nblaisot.voxcrew.audio.SileroVoiceDetector
@@ -57,14 +59,20 @@ class LanIntercomEngine(
     private val signalingClient: SignalingClient? = null,
     private val networkMonitor: NetworkMonitor = NetworkMonitor(context),
     private val intercomAudioSession: IntercomAudioSession = IntercomAudioSession(context),
+    telecomSession: IntercomTelecomSession? = null,
 ) {
     private val appContext = context.applicationContext
+    private val telecomSession = telecomSession ?: IntercomTelecomSession(appContext, scope)
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val json = Json { ignoreUnknownKeys = true }
     private val beacon = LanBeacon(context, scope)
     private val lanServer = LanTcpServer(scope)
     private val sharedUdp = SharedUdpSocket()
-    private val capture = AudioCapture(scope, intercomAudioSession)
+    private val capture = AudioCapture(
+        scope = scope,
+        intercomAudioSession = intercomAudioSession,
+        playbackSessionIdProvider = { playback.audioSessionId },
+    )
     private val playback = AudioPlayback(scope, intercomAudioSession)
     private val uiFeedback = UiFeedbackPlayer(scope)
 
@@ -113,7 +121,7 @@ class LanIntercomEngine(
     private var receivingSweepJob: Job? = null
     private var metricsJob: Job? = null
     private var routeWatchJob: Job? = null
-    private var releaseAudioJob: Job? = null
+    private var routeRestartJob: Job? = null
     private val audioInitMutex = Mutex()
     private var audioPrepared = false
     private var lastFanOutDiagMs = 0L
@@ -220,12 +228,12 @@ class LanIntercomEngine(
             pttPolicy.cancel()
             activePolicy = voxPolicy
             watchPolicy(activePolicy)
-            prepareAudioAndCapture()
+            prepareAudioPath()
         } else {
             stopVoxCapture()
             activePolicy = pttPolicy
             watchPolicy(activePolicy)
-            releaseAudioWhenIdle(delayMs = 0L)
+            prepareAudioPath()
         }
     }
 
@@ -235,13 +243,12 @@ class LanIntercomEngine(
         if (_voxEnabled.value) {
             stopVoxCapture()
             audioPrepared = false
-            prepareAudioAndCapture()
+            prepareAudioPath()
         }
     }
 
     fun pttPress() {
         if (_voxEnabled.value) return
-        prepareAudioAndCapture()
         logPttRouteSummary()
         pttPolicy.onPress()
     }
@@ -249,7 +256,6 @@ class LanIntercomEngine(
     fun pttRelease() {
         if (_voxEnabled.value) return
         pttPolicy.onRelease()
-        releaseAudioWhenIdle()
     }
 
     fun onBluetoothPermissionGranted() {
@@ -281,10 +287,54 @@ class LanIntercomEngine(
     private fun ensureAudioRoutingMonitorLocked() {
         if (!intercomAudioSession.isActive) {
             intercomAudioSession.enter()
+            telecomSession.start()
         } else {
             intercomAudioSession.reapplyRouting()
         }
         watchAudioRoute()
+        prepareAudioPathLocked()
+    }
+
+    private fun prepareAudioPath() {
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                audioInitMutex.withLock {
+                    prepareAudioPathLocked(forceReattach = true)
+                }
+            }.onFailure { error ->
+                Log.e(TAG, "audio path prepare failed: ${error.message}", error)
+            }
+        }
+    }
+
+    private fun prepareAudioPathLocked(forceReattach: Boolean = false) {
+        val result = AudioPathPreparer.prepare(
+            isSessionActive = intercomAudioSession.isActive,
+            awaitRouteReady = {
+                val ready = intercomAudioSession.awaitRouteReady()
+                if (!ready) {
+                    Log.w(TAG, "audio route not ready; capture/playback deferred")
+                }
+                ready
+            },
+            awaitRoutingApplied = { intercomAudioSession.awaitRoutingApplied() },
+            warmUpPlayback = {
+                if (!intercomAudioSession.isAudioFocusGranted()) {
+                    Log.w(TAG, "audio focus not granted — capture may be unreliable")
+                }
+                playback.warmUp()
+            },
+            detachCapture = {
+                stopVoxCapture()
+                capture.detach()
+            },
+            attachCapture = { attachCaptureForCurrentMode() },
+            audioPrepared = audioPrepared,
+            forceReattach = forceReattach,
+        )
+        if (result.captureAttached) {
+            audioPrepared = true
+        }
     }
 
     private fun fanOut(payload: ByteArray) {
@@ -295,14 +345,19 @@ class LanIntercomEngine(
         }
         var missingConnection = 0
         var notConnected = 0
+        val notConnectedUids = mutableListOf<String>()
+        var sent = 0
         active.forEach { uid ->
             val conn = connections[uid]
             if (conn == null) {
                 missingConnection++
                 ensureConnection(uid).start()
+            } else if (conn.linkState.value !is PeerLink.LinkState.Connected) {
+                notConnected++
+                notConnectedUids.add(uid)
             } else {
-                if (conn.linkState.value !is PeerLink.LinkState.Connected) notConnected++
                 conn.send(payload)
+                sent++
             }
         }
         val now = System.currentTimeMillis()
@@ -310,8 +365,9 @@ class LanIntercomEngine(
             lastFanOutDiagMs = now
             Log.i(
                 TAG,
-                "fanOut: recipients=${active.size} bytes=${payload.size} " +
-                    "missingConnection=$missingConnection notConnected=$notConnected",
+                "fanOut: recipients=${active.size} sent=$sent bytes=${payload.size} " +
+                    "missingConnection=$missingConnection notConnected=$notConnected " +
+                    "notConnectedUids=$notConnectedUids",
             )
         }
     }
@@ -330,122 +386,83 @@ class LanIntercomEngine(
         )
     }
 
-    private fun prepareAudioAndCapture() {
-        scope.launch(Dispatchers.IO) {
-            runCatching {
-                audioInitMutex.withLock {
-                    releaseAudioJob?.cancel()
-                    ensureAudioRoutingMonitorLocked()
-                    intercomAudioSession.activateAudio()
-                    if (!intercomAudioSession.awaitRouteReady()) {
-                        Log.w(TAG, "audio route not ready; capture/playback deferred")
-                        return@withLock
-                    }
-                    if (!intercomAudioSession.isAudioFocusGranted()) {
-                        Log.w(TAG, "audio focus not granted — capture may be unreliable")
-                    }
-                    if (audioPrepared) return@withLock
-                    playback.warmUp()
-                    attachCaptureForCurrentMode()
-                    audioPrepared = true
-                }
-            }.onFailure { error ->
-                Log.e(TAG, "audio session init failed: ${error.message}", error)
-            }
-        }
-    }
-
-    private fun releaseAudioWhenIdle(delayMs: Long = AUDIO_IDLE_RELEASE_DELAY_MS) {
-        releaseAudioJob?.cancel()
-        releaseAudioJob = scope.launch(Dispatchers.IO) {
-            var nextDelayMs = delayMs
-            while (currentCoroutineContext().isActive) {
-                delay(nextDelayMs)
-                var keepWaitingForPlayback = false
-                var released = false
-                runCatching {
-                    audioInitMutex.withLock {
-                        if (_voxEnabled.value || pttPolicy.shouldTransmit.value) {
-                            return@withLock
-                        }
-                        if (playback.isReceiving.value) {
-                            keepWaitingForPlayback = true
-                            return@withLock
-                        }
-                        capture.detach()
-                        playback.stop()
-                        audioPrepared = false
-                        intercomAudioSession.deactivateAudio()
-                        released = true
-                    }
-                }.onFailure { error ->
-                    Log.e(TAG, "audio idle release failed: ${error.message}", error)
-                }
-                if (released || !keepWaitingForPlayback) {
-                    return@launch
-                }
-                nextDelayMs = AUDIO_IDLE_RELEASE_DELAY_MS
-            }
-        }
-    }
-
     private fun watchAudioRoute() {
         if (routeWatchJob?.isActive == true) return
         routeWatchJob = scope.launch {
             var previousPlaybackKey: String? = null
             var previousCaptureKey: String? = null
-            var detachedForUnavailableRoute = false
+            var wasRouteReady = false
             combine(
                 intercomAudioSession.routeReady,
                 intercomAudioSession.audioRoute,
             ) { ready, route ->
                 ready to route
             }.collect { (ready, route) ->
-                if (!audioPrepared) return@collect
-                if (!ready) {
-                    Log.i(TAG, "audio route became unavailable; stopping capture")
-                    stopVoxCapture()
-                    capture.detach()
-                    previousPlaybackKey = null
-                    previousCaptureKey = null
-                    detachedForUnavailableRoute = true
-                    return@collect
+                val becameReady = ready && !wasRouteReady
+                wasRouteReady = ready
+
+                if (!audioPrepared || becameReady) {
+                    scope.launch(Dispatchers.IO) {
+                        runCatching {
+                            audioInitMutex.withLock {
+                                prepareAudioPathLocked(forceReattach = audioPrepared && becameReady)
+                            }
+                        }
+                    }
                 }
+
                 val playbackKey = playbackKey(route)
                 val captureKey = captureKey(route)
-                val playbackChanged = detachedForUnavailableRoute ||
-                    (previousPlaybackKey != null && previousPlaybackKey != playbackKey)
-                val captureChanged = detachedForUnavailableRoute ||
-                    (previousCaptureKey != null && previousCaptureKey != captureKey)
-                detachedForUnavailableRoute = false
+                if (previousPlaybackKey == null || previousCaptureKey == null) {
+                    previousPlaybackKey = playbackKey
+                    previousCaptureKey = captureKey
+                    if (!ready) {
+                        Log.i(
+                            TAG,
+                            "audio route not ready; capture/playback started to unlock platform routing",
+                        )
+                    }
+                    return@collect
+                }
+
+                if (!ready) return@collect
+
+                val playbackChanged = previousPlaybackKey != playbackKey
+                val captureChanged = previousCaptureKey != captureKey
+                if (!playbackChanged && !captureChanged) return@collect
                 previousPlaybackKey = playbackKey
                 previousCaptureKey = captureKey
-                if (!playbackChanged && !captureChanged) return@collect
                 Log.i(
                     TAG,
                     "audio route changed — playbackChanged=$playbackChanged captureChanged=$captureChanged",
                 )
-                restartAudioPath(route, playbackChanged, captureChanged)
+                scheduleRestartAudioPath(route, playbackChanged, captureChanged)
             }
         }
     }
 
-    private fun restartAudioPath(
+    private fun scheduleRestartAudioPath(
         route: AudioRouteState,
         playbackChanged: Boolean,
         captureChanged: Boolean,
     ) {
-        scope.launch(Dispatchers.IO) {
+        routeRestartJob?.cancel()
+        routeRestartJob = scope.launch(Dispatchers.IO) {
+            delay(ROUTE_RESTART_DEBOUNCE_MS)
             runCatching {
                 audioInitMutex.withLock {
                     if (!intercomAudioSession.awaitRouteReady()) return@withLock
+                    intercomAudioSession.awaitRoutingApplied()
                     if (playbackChanged) playback.refreshRoute(route)
-                    if (captureChanged && _voxEnabled.value) {
-                        stopVoxCapture()
-                        startVoxCapture()
-                    } else if (captureChanged) {
-                        capture.detach()
-                        capture.attach(activePolicy.shouldTransmit) { payload -> fanOut(payload) }
+                    if (captureChanged) {
+                        playback.warmUp()
+                        if (_voxEnabled.value) {
+                            stopVoxCapture()
+                            startVoxCapture()
+                        } else {
+                            capture.detach()
+                            capture.attach(activePolicy.shouldTransmit) { payload -> fanOut(payload) }
+                        }
                     }
                 }
             }.onFailure { error ->
@@ -457,8 +474,14 @@ class LanIntercomEngine(
     private fun playbackKey(route: AudioRouteState): String =
         "${route.playbackUsage}:${route.audioMode}:${AudioRouteSelector.deviceIdentity(route.outputDevice)}"
 
-    private fun captureKey(route: AudioRouteState): String =
-        "${route.micKind}:${AudioRouteSelector.deviceIdentity(route.captureDevice)}:${route.captureAudioSource}"
+    private fun captureKey(route: AudioRouteState): String {
+        if (route.micKind == CaptureInputKind.BLUETOOTH &&
+            !AudioRouteSelector.isBluetoothCaptureDevice(route.captureDevice)
+        ) {
+            return "BT_PENDING:${AudioRouteSelector.deviceIdentity(route.outputDevice)}:${route.captureAudioSource}"
+        }
+        return "${route.micKind}:${AudioRouteSelector.deviceIdentity(route.captureDevice)}:${route.captureAudioSource}"
+    }
 
     private fun attachCaptureForCurrentMode() {
         if (_voxEnabled.value) {
@@ -531,7 +554,6 @@ class LanIntercomEngine(
         if (audioCollectJobs.containsKey(conn.peerUid)) return
         audioCollectJobs[conn.peerUid] = scope.launch(Dispatchers.IO) {
             conn.peerLink.incomingAudio.collect { payload ->
-                ensureAudioRoutingMonitor()
                 playback.play(payload)
                 receivingUntilMs[conn.peerUid] = System.currentTimeMillis() + RECEIVING_IDLE_MS
                 refreshReceivingUids()
@@ -712,10 +734,20 @@ class LanIntercomEngine(
         }
     }
 
+    fun releaseAudioSession() {
+        routeWatchJob?.cancel()
+        routeWatchJob = null
+        telecomSession.stop()
+        stopVoxCapture()
+        capture.detach()
+        audioPrepared = false
+        intercomAudioSession.exit()
+    }
+
     companion object {
         private const val TAG = "LanIntercomEngine"
         private const val RECEIVING_IDLE_MS = 500L
-        private const val AUDIO_IDLE_RELEASE_DELAY_MS = 900L
+        private const val ROUTE_RESTART_DEBOUNCE_MS = 400L
         private const val PREFS_NAME = "voxcrew_lanlink"
         private const val KEY_ACTIVE_RECIPIENTS = "active_recipient_uids"
         private const val KEY_VOX_ENABLED = "vox_enabled"

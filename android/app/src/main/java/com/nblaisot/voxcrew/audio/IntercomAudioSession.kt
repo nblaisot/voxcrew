@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import java.util.concurrent.CopyOnWriteArrayList
@@ -79,9 +80,7 @@ class IntercomAudioSession(
     private var savedMode: Int? = null
     private var savedSpeakerphoneOn: Boolean? = null
     private var active = false
-    private var audioActive = false
     private val routeReadyAwaiters = CopyOnWriteArrayList<CountDownLatch>()
-    private val disabledBluetoothMicrophoneIdentities = mutableSetOf<String>()
 
     private val _audioRoute = MutableStateFlow(AudioRouteState.builtIn(routeReady = false))
     val audioRoute: StateFlow<AudioRouteState> = _audioRoute.asStateFlow()
@@ -100,22 +99,19 @@ class IntercomAudioSession(
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
-            postOnRoutingThread {
-                clearDisabledBluetoothMicrophones()
-                applyRoutingInternal()
-            }
+            postOnRoutingThread { applyRoutingInternal() }
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
-            postOnRoutingThread {
-                clearDisabledBluetoothMicrophones()
-                applyRoutingInternal()
-            }
+            postOnRoutingThread { applyRoutingInternal() }
         }
     }
 
     private val commDeviceChangedListener: () -> Unit = {
-        postOnRoutingThread { applyRoutingInternal() }
+        postOnRoutingThread {
+            if (router.deferringCommDeviceCallbacks()) return@postOnRoutingThread
+            applyRoutingInternal()
+        }
     }
 
     val isActive: Boolean get() = active
@@ -123,8 +119,6 @@ class IntercomAudioSession(
     fun enter() {
         if (active) return
         active = true
-        audioActive = false
-        disabledBluetoothMicrophoneIdentities.clear()
         savedMode = audioManager.mode
         savedSpeakerphoneOn = audioManager.isSpeakerphoneOn
         audioManager.registerAudioDeviceCallback(deviceCallback, routing.callbackHandler)
@@ -138,7 +132,7 @@ class IntercomAudioSession(
     }
 
     fun retryAudioFocus(): Boolean {
-        if (!active || !audioActive) return false
+        if (!active) return false
         return if (_audioRoute.value.audioMode == AudioManager.MODE_IN_COMMUNICATION) {
             audioFocus.request()
         } else {
@@ -147,19 +141,17 @@ class IntercomAudioSession(
     }
 
     fun isAudioFocusGranted(): Boolean =
-        !audioActive || _audioRoute.value.audioMode != AudioManager.MODE_IN_COMMUNICATION || audioFocus.isGranted()
+        _audioRoute.value.audioMode != AudioManager.MODE_IN_COMMUNICATION || audioFocus.isGranted()
 
     fun exit() {
         if (!active) return
         active = false
-        audioActive = false
         runOnRoutingThread {
             runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
             if (supportsCommunicationDeviceApi) {
                 audioManager.setOnCommunicationDeviceChangedListener(null)
             }
             router.release()
-            disabledBluetoothMicrophoneIdentities.clear()
             publishRoute(AudioRouteState.builtIn(routeReady = false))
             releaseRouteReadyAwaiters()
             logInfo(TAG, "routing thread cleaned up")
@@ -171,23 +163,6 @@ class IntercomAudioSession(
         logInfo(TAG, "restored previous audio mode")
     }
 
-    fun activateAudio() {
-        if (!active) enter()
-        runOnRoutingThread {
-            audioActive = true
-            applyRoutingInternal()
-        }
-    }
-
-    fun deactivateAudio() {
-        if (!active) return
-        runOnRoutingThread {
-            audioActive = false
-            router.release()
-            applyRoutingInternal()
-        }
-    }
-
     fun awaitRoutingApplied() {
         if (!active) return
         runOnRoutingThread { Unit }
@@ -195,48 +170,22 @@ class IntercomAudioSession(
 
     fun awaitRouteReady(): Boolean {
         if (!active) return false
-        if (_routeReady.value) return true
         if (_audioRoute.value.permissionIssue != null) return false
-        val latch = CountDownLatch(1)
-        runOnRoutingThread {
-            if (_routeReady.value) {
-                latch.countDown()
-            } else if (!active || _audioRoute.value.permissionIssue != null) {
-                latch.countDown()
-            } else {
-                routeReadyAwaiters.add(latch)
-            }
-        }
-        return latch.await(ROUTING_READY_TIMEOUT_MS, TimeUnit.MILLISECONDS) && _routeReady.value
+        return true
     }
 
     fun currentRoute(): AudioRouteState = _audioRoute.value
 
     fun preferredCaptureDevice(): AudioDeviceInfo? {
-        if (!active || !_routeReady.value) return null
+        if (!active) return null
         val route = runOnRoutingThread { _audioRoute.value }
         val capture = route.captureDevice?.takeIf { it.isSource } ?: return null
         return when (route.micKind) {
-            CaptureInputKind.USB -> capture.takeIf { preferredCaptureMatchesOutput(it, route.outputDevice) }
+            CaptureInputKind.BLUETOOTH ->
+                capture.takeIf { AudioRouteSelector.isBluetoothCaptureDevice(it) }
+            CaptureInputKind.USB -> capture
             CaptureInputKind.BUILTIN -> null
-            CaptureInputKind.BLUETOOTH -> null
         }
-    }
-
-    private fun preferredCaptureMatchesOutput(
-        capture: AudioDeviceInfo,
-        output: AudioDeviceInfo?,
-    ): Boolean {
-        if (output == null) return true
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
-            return capture.type == output.type
-        }
-        val outputAddress = output.address
-        val captureAddress = capture.address
-        if (outputAddress.isEmpty() || captureAddress.isEmpty()) {
-            return capture.type == output.type
-        }
-        return outputAddress == captureAddress
     }
 
     fun onRecordAudioPermissionMissing() {
@@ -252,73 +201,26 @@ class IntercomAudioSession(
 
     fun onCaptureRouteObserved(routedDevice: AudioDeviceInfo?) {
         if (routedDevice == null) return
-        postOnRoutingThread {
-            val current = _audioRoute.value
-            val observedKind = when (routedDevice.type) {
-                AudioDeviceInfo.TYPE_BLE_HEADSET,
-                AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
-                AudioDeviceInfo.TYPE_HEARING_AID,
-                -> CaptureInputKind.BLUETOOTH
-                AudioDeviceInfo.TYPE_USB_HEADSET,
-                AudioDeviceInfo.TYPE_USB_DEVICE,
-                AudioDeviceInfo.TYPE_USB_ACCESSORY,
-                -> CaptureInputKind.USB
-                else -> CaptureInputKind.BUILTIN
-            }
-            if (observedKind == CaptureInputKind.BLUETOOTH &&
-                AudioRouteSelector.deviceIdentity(routedDevice) in disabledBluetoothMicrophoneIdentities
-            ) {
-                logWarn(TAG, "ignoring disabled Bluetooth routed input type=${routedDevice.type}")
-                return@postOnRoutingThread
-            }
-            if (current.micKind != CaptureInputKind.BUILTIN && observedKind == CaptureInputKind.BUILTIN) {
-                publishRoute(
-                    current.copy(
-                        micKind = CaptureInputKind.BUILTIN,
-                        captureDevice = null,
-                        captureSource = CaptureSource.DEVICE_MIC,
-                    ),
-                )
-            } else if (observedKind != CaptureInputKind.BUILTIN && observedKind != current.micKind) {
-                publishRoute(
-                    current.copy(
-                        micKind = observedKind,
-                        captureDevice = routedDevice,
-                        captureSource = CaptureSource.HEADSET_MIC,
-                    ),
-                )
-            }
+        val current = _audioRoute.value
+        if (current.micKind == CaptureInputKind.BLUETOOTH &&
+            current.audioMode == AudioManager.MODE_IN_COMMUNICATION &&
+            !AudioRouteSelector.isBluetoothCaptureType(routedDevice.type)
+        ) {
+            logWarn(
+                TAG,
+                "capture not on Bluetooth device while BT comm route active routedType=${routedDevice.type}",
+            )
         }
     }
 
     fun refreshRouting() {
         if (!active) return
-        postOnRoutingThread {
-            clearDisabledBluetoothMicrophones()
-            applyRoutingInternal()
-        }
+        postOnRoutingThread { applyRoutingInternal() }
     }
 
     fun reapplyRouting() {
         if (!active) return
         postOnRoutingThread { applyRoutingInternal() }
-    }
-
-    fun onBluetoothCaptureSilence(routedDevice: AudioDeviceInfo?) {
-        postOnRoutingThread {
-            val current = _audioRoute.value
-            if (current.micKind != CaptureInputKind.BLUETOOTH) return@postOnRoutingThread
-            val identities = listOf(routedDevice, current.captureDevice, current.outputDevice)
-                .mapNotNull { AudioRouteSelector.deviceIdentity(it) }
-                .toSet()
-            if (identities.isEmpty()) return@postOnRoutingThread
-            disabledBluetoothMicrophoneIdentities += identities
-            logWarn(
-                TAG,
-                "Bluetooth capture stayed silent; disabling mic identities=$identities and re-routing",
-            )
-            applyRoutingInternal()
-        }
     }
 
     private fun postOnRoutingThread(block: () -> Unit) {
@@ -349,11 +251,7 @@ class IntercomAudioSession(
 
     private fun applyRoutingInternal() {
         if (!active) return
-        val route = router.applyRouting(
-            permissionChecker = permissionChecker,
-            disabledBluetoothMicrophoneIdentities = disabledBluetoothMicrophoneIdentities,
-            audioActive = audioActive,
-        )
+        val route = router.applyRouting(permissionChecker = permissionChecker)
         publishRoute(route)
     }
 
@@ -387,13 +285,6 @@ class IntercomAudioSession(
         routeReadyAwaiters.clear()
     }
 
-    private fun clearDisabledBluetoothMicrophones() {
-        if (disabledBluetoothMicrophoneIdentities.isNotEmpty()) {
-            logInfo(TAG, "clearing disabled Bluetooth mic identities")
-            disabledBluetoothMicrophoneIdentities.clear()
-        }
-    }
-
     companion object {
         private const val TAG = "IntercomAudioSession"
         private const val ROUTING_OPERATION_TIMEOUT_MS = 3_000L
@@ -410,17 +301,27 @@ private class AndroidAudioRouter(
     private val supportsCommunicationDeviceApi: Boolean,
 ) {
     private var scoStarted = false
+    private var suppressCommDeviceCallbacks = false
+
+    fun deferringCommDeviceCallbacks(): Boolean = suppressCommDeviceCallbacks
+
+    private fun clearCommunicationDeviceQuietly() {
+        suppressCommDeviceCallbacks = true
+        try {
+            runCatching { audioManager.clearCommunicationDevice() }
+        } finally {
+            suppressCommDeviceCallbacks = false
+        }
+    }
 
     fun applyRouting(
         permissionChecker: AudioPermissionChecker,
-        disabledBluetoothMicrophoneIdentities: Set<String>,
-        audioActive: Boolean,
     ): AudioRouteState {
         val recordAudioGranted = permissionChecker.hasRecordAudioPermission()
         val bluetoothConnectGranted = permissionChecker.hasBluetoothConnectPermission()
         val outputs = getDevices(AudioManager.GET_DEVICES_OUTPUTS)
         val inputs = getDevices(AudioManager.GET_DEVICES_INPUTS)
-        val availableCommunicationDevices = if (audioActive && supportsCommunicationDeviceApi && bluetoothConnectGranted) {
+        val availableCommunicationDevices = if (supportsCommunicationDeviceApi && bluetoothConnectGranted) {
             runCatching { audioManager.availableCommunicationDevices() }
                 .getOrElse { error ->
                     if (error is SecurityException) {
@@ -432,7 +333,7 @@ private class AndroidAudioRouter(
         } else {
             emptyList()
         }
-        val activeCommunicationDevice = if (audioActive && supportsCommunicationDeviceApi && bluetoothConnectGranted) {
+        val activeCommunicationDevice = if (supportsCommunicationDeviceApi && bluetoothConnectGranted) {
             runCatching { audioManager.communicationDevice() }
                 .getOrElse { error ->
                     if (error is SecurityException) {
@@ -453,8 +354,6 @@ private class AndroidAudioRouter(
             supportsCommunicationDeviceApi = supportsCommunicationDeviceApi,
             recordAudioGranted = recordAudioGranted,
             bluetoothConnectGranted = bluetoothConnectGranted,
-            ignoreBluetoothMicrophones = !audioActive,
-            disabledBluetoothMicrophoneIdentities = disabledBluetoothMicrophoneIdentities,
         )
         return applySelection(
             selection = selection,
@@ -474,6 +373,13 @@ private class AndroidAudioRouter(
         stopSco()
         audioFocus.abandon()
     }
+
+    private fun hasBluetoothMicPresent(
+        inputs: List<AudioDeviceInfo>,
+        route: AudioRouteState,
+    ): Boolean =
+        AudioRouteSelector.hasBluetoothMicInput(inputs) ||
+            AudioRouteSelector.isBluetoothCaptureDevice(route.captureDevice)
 
     private fun applySelection(
         selection: AudioRouteSelection,
@@ -497,6 +403,13 @@ private class AndroidAudioRouter(
 
         val communicationDevice = selection.communicationDevice
         if (communicationDevice == null || !communicationDevice.isSink) {
+            if (hasBluetoothMicPresent(inputs, route)) {
+                logWarn(TAG, "Bluetooth mic route had no communication sink; waiting")
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                audioManager.isSpeakerphoneOn = false
+                ensureAudioFocus()
+                return route.copy(routeReady = false)
+            }
             logWarn(TAG, "Bluetooth mic route had no communication sink; falling back")
             return applyFallbackWithoutBluetoothMic(
                 outputs,
@@ -513,7 +426,7 @@ private class AndroidAudioRouter(
         ensureAudioFocus()
 
         if (supportsCommunicationDeviceApi) {
-            if (AudioRouteSelector.sameDevice(activeCommunicationDevice, communicationDevice)) {
+            if (AudioRouteSelector.communicationRouteReady(activeCommunicationDevice, communicationDevice)) {
                 stopSco()
                 return route.copy(routeReady = true)
             }
@@ -526,7 +439,24 @@ private class AndroidAudioRouter(
                     false
                 }
             if (!accepted) {
-                logWarn(TAG, "setCommunicationDevice returned false; falling back")
+                logWarn(TAG, "setCommunicationDevice returned false; clearing and retrying once")
+                clearCommunicationDeviceQuietly()
+                val retryAccepted = runCatching { audioManager.setCommunicationDevice(communicationDevice) }
+                    .getOrDefault(false)
+                if (retryAccepted) {
+                    val confirmedDevice = runCatching { audioManager.communicationDevice() }.getOrNull()
+                    return route.copy(
+                        routeReady = AudioRouteSelector.communicationRouteReady(
+                            confirmedDevice,
+                            communicationDevice,
+                        ),
+                    )
+                }
+                if (hasBluetoothMicPresent(inputs, route)) {
+                    logWarn(TAG, "setCommunicationDevice failed; BT mic still present — waiting")
+                    return route.copy(routeReady = false)
+                }
+                logWarn(TAG, "setCommunicationDevice retry failed; falling back without Bluetooth mic")
                 return applyFallbackWithoutBluetoothMic(
                     outputs,
                     inputs,
@@ -537,15 +467,25 @@ private class AndroidAudioRouter(
                 )
             }
             val confirmedDevice = runCatching { audioManager.communicationDevice() }.getOrNull()
-            return route.copy(
-                routeReady = AudioRouteSelector.sameDevice(confirmedDevice, communicationDevice),
-            )
+            val routeReady = AudioRouteSelector.communicationRouteReady(confirmedDevice, communicationDevice)
+            if (!routeReady) {
+                logWarn(
+                    TAG,
+                    "setCommunicationDevice accepted but route not confirmed " +
+                        "requestedType=${communicationDevice.type} confirmedType=${confirmedDevice?.type}",
+                )
+            }
+            return route.copy(routeReady = routeReady)
         }
 
         val scoOk = if (selection.needsLegacyBluetoothSco) startSco() else true
         return if (scoOk) {
             route.copy(routeReady = true)
         } else {
+            if (hasBluetoothMicPresent(inputs, route)) {
+                logWarn(TAG, "startBluetoothSco failed; BT mic still present — waiting")
+                return route.copy(routeReady = false)
+            }
             logWarn(TAG, "startBluetoothSco failed; falling back")
             applyFallbackWithoutBluetoothMic(
                 outputs,

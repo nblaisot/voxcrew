@@ -159,39 +159,51 @@ média, mais ne produisent pas de nouvelle icône micro.
 
 ### Application plateforme (`IntercomAudioSession` / `AndroidAudioRouter`)
 
-- `AudioDeviceCallback` est enregistré pour ré-appliquer la politique à chaque ajout ou
-  retrait de périphérique.
-- API 31+ : les routes Bluetooth micro utilisent `availableCommunicationDevices`,
-  `setCommunicationDevice` et `OnCommunicationDeviceChangedListener`. `routeReady=false`
-  tant que `communicationDevice()` ne confirme pas le périphérique demandé.
-- API 26–30 : le repli `startBluetoothSco()` est conservé uniquement pour les routes
-  Bluetooth micro.
-- Routes média : `clearCommunicationDevice()` si nécessaire, arrêt SCO, abandon focus,
-  `MODE_NORMAL`, `USAGE_MEDIA`.
-- Routes Bluetooth micro : `MODE_IN_COMMUNICATION`, focus VoIP idempotent,
-  `USAGE_VOICE_COMMUNICATION`. Sur API 31+, `setCommunicationDevice()` est l'autorité
-  unique pour la route Bluetooth bidirectionnelle ; `AudioRecord.setPreferredDevice`
-  n'est pas utilisé pour les micros Bluetooth.
-- Échec `setCommunicationDevice(false)` ou périphérique communication absent :
-  re-sélection sans micro Bluetooth, sans crash.
+Modèle **session d'appel** (self-managed VoIP Android) : une route communication stable
+pour toute la durée de l'intercom, pilotée uniquement par les callbacks plateforme — pas
+de timers, pas d'inspection PCM pour changer de route.
+
+- `enter()` au démarrage intercom : si micro Bluetooth présent → `MODE_IN_COMMUNICATION`,
+  focus VoIP, `setCommunicationDevice(sink)` depuis `availableCommunicationDevices()`.
+- `exit()` à la fin de session : `clearCommunicationDevice()`, restauration du mode.
+- `AudioDeviceCallback` + `OnCommunicationDeviceChangedListener` ré-appliquent la politique
+  à chaque ajout/retrait/changement de périphérique communication.
+- `routeReady=false` tant que `communicationDevice()` ne confirme pas le sink demandé
+  (callback plateforme, pas de polling applicatif).
+- API 26–30 : repli `startBluetoothSco()` pour les routes Bluetooth micro.
+- Routes média (speaker, USB, BT sortie seule) : `MODE_NORMAL`, `USAGE_MEDIA`.
+- Échec `setCommunicationDevice` avec micro BT encore présent : `routeReady=false` (attente callback), pas de bascule téléphone.
+- Phase 2 (Samsung) : session Telecom self-managed (`IntercomTelecomSession`) enregistrée pendant l'intercom pour signaler un appel VoIP au système.
+
+**Explicitement rejeté** : détection de silence PCM pour rerouter, timers de libération
+idle, split passif/actif PTT vs réception, blacklist de micros Bluetooth.
 
 ### Capture et lecture
 
+Ordre strict de préparation (`LanIntercomEngine.prepareAudioPathLocked`) :
+
+1. `awaitRouteReady()` — `communicationDevice()` confirme le sink BLE
+2. `awaitRoutingApplied()` — thread routage a fini `setCommunicationDevice`
+3. `AudioPlayback.warmUp()` — `AudioTrack` `USAGE_VOICE_COMMUNICATION` avant capture
+4. `AudioCapture.attach()` — `AudioRecord` avec `setPreferredDevice(bleInput)` et `audioSessionId` partagé
+
+- `LanIntercomEngine` ouvre la session audio au démarrage ; capture/playback s'attachent dès que `routeReady=true` (pas au premier PTT).
+- PTT ne fait que basculer `TransmissionPolicy.shouldTransmit` ; le micro reste ouvert
+  pendant toute la session (encode seulement quand `shouldTransmit` est vrai).
 - `AudioCapture` attend `routeReady` avant d'ouvrir `AudioRecord`.
-- `AudioCapture` utilise `AudioRecord.setPreferredDevice` seulement pour les micros USB
-  explicites ; les routes Bluetooth suivent la route communication Android.
-- `AudioCapture` lit `AudioRecord.routedDevice` après `startRecording()` et corrige
-  l'état si Android route finalement vers une autre entrée.
-- Si une route micro Bluetooth produit uniquement du PCM nul pendant ~800 ms,
-  `AudioCapture` signale la route comme cassée : la session garde la sortie Bluetooth
-  quand possible, retombe sur le micro téléphone, et supprime l'icône micro Bluetooth.
-- `AudioPlayback` construit `AudioTrack` depuis `AudioRouteState.playbackUsage`.
-- `AudioPlayback` vérifie la première route de sortie effective et force une ré-application
-  unique si une route Bluetooth communication n'est pas respectée.
-- `AudioPlayback` utilise `AudioTrack.setPreferredDevice` pour les sorties média
-  explicites (USB/Bluetooth sortie seule) quand Android l'expose.
-- Les redémarrages capture/lecture sont sérialisés dans `LanIntercomEngine` quand la
-  clé de route change.
+- Micro Bluetooth (guide Android BLE recording) : `AudioSource.MIC` +
+  `setPreferredDevice(bleInput)` en plus de `setCommunicationDevice(sink)` ; effets AEC liés
+  au `audioSessionId` de `AudioTrack` (warmUp avant capture).
+- Micro USB : `setPreferredDevice` sur l'entrée USB explicite.
+- Diagnostics légers sur les premières frames (`routedType`, `pcmRms`) — logging uniquement,
+  aucune décision de routage.
+- `AudioPlayback` : `AudioTrack` avec `playbackUsage` de la route (`VOICE_COMMUNICATION`
+  en duplex BT, `USAGE_MEDIA` sinon), créé au `warmUp()` session.
+- `AudioPlayback` utilise `AudioTrack.setPreferredDevice` pour les sorties média explicites
+  (`MODE_NORMAL` uniquement). En duplex Bluetooth (`MODE_IN_COMMUNICATION`), la sortie suit
+  `setCommunicationDevice`.
+- Changement de route (callback) : `playback.refreshRoute()` + recréation capture si la clé
+  de route change (`LanIntercomEngine.watchAudioRoute`).
 
 ### Bluetooth et écouteurs sans fil
 
@@ -228,9 +240,10 @@ Solution : chemin VoIP natif Android, sans dépendance tierce :
 
 ```text
 LanIntercomEngine.start()
-  → IntercomAudioSession.enter()     (sélection et application AudioRouteState)
-  → AudioPlayback.warmUp()           (route playback avant capture)
-  → AudioCapture                     (source audio de la route + effets disponibles)
+  → IntercomAudioSession.enter()     (route communication pour toute la session si BT mic)
+  → routeReady                       (callback OnCommunicationDeviceChangedListener)
+  → AudioPlayback.warmUp()           (AudioTrack VoIP, référence AEC)
+  → AudioCapture.attach()            (AudioRecord ouvert session entière ; PTT = transmit only)
 ```
 
 Effets attachés sur la session [AudioRecord] quand disponibles (`CaptureAudioEffects`) :

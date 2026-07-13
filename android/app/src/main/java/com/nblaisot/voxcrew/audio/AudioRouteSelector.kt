@@ -43,10 +43,9 @@ data class AudioRouteState(
     val captureInput: AudioDeviceInfo? get() = captureDevice
     val captureInputKind: CaptureInputKind get() = micKind
     val captureAudioSource: Int
-        get() = if (audioMode == AudioManager.MODE_IN_COMMUNICATION) {
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION
-        } else {
-            MediaRecorder.AudioSource.MIC
+        get() = when (micKind) {
+            CaptureInputKind.BLUETOOTH -> MediaRecorder.AudioSource.MIC
+            else -> MediaRecorder.AudioSource.MIC
         }
 
     companion object {
@@ -130,11 +129,19 @@ object AudioRouteSelector {
         COMMUNICATION_TYPE_PRIORITY.firstOrNull { it in inputTypes }
             ?: inputTypes.firstOrNull { it in USB_TYPES }
 
+    fun isBluetoothCaptureType(type: Int): Boolean = type in BLUETOOTH_MIC_TYPES
+
+    fun isBluetoothCaptureDevice(device: AudioDeviceInfo?): Boolean =
+        device?.isSource == true && isBluetoothCaptureType(device.type)
+
+    fun hasBluetoothMicInput(inputs: Collection<AudioDeviceInfo>): Boolean =
+        inputs.any { it.isSource && isBluetoothCaptureType(it.type) }
+
     fun shouldUseSpeakerphone(connectedTypes: Collection<Int>): Boolean =
         !isHeadsetPresent(connectedTypes)
 
     fun pttMicIconKind(route: AudioRouteState): CaptureInputKind? {
-        if (!route.routeReady) return null
+        if (route.permissionIssue != null) return null
         return when (route.micKind) {
             CaptureInputKind.BLUETOOTH -> CaptureInputKind.BLUETOOTH
             CaptureInputKind.USB -> CaptureInputKind.USB
@@ -154,7 +161,6 @@ object AudioRouteSelector {
         recordAudioGranted: Boolean,
         bluetoothConnectGranted: Boolean,
         ignoreBluetoothMicrophones: Boolean = false,
-        disabledBluetoothMicrophoneIdentities: Set<String> = emptySet(),
     ): AudioRouteSelection {
         if (!recordAudioGranted) {
             return AudioRouteSelection(
@@ -176,7 +182,6 @@ object AudioRouteSelector {
                 activeCommunicationDevice = activeCommunicationDevice,
                 supportsCommunicationDeviceApi = supportsCommunicationDeviceApi,
                 bluetoothConnectGranted = bluetoothConnectGranted,
-                disabledBluetoothMicrophoneIdentities = disabledBluetoothMicrophoneIdentities,
             )
             if (bluetoothSelection != null) return bluetoothSelection
         }
@@ -232,6 +237,33 @@ object AudioRouteSelector {
         return if (aIdentity != null && bIdentity != null) aIdentity == bIdentity else a.type == b.type
     }
 
+    fun isBluetoothCommunicationSink(device: AudioDeviceInfo?): Boolean =
+        device?.isSink == true && device.type in BLUETOOTH_COMMUNICATION_SINK_TYPES
+
+    /**
+     * Samsung and other OEMs may confirm [setCommunicationDevice] with SCO while the app
+     * requested BLE_HEADSET (or vice versa) on the same MAC — treat that as ready.
+     */
+    fun communicationRouteReady(confirmed: AudioDeviceInfo?, target: AudioDeviceInfo?): Boolean {
+        if (sameDevice(confirmed, target)) return true
+        if (!isBluetoothCommunicationSink(confirmed) || !isBluetoothCommunicationSink(target)) return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val confirmedAddress = confirmed!!.address
+            val targetAddress = target!!.address
+            if (confirmedAddress.isNotEmpty() && targetAddress.isNotEmpty()) {
+                return confirmedAddress.equals(targetAddress, ignoreCase = true)
+            }
+        }
+        return confirmed!!.type in COMMUNICATION_TYPE_PRIORITY &&
+            target!!.type in COMMUNICATION_TYPE_PRIORITY
+    }
+
+    private val BLUETOOTH_COMMUNICATION_SINK_TYPES = setOf(
+        AudioDeviceInfo.TYPE_BLE_HEADSET,
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        AudioDeviceInfo.TYPE_HEARING_AID,
+    )
+
     private fun resolveBluetoothMicRoute(
         outputSinks: List<AudioDeviceInfo>,
         inputSources: List<AudioDeviceInfo>,
@@ -239,23 +271,13 @@ object AudioRouteSelector {
         activeCommunicationDevice: AudioDeviceInfo?,
         supportsCommunicationDeviceApi: Boolean,
         bluetoothConnectGranted: Boolean,
-        disabledBluetoothMicrophoneIdentities: Set<String>,
     ): AudioRouteSelection? {
         val bluetoothInput = pickBluetoothInput(inputSources)
-            ?.takeUnless { isBluetoothMicrophoneDisabled(it, disabledBluetoothMicrophoneIdentities) }
-        val communicationDevice = if (supportsCommunicationDeviceApi) {
-            pickBluetoothCommunicationDevice(availableCommunicationDevices)
-                ?.takeUnless { isBluetoothMicrophoneDisabled(it, disabledBluetoothMicrophoneIdentities) }
-        } else {
-            null
-        }
-
-        if (bluetoothInput == null && communicationDevice == null) return null
-
-        val bluetoothOutput = communicationDevice ?: matchingOutput(outputSinks, bluetoothInput, BLUETOOTH_OUTPUT_TYPES)
-            ?: pickOutput(outputSinks, BLUETOOTH_MIC_TYPES)
+        if (bluetoothInput == null) return null
 
         if (supportsCommunicationDeviceApi && !bluetoothConnectGranted) {
+            val bluetoothOutput = matchingOutput(outputSinks, bluetoothInput, BLUETOOTH_OUTPUT_TYPES)
+                ?: pickOutput(outputSinks, BLUETOOTH_MIC_TYPES)
             return AudioRouteSelection(
                 AudioRouteState(
                     micKind = CaptureInputKind.BLUETOOTH,
@@ -272,18 +294,35 @@ object AudioRouteSelector {
             )
         }
 
+        val communicationDevice = if (supportsCommunicationDeviceApi) {
+            pickBluetoothCommunicationDevice(availableCommunicationDevices)
+                ?: matchingOutput(outputSinks, bluetoothInput, BLUETOOTH_OUTPUT_TYPES)
+                ?: pickOutput(outputSinks, BLUETOOTH_OUTPUT_TYPES)
+        } else {
+            null
+        }
+
+        if (supportsCommunicationDeviceApi && communicationDevice == null) return null
+
+        val bluetoothOutput = communicationDevice ?: matchingOutput(outputSinks, bluetoothInput, BLUETOOTH_OUTPUT_TYPES)
+            ?: pickOutput(outputSinks, BLUETOOTH_MIC_TYPES)
+
         val target = communicationDevice ?: bluetoothOutput ?: bluetoothInput
-        val activeMatchesTarget = !supportsCommunicationDeviceApi || sameDevice(activeCommunicationDevice, target)
+        val activeMatchesTarget = !supportsCommunicationDeviceApi ||
+            communicationRouteReady(activeCommunicationDevice, target)
+        val routeReady = activeMatchesTarget &&
+            isBluetoothCaptureDevice(bluetoothInput) &&
+            (target?.isSink == true)
         return AudioRouteSelection(
             route = AudioRouteState(
                 micKind = CaptureInputKind.BLUETOOTH,
-                captureDevice = bluetoothInput?.takeIf { it.isSource },
+                captureDevice = bluetoothInput,
                 outputDevice = target?.takeIf { it.isSink } ?: bluetoothOutput,
                 outputKind = OutputKind.BLUETOOTH,
                 captureSource = CaptureSource.HEADSET_MIC,
                 playbackUsage = AudioAttributes.USAGE_VOICE_COMMUNICATION,
                 audioMode = AudioManager.MODE_IN_COMMUNICATION,
-                routeReady = activeMatchesTarget,
+                routeReady = routeReady,
             ),
             communicationDevice = target?.takeIf { it.isSink },
             needsLegacyBluetoothSco = !supportsCommunicationDeviceApi,
@@ -344,13 +383,4 @@ object AudioRouteSelector {
             in USB_TYPES -> OutputKind.USB
             else -> OutputKind.WIRED
         }
-
-    private fun isBluetoothMicrophoneDisabled(
-        device: AudioDeviceInfo,
-        disabledBluetoothMicrophoneIdentities: Set<String>,
-    ): Boolean {
-        if (disabledBluetoothMicrophoneIdentities.isEmpty()) return false
-        val identity = deviceIdentity(device)
-        return identity in disabledBluetoothMicrophoneIdentities || "${device.type}:" in disabledBluetoothMicrophoneIdentities
-    }
 }

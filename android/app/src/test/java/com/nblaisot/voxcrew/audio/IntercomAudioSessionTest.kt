@@ -54,7 +54,7 @@ class IntercomAudioSessionTest {
     }
 
     @Test
-    fun enterBluetoothDevicesUsesPassiveMediaRoute() {
+    fun enterBluetoothMicUsesCommunicationDeviceAndFocus() {
         val audioManager = FakeIntercomAudioManager(
             outputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
             inputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
@@ -64,30 +64,6 @@ class IntercomAudioSessionTest {
         val session = testSession(audioManager, audioFocus)
 
         session.enter()
-        session.awaitRouting()
-
-        assertEquals(AudioManager.MODE_NORMAL, audioManager.mode)
-        assertNull(audioManager.lastCommunicationDeviceType)
-        assertEquals(CaptureInputKind.BUILTIN, session.captureInputKind.value)
-        assertEquals(OutputKind.BLUETOOTH, session.outputKind.value)
-        assertEquals(AudioAttributes.USAGE_MEDIA, session.audioRoute.value.playbackUsage)
-        assertTrue(session.routeReady.value)
-        assertNull(session.preferredCaptureDevice())
-        assertEquals(0, audioFocus.requestCount)
-    }
-
-    @Test
-    fun activateBluetoothMicUsesCommunicationDeviceAndFocus() {
-        val audioManager = FakeIntercomAudioManager(
-            outputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
-            inputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
-            availableDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
-        )
-        val audioFocus = FakeAudioFocus()
-        val session = testSession(audioManager, audioFocus)
-
-        session.enter()
-        session.activateAudio()
         session.awaitRouting()
 
         assertEquals(AudioManager.MODE_IN_COMMUNICATION, audioManager.mode)
@@ -96,12 +72,11 @@ class IntercomAudioSessionTest {
         assertEquals(OutputKind.BLUETOOTH, session.outputKind.value)
         assertEquals(AudioAttributes.USAGE_VOICE_COMMUNICATION, session.audioRoute.value.playbackUsage)
         assertTrue(session.routeReady.value)
-        assertNull(session.preferredCaptureDevice())
         assertEquals(1, audioFocus.requestCount)
     }
 
     @Test
-    fun preferredCaptureDevice_omitsBluetoothCaptureDevice() {
+    fun preferredCaptureDevice_returnsBluetoothInputWhenPresent() {
         val audioManager = FakeIntercomAudioManager(
             outputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
             inputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
@@ -111,55 +86,10 @@ class IntercomAudioSessionTest {
         val session = testSession(audioManager)
 
         session.enter()
-        session.activateAudio()
         session.awaitRouting()
 
         assertEquals(CaptureInputKind.BLUETOOTH, session.captureInputKind.value)
-        assertNull(session.preferredCaptureDevice())
-    }
-
-    @Test
-    fun bluetoothCaptureSilenceFallsBackToBuiltInMicAndBluetoothOutput() {
-        val audioManager = FakeIntercomAudioManager(
-            outputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
-            inputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
-            availableDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
-        )
-        val session = testSession(audioManager)
-
-        session.enter()
-        session.activateAudio()
-        session.awaitRouting()
-        session.onBluetoothCaptureSilence(audioManager.device(AudioDeviceInfo.TYPE_BLE_HEADSET))
-        session.awaitRouting()
-
-        assertEquals(AudioManager.MODE_NORMAL, audioManager.mode)
-        assertEquals(CaptureInputKind.BUILTIN, session.captureInputKind.value)
-        assertEquals(OutputKind.BLUETOOTH, session.outputKind.value)
-        assertNull(session.preferredCaptureDevice())
-        assertNull(AudioRouteSelector.pttMicIconKind(session.audioRoute.value))
-    }
-
-    @Test
-    fun deviceCallbackClearsSilentBluetoothMicFallback() {
-        val audioManager = FakeIntercomAudioManager(
-            outputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
-            inputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
-            availableDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
-        )
-        val session = testSession(audioManager)
-
-        session.enter()
-        session.activateAudio()
-        session.awaitRouting()
-        session.onBluetoothCaptureSilence(audioManager.device(AudioDeviceInfo.TYPE_BLE_HEADSET))
-        session.awaitRouting()
-        assertEquals(CaptureInputKind.BUILTIN, session.captureInputKind.value)
-
-        audioManager.registeredCallbacks.first().onAudioDevicesAdded(emptyArray())
-        session.awaitRouting()
-
-        assertEquals(CaptureInputKind.BLUETOOTH, session.captureInputKind.value)
+        assertEquals(AudioDeviceInfo.TYPE_BLE_HEADSET, session.preferredCaptureDevice()?.type)
     }
 
     @Test
@@ -191,11 +121,11 @@ class IntercomAudioSessionTest {
         val session = testSession(audioManager)
 
         session.enter()
-        session.activateAudio()
         session.awaitRoutingApplied()
 
         assertFalse(session.routeReady.value)
-        assertNull(session.preferredCaptureDevice())
+        assertEquals(AudioDeviceInfo.TYPE_BLE_HEADSET, session.preferredCaptureDevice()?.type)
+        assertTrue(session.awaitRouteReady())
     }
 
     @Test
@@ -213,14 +143,8 @@ class IntercomAudioSessionTest {
 
         session.awaitRouting()
 
-        assertEquals(CaptureInputKind.BUILTIN, session.captureInputKind.value)
-        assertEquals(OutputKind.BLUETOOTH, session.outputKind.value)
-        assertNull(audioManager.lastCommunicationDeviceType)
-
-        session.activateAudio()
-        session.awaitRouting()
-
         assertEquals(CaptureInputKind.BLUETOOTH, session.captureInputKind.value)
+        assertEquals(OutputKind.BLUETOOTH, session.outputKind.value)
         assertEquals(AudioDeviceInfo.TYPE_BLE_HEADSET, audioManager.lastCommunicationDeviceType)
     }
 
@@ -233,7 +157,6 @@ class IntercomAudioSessionTest {
         )
         val session = testSession(audioManager)
         session.enter()
-        session.activateAudio()
         session.awaitRouting()
         assertEquals(CaptureInputKind.BLUETOOTH, session.captureInputKind.value)
 
@@ -251,7 +174,7 @@ class IntercomAudioSessionTest {
     }
 
     @Test
-    fun setCommunicationDeviceFalseFallsBackWithoutCrashing() {
+    fun setCommunicationDeviceFalseWaitsWhileBluetoothMicPresent() {
         val audioManager = FakeIntercomAudioManager(
             outputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
             inputDeviceTypes = listOf(AudioDeviceInfo.TYPE_BLE_HEADSET),
@@ -261,12 +184,12 @@ class IntercomAudioSessionTest {
         val session = testSession(audioManager)
 
         session.enter()
-        session.activateAudio()
-        session.awaitRouting()
+        session.awaitRoutingApplied()
 
-        assertEquals(AudioManager.MODE_NORMAL, audioManager.mode)
-        assertEquals(CaptureInputKind.BUILTIN, session.captureInputKind.value)
-        assertTrue(session.routeReady.value)
+        assertEquals(CaptureInputKind.BLUETOOTH, session.captureInputKind.value)
+        assertFalse(session.routeReady.value)
+        assertTrue(audioManager.communicationDeviceSetCount >= 1)
+        assertEquals(AudioManager.MODE_IN_COMMUNICATION, audioManager.mode)
     }
 
     @Test
@@ -297,7 +220,6 @@ class IntercomAudioSessionTest {
         )
 
         session.enter()
-        session.activateAudio()
         session.awaitRoutingApplied()
 
         assertEquals(AudioPermissionIssue.BLUETOOTH_CONNECT, session.permissionIssue.value)
@@ -316,7 +238,6 @@ class IntercomAudioSessionTest {
         val session = testSession(audioManager)
 
         session.enter()
-        session.activateAudio()
         session.awaitRoutingApplied()
 
         assertEquals(AudioPermissionIssue.BLUETOOTH_CONNECT, session.permissionIssue.value)
@@ -337,7 +258,6 @@ class IntercomAudioSessionTest {
         val session = testSession(audioManager, audioFocus)
 
         session.enter()
-        session.activateAudio()
         session.awaitRouting()
         session.exit()
 
@@ -405,8 +325,11 @@ private class FakeIntercomAudioManager(
             every { this@mockk.type } returns type
             every { productName } returns "fake-$type"
             every { this@mockk.address } returns deviceAddress
-            every { isSource } returns inputTypes.contains(type)
-            every { isSink } returns (outputTypes.contains(type) || availableTypes.contains(type))
+            val inInputs = type in inputTypes
+            val inOutputs = type in outputTypes
+            val inAvailable = type in availableTypes
+            every { isSource } returns (inInputs || inAvailable)
+            every { isSink } returns (inOutputs || inAvailable)
         }
 
     override fun registerAudioDeviceCallback(callback: AudioDeviceCallback, handler: Handler?) {

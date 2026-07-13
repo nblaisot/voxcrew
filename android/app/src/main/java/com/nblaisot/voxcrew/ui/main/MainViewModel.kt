@@ -141,6 +141,7 @@ class MainViewModel(
         }
         if (micGranted) {
             startForegroundIfAllowed()
+            SessionForegroundService.refreshForegroundTypes(appContext)
             lanEngine.onMicrophonePermissionGranted()
         }
         lanEngine.refreshAudioRouting()
@@ -153,7 +154,6 @@ class MainViewModel(
         copy(
             pttEnabled = !voxEnabled &&
                 micPermissionGranted &&
-                audioRouteReady &&
                 permissionPrompt == null,
         )
 
@@ -192,6 +192,7 @@ class MainViewModel(
         }
         if (micGranted) {
             startForegroundIfAllowed()
+            SessionForegroundService.refreshForegroundTypes(appContext)
             lanEngine.onMicrophonePermissionGranted()
         }
         if (btGranted) {
@@ -266,6 +267,7 @@ class MainViewModel(
 
     fun signOut() {
         signalingClient.disconnect()
+        lanEngine.releaseAudioSession()
         SessionForegroundService.stop(appContext)
         viewModelScope.launch { authRepository.signOut() }
     }
