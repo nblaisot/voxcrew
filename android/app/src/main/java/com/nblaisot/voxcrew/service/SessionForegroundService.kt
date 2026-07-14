@@ -28,7 +28,7 @@ import kotlinx.coroutines.launch
 
 /**
  * Permanent foreground service for the whole signed-in session, started as soon as
- * the user is signed in and only stopped at sign-out. The notification is
+ * the user is signed in and stopped at sign-out or explicit application exit. The notification is
  * kept continuously in sync with [com.nblaisot.voxcrew.lanlink.LanIntercomEngine]
  * (link/discovery status + VOX on/off), so the intercom remains visible and
  * trustworthy whether the app is backgrounded or the screen is off.
@@ -90,6 +90,7 @@ class SessionForegroundService : Service() {
     override fun onDestroy() {
         observeJob?.cancel()
         releaseWifiLock()
+        stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
 
@@ -185,9 +186,9 @@ class SessionForegroundService : Service() {
         }
 
         fun stop(context: Context) {
-            context.startService(
-                Intent(context, SessionForegroundService::class.java).setAction(ACTION_STOP),
-            )
+            context.stopService(Intent(context, SessionForegroundService::class.java))
+            val notifications = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notifications.cancel(NOTIFICATION_ID)
         }
     }
 }

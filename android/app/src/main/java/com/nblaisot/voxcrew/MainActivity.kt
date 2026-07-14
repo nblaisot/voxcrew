@@ -19,9 +19,16 @@ class MainActivity : ComponentActivity() {
         val container = (application as VoxCrewApp).container
         setContent {
             VoxCrewTheme {
-                VoxCrewNavHost(container = container)
+                VoxCrewNavHost(
+                    container = container,
+                    onQuitApplication = ::quitApplication,
+                )
             }
         }
+    }
+
+    private fun quitApplication() {
+        finishAndRemoveTask()
     }
 
     override fun onStart() {

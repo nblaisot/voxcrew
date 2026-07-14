@@ -17,7 +17,10 @@ import com.nblaisot.voxcrew.ui.main.MainViewModel
 import com.nblaisot.voxcrew.ui.navigation.Routes
 
 @Composable
-fun VoxCrewNavHost(container: AppContainer) {
+fun VoxCrewNavHost(
+    container: AppContainer,
+    onQuitApplication: () -> Unit,
+) {
     val navController = rememberNavController()
     val authUser by container.authRepository.currentUser.collectAsState()
     val start = if (authUser != null) Routes.MAIN else Routes.LOGIN
@@ -44,6 +47,7 @@ fun VoxCrewNavHost(container: AppContainer) {
                 viewModel = vm,
                 onNavigateToAbout = { navController.navigate(Routes.ABOUT) },
                 onSignOut = { navController.navigate(Routes.LOGIN) { popUpTo(0) } },
+                onQuitApplication = onQuitApplication,
             )
         }
         composable(Routes.ABOUT) {

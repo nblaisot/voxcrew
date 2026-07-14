@@ -84,6 +84,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.nblaisot.voxcrew.R
 import com.nblaisot.voxcrew.audio.AudioPermissionIssue
 import com.nblaisot.voxcrew.audio.CaptureInputKind
+import com.nblaisot.voxcrew.audio.ManualRouteStatus
 import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.roster.CrewMember
@@ -102,6 +103,7 @@ fun MainScreen(
     viewModel: MainViewModel,
     onNavigateToAbout: () -> Unit,
     onSignOut: () -> Unit,
+    onQuitApplication: () -> Unit,
 ) {
     val state by viewModel.uiState.collectAsState()
     val haptic = LocalHapticFeedback.current
@@ -191,6 +193,14 @@ fun MainScreen(
                                 onSignOut()
                             },
                         )
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.menu_quit)) },
+                            onClick = {
+                                menuExpanded = false
+                                viewModel.quitApplication()
+                                onQuitApplication()
+                            },
+                        )
                     }
                 },
                 title = {
@@ -210,9 +220,14 @@ fun MainScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = { audioMenuExpanded = true }) {
+                    val routeMenuEnabled = state.audioRouteStatus != ManualRouteStatus.STARTING &&
+                        state.audioRouteStatus != ManualRouteStatus.REQUESTING
+                    IconButton(
+                        enabled = routeMenuEnabled,
+                        onClick = { audioMenuExpanded = true },
+                    ) {
                         Icon(
-                            imageVector = audioRouteIcon(state.selectedAudioRoute.inputKind),
+                            imageVector = audioRouteIcon(state.pttMicIconKind),
                             contentDescription = "Audio : ${state.selectedAudioRoute.name}",
                         )
                     }
@@ -222,6 +237,7 @@ fun MainScreen(
                     ) {
                         state.audioRouteChoices.forEach { choice ->
                             DropdownMenuItem(
+                                enabled = routeMenuEnabled,
                                 text = { Text(choice.name) },
                                 leadingIcon = {
                                     Icon(
@@ -380,6 +396,10 @@ fun MainScreen(
                         when {
                             state.audioRoutePending ->
                                 "Connexion audio — ${state.selectedAudioRoute.name}…"
+                            state.audioRouteStatus == ManualRouteStatus.DIVERGED ||
+                                state.audioRouteStatus == ManualRouteStatus.UNAVAILABLE ||
+                                state.audioRouteStatus == ManualRouteStatus.FAILED ->
+                                "Choisir une sortie audio"
                             state.voxEnabled && state.isTransmitting -> "Vox — transmission…"
                             state.voxEnabled -> "Vox actif — en écoute"
                             state.isTransmitting -> "Transmission…"

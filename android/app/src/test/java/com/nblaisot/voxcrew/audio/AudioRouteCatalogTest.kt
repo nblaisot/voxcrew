@@ -19,6 +19,7 @@ class AudioRouteCatalogTest {
         assertEquals(DEVICE_AUDIO_ROUTE_KEY, choices.first().key)
         assertEquals("Cet appareil", choices.first().name)
         assertEquals(CaptureInputKind.BUILTIN, choices.first().inputKind)
+        assertEquals(AudioRouteTarget.DEVICE, choices.first().target)
         assertEquals(speaker.identifier, choices.first().endpointIdentifier)
     }
 
@@ -28,6 +29,7 @@ class AudioRouteCatalogTest {
         val bluetooth = choices.filter { it.inputKind == CaptureInputKind.BLUETOOTH }
 
         assertEquals(listOf("Galaxy Buds", "Galaxy Watch5"), bluetooth.map { it.name })
+        assertTrue(bluetooth.all { it.target == AudioRouteTarget.BLUETOOTH })
         assertNotEquals(bluetooth[0].key, bluetooth[1].key)
         assertEquals(setOf("buds", "watch"), bluetooth.map { it.endpointIdentifier }.toSet())
     }
@@ -41,6 +43,7 @@ class AudioRouteCatalogTest {
         val choice = choices.single { it.endpointIdentifier == usb.identifier }
 
         assertEquals(CaptureInputKind.USB, choice.inputKind)
+        assertEquals(AudioRouteTarget.WIRED_USB, choice.target)
         assertEquals(CallEndpointCompat.TYPE_WIRED_HEADSET, choice.endpointType)
     }
 
@@ -59,17 +62,19 @@ class AudioRouteCatalogTest {
 
         assertEquals(
             DEVICE_AUDIO_ROUTE_KEY,
-            selectedAudioRouteChoice(choices, DEVICE_AUDIO_ROUTE_KEY).key,
+            selectedAudioRouteChoice(choices, deviceAudioRouteChoice()).key,
         )
     }
 
     @Test
-    fun removingTheSelectedAccessoryResetsSelectionToDevice() {
+    fun removingTheSelectedAccessoryKeepsTheManualChoiceUnavailable() {
+        val selectedBuds = buildAudioRouteChoices(listOf(speaker, buds))
+            .single { it.endpointIdentifier == buds.identifier }
         val choicesAfterRemoval = buildAudioRouteChoices(listOf(speaker, watch))
 
         assertEquals(
-            DEVICE_AUDIO_ROUTE_KEY,
-            selectedAudioRouteChoice(choicesAfterRemoval, "endpoint:${buds.identifier}").key,
+            "endpoint:${buds.identifier}",
+            selectedAudioRouteChoice(choicesAfterRemoval, selectedBuds).key,
         )
     }
 

@@ -8,6 +8,7 @@
     <string name="notification_vox_off">VOX désactivé — PTT</string>
     <string name="action_leave_session">Quitter</string>
     <string name="menu_about">À propos</string>
+    <string name="menu_quit">QUITTER</string>
     <string name="about_title">À propos</string>
     <string name="about_intro">Cette application utilise des logiciels open source.</string>
     <string name="about_back">Retour</string>

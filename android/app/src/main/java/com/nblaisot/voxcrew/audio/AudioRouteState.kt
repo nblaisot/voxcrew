@@ -12,11 +12,27 @@ enum class CaptureInputKind {
 
 const val DEVICE_AUDIO_ROUTE_KEY = "device"
 
+enum class AudioRouteTarget {
+    DEVICE,
+    BLUETOOTH,
+    WIRED_USB,
+}
+
+enum class ManualRouteStatus {
+    STARTING,
+    REQUESTING,
+    CONFIRMED,
+    DIVERGED,
+    UNAVAILABLE,
+    FAILED,
+}
+
 /** A user-selectable route backed by an exact Telecom endpoint when it is an accessory. */
 data class AudioRouteChoice(
     val key: String,
     val name: String,
     val inputKind: CaptureInputKind,
+    val target: AudioRouteTarget,
     val endpointIdentifier: String?,
     val endpointType: Int,
 )
@@ -24,6 +40,9 @@ data class AudioRouteChoice(
 data class AudioRouteSelectionState(
     val availableChoices: List<AudioRouteChoice> = listOf(deviceAudioRouteChoice()),
     val selectedChoice: AudioRouteChoice = deviceAudioRouteChoice(),
+    val status: ManualRouteStatus = ManualRouteStatus.STARTING,
+    val confirmedChoiceKey: String? = null,
+    val errorCode: Int? = null,
 )
 
 fun deviceAudioRouteChoice(endpointIdentifier: String? = null): AudioRouteChoice =
@@ -31,6 +50,7 @@ fun deviceAudioRouteChoice(endpointIdentifier: String? = null): AudioRouteChoice
         key = DEVICE_AUDIO_ROUTE_KEY,
         name = "Cet appareil",
         inputKind = CaptureInputKind.BUILTIN,
+        target = AudioRouteTarget.DEVICE,
         endpointIdentifier = endpointIdentifier,
         endpointType = CallEndpointCompat.TYPE_SPEAKER,
     )
@@ -50,10 +70,6 @@ enum class AudioPermissionIssue {
 enum class AudioSessionIssue {
     TELECOM_UNAVAILABLE,
     AUDIO_PIPELINE_FAILED,
-}
-
-enum class RouteRequestWarning {
-    ENDPOINT_CHANGE_FAILED,
 }
 
 enum class TelecomCallPhase {
@@ -85,7 +101,6 @@ data class TelecomCallState(
     val selectedEndpoint: TelecomEndpoint? = null,
     val availableEndpoints: List<TelecomEndpoint> = emptyList(),
     val sessionIssue: AudioSessionIssue? = null,
-    val routeRequestWarning: RouteRequestWarning? = null,
 ) {
     val selectionConfirmed: Boolean
         get() = currentEndpoint != null &&

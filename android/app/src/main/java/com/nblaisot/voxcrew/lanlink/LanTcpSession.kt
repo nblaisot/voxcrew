@@ -28,20 +28,27 @@ internal class LanTcpSession(
     private val transport: FrameTransport,
     private val onClosed: (String) -> Unit,
 ) {
-    private val writeLock = Any()
     private var readerJob: Job? = null
+    private val writer = SerializedFrameWriter(
+        scope = scope,
+        write = { frame -> LanProtocol.writeFrame(out, frame) },
+        onFailure = { error ->
+            Log.d(TAG, "session with $peerUid write error: ${error.message}")
+            close()
+        },
+    )
     @Volatile var closed = false
         private set
 
     fun start() {
+        writer.start()
         readerJob = scope.launch(Dispatchers.IO) { readLoop() }
     }
 
     fun sendFrame(frame: LanFrame) {
         if (closed) return
-        try {
-            synchronized(writeLock) { LanProtocol.writeFrame(out, frame) }
-        } catch (e: IOException) {
+        if (!writer.tryWrite(frame)) {
+            Log.d(TAG, "session with $peerUid outbound queue unavailable")
             close()
         }
     }
@@ -61,9 +68,11 @@ internal class LanTcpSession(
         }
     }
 
+    @Synchronized
     fun close() {
         if (closed) return
         closed = true
+        writer.stop()
         readerJob?.cancel()
         runCatching { socket.close() }
         onClosed(peerUid)

@@ -13,7 +13,10 @@ interface FrameTransport {
     /** Human-readable path name surfaced in the UI, e.g. "Local", "Internet direct", "Relais". */
     val label: String
 
-    /** Best-effort send; safe to call even when not currently connected (silently dropped). */
+    /**
+     * Best-effort, non-blocking send. Implementations must never perform socket IO on the
+     * caller's thread and remain safe when not currently connected (silently dropped).
+     */
     fun sendFrame(frame: LanFrame)
 
     /**

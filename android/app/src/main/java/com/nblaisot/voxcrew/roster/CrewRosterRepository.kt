@@ -5,6 +5,7 @@ import com.nblaisot.voxcrew.lanlink.LanPeer
 import com.nblaisot.voxcrew.signaling.PresenceMember
 import com.nblaisot.voxcrew.signaling.SignalingClient
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -37,16 +38,26 @@ class CrewRosterRepository(
     private var activeRecipientUids: Set<String> = emptySet()
     private var localUid: String? = null
     private var localEmail: String? = null
+    private var observeJob: Job? = null
     private val availabilityStabilizer = AvailabilityStabilizer()
 
     fun start(localUid: String, localEmail: String?) {
+        observeJob?.cancel()
         this.localUid = localUid
         this.localEmail = localEmail
-        scope.launch {
+        observeJob = scope.launch {
             combine(signalingClient.presenceMembers, lanPeers) { cloudPresence, peers ->
                 merge(localUid, localEmail, cloudPresence, peers, activeRecipientUids)
             }.collect { _members.value = it }
         }
+    }
+
+    fun stop() {
+        observeJob?.cancel()
+        observeJob = null
+        localUid = null
+        localEmail = null
+        _members.value = emptyList()
     }
 
     fun setActiveRecipients(uids: Set<String>) {
