@@ -46,6 +46,7 @@ class UdpP2pTransport(
     private var punchJob: Job? = null
     private var receiveJob: Job? = null
     private var retransmitJob: Job? = null
+    private var frameWriter: SerializedFrameWriter? = null
 
     val activePeerUid: String get() = peerUid
 
@@ -77,6 +78,7 @@ class UdpP2pTransport(
         connected = false
         handshakeSent = false
         running = true
+        startFrameWriter()
         peerLink.markConnecting(peerUid)
         punchJob?.cancel()
         punchJob = scope.launch(Dispatchers.IO) { punchLoop() }
@@ -109,8 +111,11 @@ class UdpP2pTransport(
     }
 
     override fun sendFrame(frame: LanFrame) {
-        val address = confirmedAddress ?: return
-        sendTo(frame, address)
+        if (confirmedAddress == null) return
+        if (frameWriter?.tryWrite(frame) == true) return
+        Log.d(TAG, "outbound frame queue unavailable; restarting direct path")
+        startFrameWriter()
+        dropAndRetry()
     }
 
     override fun dropAndRetry() {
@@ -127,9 +132,11 @@ class UdpP2pTransport(
         punchJob?.cancel()
         receiveJob?.cancel()
         retransmitJob?.cancel()
+        frameWriter?.stop()
         punchJob = null
         receiveJob = null
         retransmitJob = null
+        frameWriter = null
         if (sharedUdp == null) {
             runCatching { ownedSocket?.close() }
             ownedSocket = null
@@ -142,6 +149,17 @@ class UdpP2pTransport(
     }
 
     private fun activeSocket(): DatagramSocket? = sharedUdp?.open() ?: ownedSocket
+
+    @Synchronized
+    private fun startFrameWriter() {
+        if (!running) return
+        frameWriter?.stop()
+        frameWriter = SerializedFrameWriter(
+            scope = scope,
+            write = { frame -> confirmedAddress?.let { address -> sendTo(frame, address) } },
+            onFailure = { error -> Log.d(TAG, "outbound writer failed: ${error.message}") },
+        ).also { it.start() }
+    }
 
     private fun sendTo(frame: LanFrame, address: InetSocketAddress) {
         val bytes = LanProtocol.encodeFrame(frame)

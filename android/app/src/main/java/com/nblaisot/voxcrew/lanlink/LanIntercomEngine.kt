@@ -139,6 +139,7 @@ class LanIntercomEngine(
     private var receivingSweepJob: Job? = null
     private var metricsJob: Job? = null
     private var routeWatchJob: Job? = null
+    private val lifecycleJobs = mutableListOf<Job>()
     private val audioInitMutex = Mutex()
     private val mediaDemandMutex = Mutex()
     private val mediaDemandState = MediaDemandState()
@@ -197,18 +198,18 @@ class LanIntercomEngine(
         mediaDemandState.setSessionActive(true)
         watchPolicy(activePolicy)
 
-        scope.launch {
+        lifecycleJobs += scope.launch {
             beacon.peers.collect { list -> updateLanTargets(list) }
         }
-        scope.launch {
+        lifecycleJobs += scope.launch {
             cloudTransport.incomingMessages.collect { handleCloudMessage(it) }
         }
         signalingClient?.let { client ->
-            scope.launch {
+            lifecycleJobs += scope.launch {
                 client.peerOffline.collect { uid -> connections[uid]?.onPeerPresenceLost() }
             }
         }
-        scope.launch {
+        lifecycleJobs += scope.launch {
             networkMonitor.networkChanged.collect { onNetworkChanged() }
         }
 
@@ -334,7 +335,10 @@ class LanIntercomEngine(
     }
 
     fun selectAudioRoute(key: String) {
-        telecomSession.selectAudioRoute(key)
+        scope.launch(Dispatchers.IO) {
+            telecomSession.selectAudioRoute(key)
+            reconcileMediaDemand()
+        }
     }
 
     fun refreshAudioRouting() {
@@ -460,7 +464,6 @@ class LanIntercomEngine(
 
     fun retryAudioPipeline() {
         scope.launch(Dispatchers.IO) {
-            telecomSession.retrySelectedRoute()
             mediaDemandState.setPipelineUsable(true)
             val pendingPeers = incomingMediaMutex.withLock {
                 pendingIncomingMedia.filterValues { it.isNotEmpty() }.keys.toList()
@@ -505,10 +508,12 @@ class LanIntercomEngine(
         mediaDemandMutex.withLock {
             while (true) {
                 val demanded = mediaDemanded()
+                if (demanded && telecomSession.isRouteSelectionBlocked) return
                 when (telecomDemandAction(demanded, telecomSession.isActive, telecomSession.hasCall)) {
                     TelecomDemandAction.NONE -> return
                     TelecomDemandAction.ACTIVATE -> {
                         if (!telecomSession.activate()) {
+                            if (telecomSession.isRouteSelectionBlocked) return
                             telecomSession.stop()
                             audioInitMutex.withLock {
                                 failAudioPathLocked("Telecom could not activate media")
@@ -964,6 +969,47 @@ class LanIntercomEngine(
         telecomSession.stop()
         audioPrepared = false
         _audioPipelineState.value = AudioPipelineState.Closed
+    }
+
+    /** Terminal app shutdown: release every media, transport and discovery resource. */
+    fun shutdown() {
+        if (!started) {
+            releaseAudioSession()
+            return
+        }
+        releaseAudioSession()
+        started = false
+        _appForeground.value = false
+
+        policyWatchJob?.cancel()
+        policyWatchJob = null
+        receivingSweepJob?.cancel()
+        receivingSweepJob = null
+        metricsJob?.cancel()
+        metricsJob = null
+        udpReceiveJob?.cancel()
+        udpReceiveJob = null
+        lifecycleJobs.forEach { it.cancel() }
+        lifecycleJobs.clear()
+
+        audioCollectJobs.values.forEach { it.cancel() }
+        audioCollectJobs.clear()
+        feedbackWatchJobs.values.forEach { it.cancel() }
+        feedbackWatchJobs.clear()
+        connections.values.forEach { it.stop() }
+        connections.clear()
+
+        beacon.stop()
+        lanServer.onUnknownInboundPeer = null
+        lanServer.stop()
+        networkMonitor.stop()
+        sharedUdp.close()
+
+        receivingUntilMs.clear()
+        _receivingFromUids.value = emptySet()
+        _peerMetrics.value = emptyMap()
+        _isTransmitting.value = false
+        knownCrewUids = emptySet()
     }
 
     companion object {

@@ -1,8 +1,9 @@
 [versions]
-agp = "8.7.3"
+agp = "8.9.1"
 kotlin = "2.2.0"
-coreKtx = "1.15.0"
-coreTelecom = "1.0.0"
+coreKtx = "1.17.0"
+# 1.1.0-alpha06 fixes Android 14-16 endpoint initialization and explicit speaker switching.
+coreTelecom = "1.1.0-alpha06"
 lifecycle = "2.8.7"
 activityCompose = "1.9.3"
 composeBom = "2024.12.01"

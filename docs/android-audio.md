@@ -80,8 +80,9 @@ AudioRecord (continu) → frame PCM 20 ms ────────────�
 
 Implémenté dans `audio/` :
 
-- `IntercomTelecomSession` — appel self-managed, politique d'endpoint et état `TelecomCallState`.
-- `TelecomRouteCoordinator` — machine d'état pure où `currentCallEndpoint` est toujours autoritaire.
+- `IntercomTelecomSession` — appel self-managed, catalogue d'endpoints et état `TelecomCallState`.
+- `TelecomRouteCoordinator` — machine d'état pure où seuls les choix explicites de l'utilisateur
+  peuvent demander un changement de route.
 - `PcmSpeechLeveler` — nivellement borné et déterministe des seules frames transmises.
 - `VoxEchoGuard` — garde anti faux-déclenchement VOX pendant la réception.
 - `VoiceDetector` — interface pour le modèle acoustique (découplée du reste du pipeline).
@@ -139,15 +140,20 @@ et [prétraitement audio Android](https://source.android.com/docs/core/audio/imp
 - `RECORD_AUDIO` est obligatoire : son absence place la session/pipeline en erreur et
   désactive PTT.
 - `BLUETOOTH_CONNECT` (API 31+) est recommandé, mais non bloquant. Son refus peut masquer
-  un nom ou empêcher une préférence automatique ; il ne ferme jamais une route courante
-  déjà publiée, ni le haut-parleur, l'écouteur ou l'USB.
+  le nom d'un accessoire ; il ne ferme jamais une route courante déjà publiée, ni le
+  haut-parleur ou l'USB.
 - `MODIFY_AUDIO_SETTINGS` n'est plus demandé par l'application.
 
 ## États audio explicites
 
-`TelecomCallState` contient la phase (`STARTING`, `ACTIVE`, `INACTIVE`, `FAILED`,
-`STOPPED`), l'endpoint courant confirmé, l'endpoint sélectionné, les endpoints disponibles,
-l'erreur fatale de session et un avertissement de demande de route.
+`AudioRouteSelectionState` sépare sans ambiguïté le catalogue, la cible choisie et la route
+confirmée. La cible est un `AudioRouteTarget` (`DEVICE`, `BLUETOOTH` ou `WIRED_USB`) et
+chaque accessoire conserve son identifiant Telecom exact. `ManualRouteStatus` décrit
+`STARTING`, `REQUESTING`, `CONFIRMED`, `DIVERGED`, `UNAVAILABLE` ou `FAILED`.
+
+`TelecomCallState` contient séparément la phase (`STARTING`, `ACTIVE`, `INACTIVE`,
+`FAILED`, `STOPPED`), l'endpoint courant confirmé, l'endpoint sélectionné, les endpoints
+disponibles et l'éventuelle erreur fatale de session.
 
 `AudioPipelineState` est indépendant : `CLOSED`, `OPENING`,
 `READY(endpointKey, observedInput, observedOutput)` ou `FAILED`. En mode PTT, l'entrée de
@@ -207,23 +213,32 @@ le sélecteur audio du coin supérieur droit. Cette observation ne prend ni focu
 Chaque endpoint Bluetooth est présenté séparément par son nom et son identifiant Telecom :
 une Galaxy Watch et des Galaxy Buds ne sont donc jamais confondus. Les endpoints USB/filaire
 sont ajoutés et retirés dynamiquement. La connexion d'un accessoire ne le sélectionne jamais
-automatiquement ; sa déconnexion remet explicitement la sélection sur « Cet appareil ».
+automatiquement. Sa déconnexion conserve le choix devenu indisponible, ferme le duplex et
+attend un nouveau choix manuel ; elle ne sélectionne aucun remplacement.
 
 Une fois l'appel actif :
 
-- `currentCallEndpoint` reste la vérité sur la route physique courante ;
-- l'endpoint sélectionné est passé comme `preferredStartingCallEndpoint`, puis demandé
-  exactement par identifiant si Telecom confirme d'abord une autre route ;
+- `currentCallEndpoint` reste la vérité sur la route physique courante et ne provoque
+  jamais lui-même une demande de route ;
+- `availableEndpoints` actualise uniquement le menu et ne provoque jamais une demande ;
+- la cible sélectionnée est passée comme `preferredStartingCallEndpoint` lors de la
+  création de l'appel ;
 - le duplex reste fermé tant que l'endpoint courant ne correspond pas à la sélection :
   aucun premier paquet ne peut partir via l'écouteur ou la montre par erreur ;
-- un changement manuel pendant un appel ferme le graphe, demande une fois la nouvelle
-  route et le reconstruit uniquement après confirmation ;
-- un échec ne choisit jamais silencieusement un autre périphérique ;
+- seul un clic dans le menu peut demander un changement pendant un appel, exactement une
+  fois et vers l'identifiant choisi ; les autres clics sont refusés pendant cette requête ;
+- si Samsung change spontanément de route, l'état devient `DIVERGED`, le graphe est fermé
+  et aucune correction automatique n'est tentée ;
+- un refus devient `FAILED`, déconnecte la génération Telecom potentiellement bloquée et
+  interdit sa recréation automatique. Le prochain choix explicite crée une session propre ;
+- un endpoint disparu devient `UNAVAILABLE` et ne déclenche aucun repli ;
 - `onSetInactive` est traité comme une demande de terminaison, et `onDisconnect` ferme
   immédiatement le duplex et annule PTT.
 
 Le bouton PTT et l'action de barre supérieure affichent la sélection même à l'état idle ;
-pendant un appel, le bouton reflète la route confirmée. `AudioDeviceInfo` ne sert qu'à
+pendant un appel, le bouton reflète la route confirmée. Une Watch et des Buds sont deux
+entrées indépendantes même si leur type est identique. « Cet appareil » résout strictement
+le `TYPE_SPEAKER` fourni par Telecom, jamais l'écouteur téléphonique. `AudioDeviceInfo` ne sert qu'à
 distinguer visuellement USB/filaire et aux diagnostics. Il n'existe aucun retry automatique,
 délai, debounce, timeout de confirmation, route SCO historique ou repli applicatif.
 

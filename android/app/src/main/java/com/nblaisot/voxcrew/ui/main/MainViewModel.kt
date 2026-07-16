@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
+import androidx.core.telecom.CallEndpointCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.nblaisot.voxcrew.audio.AudioPermissionIssue
@@ -13,7 +14,8 @@ import com.nblaisot.voxcrew.audio.AudioPipelineState
 import com.nblaisot.voxcrew.audio.AudioRouteChoice
 import com.nblaisot.voxcrew.audio.AudioSessionIssue
 import com.nblaisot.voxcrew.audio.CaptureInputKind
-import com.nblaisot.voxcrew.audio.RouteRequestWarning
+import com.nblaisot.voxcrew.audio.DEVICE_AUDIO_ROUTE_KEY
+import com.nblaisot.voxcrew.audio.ManualRouteStatus
 import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.audio.deviceAudioRouteChoice
 import com.nblaisot.voxcrew.audio.isConfirmedDuplexReady
@@ -52,6 +54,7 @@ data class MainUiState(
     val permissionPrompt: AudioPermissionIssue? = null,
     val audioRouteChoices: List<AudioRouteChoice> = listOf(deviceAudioRouteChoice()),
     val selectedAudioRoute: AudioRouteChoice = deviceAudioRouteChoice(),
+    val audioRouteStatus: ManualRouteStatus = ManualRouteStatus.STARTING,
     val audioRoutePending: Boolean = false,
     val pttMicIconKind: CaptureInputKind = CaptureInputKind.BUILTIN,
 )
@@ -134,25 +137,44 @@ class MainViewModel(
                 val ready = isConfirmedDuplexReady(route, pipeline)
                 val pipelineFailure = pipeline as? AudioPipelineState.Failed
                 val startAllowed = route.sessionIssue == null && pipelineFailure == null
+                val manualStatus = selection.status
+                val confirmedChoice = selection.availableChoices.firstOrNull { choice ->
+                    if (choice.key == DEVICE_AUDIO_ROUTE_KEY) {
+                        route.currentEndpoint?.type == CallEndpointCompat.TYPE_SPEAKER
+                    } else {
+                        choice.endpointIdentifier == route.currentEndpoint?.identifier
+                    }
+                }
+                val displayedInput = when {
+                    ready -> input
+                    route.currentEndpoint != null -> confirmedChoice?.inputKind ?: route.micKind
+                    else -> selection.selectedChoice.inputKind
+                }
                 _uiState.update {
                     it.copy(
                         audioRouteChoices = selection.availableChoices,
                         selectedAudioRoute = selection.selectedChoice,
+                        audioRouteStatus = manualStatus,
                         appForeground = appForeground,
                         audioRoutePending = appForeground &&
                             !it.voxEnabled &&
                             it.micPermissionGranted &&
                             startAllowed &&
-                            !ready,
-                        pttMicIconKind = if (ready) input else selection.selectedChoice.inputKind,
+                            (manualStatus == ManualRouteStatus.STARTING ||
+                                manualStatus == ManualRouteStatus.REQUESTING),
+                        pttMicIconKind = displayedInput,
                         audioRouteReady = ready,
                         audioStartAllowed = startAllowed,
                         bannerMessage = route.sessionIssue?.toUserMessage()
                             ?: pipelineFailure?.let { failure ->
                                 "Audio indisponible : ${failure.reason}"
                             }
-                            ?: route.routeRequestWarning?.toUserMessage(),
-                        showAudioRetry = !startAllowed,
+                            ?: manualStatus.toUserMessage(
+                                selectedName = selection.selectedChoice.name,
+                                currentName = route.currentEndpoint?.name,
+                                errorCode = selection.errorCode,
+                            ),
+                        showAudioRetry = route.sessionIssue != null || pipelineFailure != null,
                     ).withPttEnabled()
                 }
             }
@@ -321,8 +343,16 @@ class MainViewModel(
     fun signOut() {
         signalingClient.disconnect()
         lanEngine.releaseAudioSession()
+        rosterRepository.stop()
         SessionForegroundService.stop(appContext)
         viewModelScope.launch { authRepository.signOut() }
+    }
+
+    fun quitApplication() {
+        signalingClient.disconnect()
+        lanEngine.shutdown()
+        rosterRepository.stop()
+        SessionForegroundService.stop(appContext)
     }
 
     private fun startForegroundIfAllowed() {
@@ -337,9 +367,23 @@ class MainViewModel(
             AudioSessionIssue.AUDIO_PIPELINE_FAILED -> "Le pipeline audio a rencontré une erreur"
         }
 
-        fun RouteRequestWarning.toUserMessage(): String = when (this) {
-            RouteRequestWarning.ENDPOINT_CHANGE_FAILED ->
-                "La sortie audio sélectionnée n'a pas pu être activée; aucun son n'est transmis"
+        fun ManualRouteStatus.toUserMessage(
+            selectedName: String,
+            currentName: String?,
+            errorCode: Int?,
+        ): String? = when (this) {
+            ManualRouteStatus.DIVERGED ->
+                "Android utilise « ${currentName ?: "une autre sortie"} ». " +
+                    "Choisissez la sortie voulue dans le menu audio."
+            ManualRouteStatus.UNAVAILABLE ->
+                "La sortie « $selectedName » n'est plus disponible. Choisissez une sortie audio."
+            ManualRouteStatus.FAILED ->
+                "Android a refusé « $selectedName »" +
+                    (errorCode?.let { " (code $it)" } ?: "") +
+                    ". Choisissez une sortie audio pour reconstruire la session."
+            ManualRouteStatus.STARTING,
+            ManualRouteStatus.REQUESTING,
+            ManualRouteStatus.CONFIRMED -> null
         }
     }
 }

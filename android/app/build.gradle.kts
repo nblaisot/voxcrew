@@ -22,7 +22,7 @@ val signalingBaseUrl = localProperties.getProperty("SIGNALING_BASE_URL")
 
 android {
     namespace = "com.nblaisot.voxcrew"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.nblaisot.voxcrew"
@@ -59,14 +59,6 @@ aboutLibraries {
     collect {
         configPath = file("config")
         filterVariants.addAll("debug", "release")
-    }
-}
-
-configurations.configureEach {
-    resolutionStrategy {
-        // AboutLibraries transitively pulls core-ktx 1.17+ which requires AGP 8.9 / compileSdk 36.
-        force("androidx.core:core-ktx:${libs.versions.coreKtx.get()}")
-        force("androidx.core:core:${libs.versions.coreKtx.get()}")
     }
 }
 
