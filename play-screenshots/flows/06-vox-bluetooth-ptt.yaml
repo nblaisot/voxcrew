@@ -1,0 +1,30 @@
+appId: com.nblaisot.voxcrew
+---
+# Main screen with VOX on and Bluetooth earbuds selected (PTT shows BT icon).
+# Assumes demo mode already enabled from flow 02.
+- runFlow:
+    when:
+      visible: "Cet appareil"
+    commands:
+      - back
+- runFlow:
+    when:
+      visible: "Oublier"
+    commands:
+      - tapOn: "Annuler"
+- extendedWaitUntil:
+    visible:
+      id: "main_vox_switch"
+    timeout: 10000
+- extendedWaitUntil:
+    visible: "Vox actif — en écoute"
+    timeout: 10000
+- extendedWaitUntil:
+    visible:
+      id: "main_ptt"
+    timeout: 5000
+- scrollUntilVisible:
+    element:
+      id: "main_ptt"
+    direction: DOWN
+    timeout: 5000

@@ -13,6 +13,8 @@ import androidx.core.telecom.CallAttributesCompat
 import androidx.core.telecom.CallControlResult
 import androidx.core.telecom.CallEndpointCompat
 import androidx.core.telecom.CallsManager
+import com.nblaisot.voxcrew.demo.DemoFixtures
+import com.nblaisot.voxcrew.demo.DemoModeStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -50,6 +52,7 @@ class IntercomTelecomSession(
     private val callsManager: CallsManager = CallsManager(context.applicationContext),
     private val permissionChecker: AudioPermissionChecker =
         AndroidAudioPermissionChecker(context.applicationContext),
+    private val demoModeStore: DemoModeStore? = null,
 ) {
     private val audioManager = context.applicationContext.getSystemService(AudioManager::class.java)
     private val lifecycleLock = Any()
@@ -94,6 +97,11 @@ class IntercomTelecomSession(
                 )
             }
         refreshEndpointCatalog()
+        if (demoModeStore != null) {
+            scope.launch {
+                demoModeStore.enabled.collect { rebuildChoicesFromLatestEndpoints() }
+            }
+        }
     }
 
     fun setMediaLifecycleCallbacks(
@@ -124,6 +132,15 @@ class IntercomTelecomSession(
     suspend fun selectAudioRoute(key: String) {
         val choice = _routeSelection.value.availableChoices.firstOrNull { it.key == key }
             ?: return
+        if (DemoFixtures.isDemoAudioRouteKey(key)) {
+            _routeSelection.value = _routeSelection.value.copy(
+                selectedChoice = choice,
+                status = ManualRouteStatus.CONFIRMED,
+                confirmedChoiceKey = choice.key,
+                errorCode = null,
+            )
+            return
+        }
         routeActivationGate.onUserSelection()
         _routeSelection.value = _routeSelection.value.copy(
             selectedChoice = choice,
@@ -490,16 +507,12 @@ class IntercomTelecomSession(
 
     private suspend fun updateStartingEndpoints(endpoints: List<CallEndpointCompat>) {
         latestStartingEndpoints = endpoints
-        val choices = buildAudioRouteChoices(
-            endpoints = endpoints.map { it.toTelecomEndpoint() },
-            usbProductNames = connectedUsbProductNames(),
+        rebuildChoicesFromLatestEndpoints()
+        val demoRouteSelected = DemoFixtures.isDemoAudioRouteKey(
+            _routeSelection.value.selectedChoice.key,
         )
-        val previous = _routeSelection.value
-        val selected = selectedAudioRouteChoice(choices, previous.selectedChoice)
-        _routeSelection.value = previous.copy(
-            availableChoices = choices,
-            selectedChoice = selected,
-        )
+        // Demo Bluetooth endpoints are UI fixtures — never mark them unavailable.
+        if (demoRouteSelected) return
         if (endpoints.isNotEmpty() &&
             currentCoordinator() == null &&
             resolveSelectedFrameworkEndpoint(endpoints) == null
@@ -507,6 +520,38 @@ class IntercomTelecomSession(
             routeActivationGate.onRouteFailure()
             updateRouteSelectionStatus(ManualRouteStatus.UNAVAILABLE)
         }
+    }
+
+    private fun rebuildChoicesFromLatestEndpoints() {
+        val catalog = latestStartingEndpoints.map { it.toTelecomEndpoint() }
+        val demoOn = demoModeStore?.enabled?.value == true
+        val withDemo = if (demoOn) {
+            catalog + DemoFixtures.bluetoothEndpoints()
+        } else {
+            catalog
+        }
+        val choices = buildAudioRouteChoices(
+            endpoints = withDemo,
+            usbProductNames = connectedUsbProductNames(),
+        )
+        val previous = _routeSelection.value
+        val preferredDemo = if (demoOn) {
+            choices.firstOrNull { it.key == DemoFixtures.audioRouteKey(DemoFixtures.EARBUDS_ID) }
+        } else {
+            null
+        }
+        val selected = preferredDemo
+            ?: selectedAudioRouteChoice(choices, previous.selectedChoice)
+        _routeSelection.value = previous.copy(
+            availableChoices = choices,
+            selectedChoice = selected,
+            status = if (preferredDemo != null && DemoFixtures.isDemoAudioRouteKey(selected.key)) {
+                ManualRouteStatus.CONFIRMED
+            } else {
+                previous.status
+            },
+            confirmedChoiceKey = if (preferredDemo != null) selected.key else previous.confirmedChoiceKey,
+        )
     }
 
     private fun resolveSelectedFrameworkEndpoint(

@@ -58,6 +58,9 @@ class LanIntercomEngine(
     private val signalingClient: SignalingClient? = null,
     private val networkMonitor: NetworkMonitor = NetworkMonitor(context),
     telecomSession: IntercomTelecomSession? = null,
+    private val cloudFallbackEnabled: Boolean = true,
+    private val optInRecipients: Boolean = false,
+    private val overlayFallbackEnabled: Boolean = false,
 ) {
     private val appContext = context.applicationContext
     private val telecomSession = telecomSession ?: IntercomTelecomSession(appContext, scope)
@@ -71,6 +74,7 @@ class LanIntercomEngine(
         telecomSession = this.telecomSession,
     )
     private val playback = AudioPlayback(scope)
+    private val mediaInboundPlayer = MediaInboundPlayer(appContext, scope)
     private val uiFeedback = UiFeedbackPlayer(scope)
 
     private val connections = ConcurrentHashMap<String, PeerConnection>()
@@ -91,7 +95,11 @@ class LanIntercomEngine(
     private val _peerMetrics = MutableStateFlow<Map<String, PeerMetrics>>(emptyMap())
     val peerMetrics: StateFlow<Map<String, PeerMetrics>> = _peerMetrics.asStateFlow()
 
-    val isReceiving: StateFlow<Boolean> = playback.isReceiving
+    val isReceiving: StateFlow<Boolean> = combine(
+        playback.isReceiving,
+        mediaInboundPlayer.isReceiving,
+    ) { telecom, media -> telecom || media }
+        .stateIn(scope, SharingStarted.Eagerly, false)
 
     private val _receivingFromUids = MutableStateFlow<Set<String>>(emptySet())
     val receivingFromUids: StateFlow<Set<String>> = _receivingFromUids.asStateFlow()
@@ -152,6 +160,13 @@ class LanIntercomEngine(
     private var localUid: String = ""
     private var displayName: String = ""
     private var knownCrewUids: Set<String> = emptySet()
+    private val peerOverlayEndpoints = ConcurrentHashMap<String, OverlayEndpoint>()
+
+    private data class OverlayEndpoint(
+        val host: String,
+        val port: Int,
+        val displayName: String,
+    )
 
     init {
         this.telecomSession.setMediaLifecycleCallbacks(
@@ -166,8 +181,13 @@ class LanIntercomEngine(
     val statusText: StateFlow<String> = combine(
         _activeRecipientUids,
         _peerMetrics,
-    ) { active, metrics ->
-        describeStatus(active ?: emptySet(), metrics ?: emptyMap())
+        beacon.peers,
+    ) { active, metrics, peers ->
+        describeStatus(
+            active = active ?: emptySet(),
+            metrics = metrics ?: emptyMap(),
+            visiblePeerCount = peers.count { it.uid != localUid },
+        )
     }.stateIn(scope, SharingStarted.Eagerly, "Recherche de coéquipiers…")
 
     fun start(uid: String, displayName: String) {
@@ -182,7 +202,8 @@ class LanIntercomEngine(
 
         lanServer.start(uid)
         lanServer.onUnknownInboundPeer = { peerUid -> ensureKnownPeer(peerUid) }
-        beacon.start(uid, displayName, lanServer.localPort)
+        val overlayHost = if (overlayFallbackEnabled) TailscaleInterface.localOverlayIpv4() else null
+        beacon.start(uid, displayName, lanServer.localPort, overlayHost)
         networkMonitor.start()
         sharedUdp.open()
         startSharedUdpReceiver()
@@ -201,8 +222,18 @@ class LanIntercomEngine(
         lifecycleJobs += scope.launch {
             beacon.peers.collect { list -> updateLanTargets(list) }
         }
-        lifecycleJobs += scope.launch {
-            cloudTransport.incomingMessages.collect { handleCloudMessage(it) }
+        if (overlayFallbackEnabled) {
+            lifecycleJobs += scope.launch {
+                while (currentCoroutineContext().isActive) {
+                    delay(LanBeacon.PRUNE_INTERVAL_MS)
+                    if (started) updateLanTargets(beacon.peers.value)
+                }
+            }
+        }
+        if (cloudFallbackEnabled) {
+            lifecycleJobs += scope.launch {
+                cloudTransport.incomingMessages.collect { handleCloudMessage(it) }
+            }
         }
         signalingClient?.let { client ->
             lifecycleJobs += scope.launch {
@@ -220,20 +251,32 @@ class LanIntercomEngine(
     }
 
     fun syncCrewPeers(crewUids: Set<String>) {
-        val newPeers = crewUids - knownCrewUids
+        val previousKnown = knownCrewUids
         knownCrewUids = crewUids
-        var active = _activeRecipientUids.value ?: emptySet()
-        if (active.isEmpty() && crewUids.isNotEmpty()) {
-            active = crewUids
-        } else if (newPeers.isNotEmpty()) {
-            active = active + newPeers
-        }
+        val active = ActiveRecipientPolicy.recipientsAfterCrewSync(
+            currentActive = _activeRecipientUids.value,
+            crewUids = crewUids,
+            previousKnownCrew = previousKnown,
+            optInMode = optInRecipients,
+        )
         if (active != _activeRecipientUids.value) {
             setActiveRecipients(active, persist = true)
         }
-        crewUids.forEach { uid -> ensureConnection(uid).start() }
-        val removed = connections.keys - crewUids
-        removed.forEach { removeConnection(it) }
+        val prunedActive = if (crewUids.isEmpty() && optInRecipients) {
+            _activeRecipientUids.value
+        } else {
+            _activeRecipientUids.value.filter { it in crewUids }.toSet()
+        }
+        if (prunedActive != _activeRecipientUids.value) {
+            setActiveRecipients(prunedActive, persist = true)
+        }
+        val targetUids = (crewUids + _activeRecipientUids.value).filter { it != localUid }.toSet()
+        targetUids.forEach { uid -> ensureConnection(uid).start() }
+        if (crewUids.isNotEmpty()) {
+            val removed = connections.keys - targetUids
+            removed.forEach { removeConnection(it) }
+        }
+        updateOverlayProbes(beacon.peers.value.map { it.uid }.toSet())
     }
 
     fun toggleRecipient(uid: String) {
@@ -246,6 +289,12 @@ class LanIntercomEngine(
     fun soloRecipient(uid: String) {
         if (uid == localUid) return
         setActiveRecipients(setOf(uid), persist = true)
+    }
+
+    fun removeRecipient(uid: String) {
+        if (uid == localUid) return
+        if (uid !in _activeRecipientUids.value) return
+        setActiveRecipients(_activeRecipientUids.value - uid, persist = true)
     }
 
     fun setActiveRecipients(uids: Set<String>, persist: Boolean = false) {
@@ -282,6 +331,8 @@ class LanIntercomEngine(
         _voxEnabled.value = enabled
         prefs.edit().putBoolean(KEY_VOX_ENABLED, enabled).apply()
         if (enabled) {
+            // VOX uses Telecom duplex; tear down multimedia inbound if we were backgrounded.
+            mediaInboundPlayer.stop()
             pttPolicy.cancel()
             stopVoxCapture()
             setOutboundMediaActive(false)
@@ -299,7 +350,10 @@ class LanIntercomEngine(
 
     fun setAppForeground(foreground: Boolean) {
         _appForeground.value = foreground
-        if (!foreground && !_voxEnabled.value) {
+        if (foreground) {
+            // Foreground restores the Telecom path; multimedia inbound must not keep playing.
+            mediaInboundPlayer.stop()
+        } else if (!_voxEnabled.value) {
             pttPolicy.cancel()
             setOutboundMediaActive(false)
         }
@@ -623,6 +677,7 @@ class LanIntercomEngine(
                 cloudTransport = cloudTransport,
                 isStillWanted = { peerUid in knownCrewUids || peerUid in _activeRecipientUids.value },
                 localIpv4Provider = ::localIpv4Address,
+                cloudFallbackEnabled = cloudFallbackEnabled,
             )
             startAudioCollection(conn)
             startConnectionFeedback(conn)
@@ -635,12 +690,10 @@ class LanIntercomEngine(
         knownCrewUids = knownCrewUids + peerUid
         val conn = ensureConnection(peerUid)
         conn.start()
-        if (peerUid !in _activeRecipientUids.value) {
-            setActiveRecipients(_activeRecipientUids.value + peerUid, persist = true)
-        }
         val peer = beacon.peers.value.firstOrNull { it.uid == peerUid }
-            ?: LanPeer(peerUid, peerUid, "", 0, System.currentTimeMillis())
-        conn.updateLanTarget(peer)
+        val overlay = overlayPeerFor(peerUid, peer?.takeIf { it.viaOverlay })
+        val lan = peer?.takeUnless { it.viaOverlay }
+        conn.applyPathTargets(lan, overlay)
     }
 
     private fun removeConnection(peerUid: String) {
@@ -691,8 +744,18 @@ class LanIntercomEngine(
         }
     }
 
+    private fun inboundPlaybackMode(): InboundPlaybackMode =
+        InboundPlaybackPolicy.mode(
+            appForeground = _appForeground.value,
+            voxEnabled = _voxEnabled.value,
+        )
+
     private suspend fun handleIncomingMedia(peerUid: String, event: IncomingMediaEvent) {
         incomingMediaMutex.withLock {
+            if (inboundPlaybackMode() == InboundPlaybackMode.MEDIA) {
+                handleIncomingMediaAsMultimediaLocked(peerUid, event)
+                return
+            }
             when (event) {
                 is IncomingMediaEvent.Activity -> {
                     if (event.active) {
@@ -716,12 +779,33 @@ class LanIntercomEngine(
                         )
                     ) {
                         setRemoteTelecomDemand(peerUid, true)
-                        playIncomingLocked(peerUid, event.payload)
+                        playIncomingTelecomLocked(peerUid, event.payload)
                     } else {
                         setRemoteTelecomDemand(peerUid, true)
                         enqueueIncomingLocked(peerUid, event)
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * Background + VOX off: play on [MediaInboundPlayer] without waking Telecom.
+     * Activity events only drive receiving UI; audio frames play immediately.
+     */
+    private fun handleIncomingMediaAsMultimediaLocked(peerUid: String, event: IncomingMediaEvent) {
+        // Drop any Telecom-pending queue for this peer — that path is not used here.
+        pendingIncomingMedia.remove(peerUid)
+        when (event) {
+            is IncomingMediaEvent.Activity -> {
+                if (!event.active) {
+                    receivingUntilMs.remove(peerUid)
+                    refreshReceivingUids()
+                }
+                // Do not call setRemoteTelecomDemand — remote peers must not reopen Telecom.
+            }
+            is IncomingMediaEvent.Audio -> {
+                playIncomingMediaLocked(peerUid, event.payload)
             }
         }
     }
@@ -747,7 +831,7 @@ class LanIntercomEngine(
                         when (val event = queue.removeFirst()) {
                             is IncomingMediaEvent.Audio -> {
                                 setRemoteTelecomDemand(peerUid, true)
-                                if (!playIncomingLocked(peerUid, event.payload)) break
+                                if (!playIncomingTelecomLocked(peerUid, event.payload)) break
                             }
                             is IncomingMediaEvent.Activity ->
                                 setRemoteTelecomDemand(peerUid, event.active)
@@ -759,16 +843,26 @@ class LanIntercomEngine(
         }
     }
 
-    private fun playIncomingLocked(peerUid: String, payload: ByteArray): Boolean {
+    private fun playIncomingTelecomLocked(peerUid: String, payload: ByteArray): Boolean {
         if (!playback.play(payload)) {
             if (_audioPipelineState.value is AudioPipelineState.Ready) {
                 onAudioPipelineFailure("AudioTrack could not play a received frame")
             }
             return false
         }
+        markReceiving(peerUid)
+        return true
+    }
+
+    private fun playIncomingMediaLocked(peerUid: String, payload: ByteArray): Boolean {
+        if (!mediaInboundPlayer.play(payload)) return false
+        markReceiving(peerUid)
+        return true
+    }
+
+    private fun markReceiving(peerUid: String) {
         receivingUntilMs[peerUid] = System.currentTimeMillis() + RECEIVING_IDLE_MS
         refreshReceivingUids()
-        return true
     }
 
     private fun startReceivingSweep() {
@@ -788,20 +882,75 @@ class LanIntercomEngine(
     }
 
     private fun updateLanTargets(peerList: List<LanPeer>) {
-        val visibleUids = peerList.map { it.uid }.toSet()
-        connections.keys.forEach { uid ->
-            if (uid != localUid && uid !in visibleUids) {
-                connections[uid]?.onLanPeerAbsent()
-            }
-        }
         peerList.forEach { peer ->
-            if (peer.uid == localUid) return@forEach
-            val conn = ensureConnection(peer.uid)
-            if (!conn.linkState.value.let { it is PeerLink.LinkState.Connected }) {
+            rememberOverlayEndpoint(peer)
+        }
+        val nowMs = System.currentTimeMillis()
+        val visibleUids = peerList.map { it.uid }.toSet()
+        val lanByUid = peerList
+            .filter { it.uid != localUid && !it.viaOverlay }
+            .associateBy { it.uid }
+        val overlaySightings = peerList
+            .filter { it.uid != localUid && it.viaOverlay }
+            .associateBy { it.uid }
+
+        val relevantUids = (knownCrewUids + _activeRecipientUids.value + visibleUids)
+            .filter { it != localUid }
+            .toSet()
+
+        relevantUids.forEach { uid ->
+            val lan = lanByUid[uid]
+            val overlay = overlayPeerFor(uid, overlaySightings[uid])
+            val conn = ensureConnection(uid)
+            if (lan != null || overlay != null) {
                 conn.start()
             }
-            conn.updateLanTarget(peer)
+            if (lan != null) {
+                conn.applyPathTargets(lan, overlay, nowMs)
+            } else {
+                conn.onLanPeerAbsent(overlay)
+            }
         }
+
+        if (overlayFallbackEnabled) {
+            updateOverlayProbes(visibleUids)
+        }
+    }
+
+    private fun overlayPeerFor(uid: String, sighting: LanPeer?): LanPeer? {
+        sighting?.let { return it.copy(viaOverlay = true) }
+        val endpoint = peerOverlayEndpoints[uid] ?: return null
+        return LanPeer(
+            uid = uid,
+            displayName = endpoint.displayName,
+            host = endpoint.host,
+            port = endpoint.port,
+            lastSeenMs = System.currentTimeMillis(),
+            overlayHost = endpoint.host,
+            viaOverlay = true,
+        )
+    }
+
+    private fun rememberOverlayEndpoint(peer: LanPeer) {
+        val overlayHost = peer.overlayHost
+            ?: peer.host.takeIf { TailscaleInterface.isTailscaleAddress(peer.host) }
+        if (overlayHost.isNullOrBlank() || peer.port <= 0) return
+        peerOverlayEndpoints[peer.uid] = OverlayEndpoint(
+            host = overlayHost,
+            port = peer.port,
+            displayName = peer.displayName,
+        )
+    }
+
+    private fun updateOverlayProbes(visibleUids: Set<String>) {
+        val lanVisible = visibleUids.filter { uid ->
+            beacon.peers.value.any { it.uid == uid && !it.viaOverlay }
+        }.toSet()
+        val targets = (knownCrewUids + _activeRecipientUids.value)
+            .filter { it != localUid && it !in lanVisible }
+            .mapNotNull { uid -> peerOverlayEndpoints[uid]?.host?.let { uid to it } }
+            .toMap()
+        beacon.setOverlayProbeTargets(targets)
     }
 
     private fun startSharedUdpReceiver() {
@@ -850,7 +999,10 @@ class LanIntercomEngine(
     }
 
     private fun onNetworkChanged() {
-        if (started) beacon.start(localUid, displayName, lanServer.localPort)
+        if (started) {
+            val overlayHost = if (overlayFallbackEnabled) TailscaleInterface.localOverlayIpv4() else null
+            beacon.start(localUid, displayName, lanServer.localPort, overlayHost)
+        }
         connections.values.forEach { it.onNetworkChanged() }
     }
 
@@ -864,7 +1016,7 @@ class LanIntercomEngine(
                 setOutboundMediaActive(transmitting)
             },
             onFrame = { payload -> fanOut(payload) },
-            isReceiving = { playback.isReceiving.value },
+            isReceiving = { isReceiving.value },
             onFailure = ::onAudioPipelineFailure,
         )
         if (result is CaptureStartResult.Success) voxJob = result.job
@@ -898,7 +1050,7 @@ class LanIntercomEngine(
             val raw = prefs.getString(KEY_ACTIVE_RECIPIENTS, null) ?: return
             json.decodeFromString<Set<String>?>(raw)
         }.getOrNull() ?: return
-        val filtered = persisted.filter { it != localUid }.toSet()
+        val filtered = persisted.filter { it.isNotBlank() && it != localUid }.toSet()
         if (filtered.isEmpty()) return
         setActiveRecipients(filtered, persist = false)
     }
@@ -935,20 +1087,52 @@ class LanIntercomEngine(
         }
     }
 
-    private fun describeStatus(active: Set<String>?, metrics: Map<String, PeerMetrics>?): String {
-        val recipients = active ?: emptySet()
-        val peerMetrics = metrics ?: emptyMap()
-        if (recipients.isEmpty()) {
+    private fun describeStatus(
+        active: Set<String>,
+        metrics: Map<String, PeerMetrics>,
+        visiblePeerCount: Int,
+    ): String {
+        val included = active.filter { it in knownCrewUids }.toSet()
+        if (optInRecipients) {
+            return when {
+                visiblePeerCount == 0 && knownCrewUids.isEmpty() ->
+                    "Recherche de coéquipiers…"
+                included.isEmpty() ->
+                    if (visiblePeerCount == 1) {
+                        "1 coéquipier à proximité · aucun inclus"
+                    } else {
+                        "$visiblePeerCount coéquipiers à proximité · aucun inclus"
+                    }
+                else -> {
+                    val connected = included.count { uid ->
+                        metrics[uid]?.linkState is PeerLink.LinkState.Connected
+                    }
+                    val pathCounts = included.mapNotNull { metrics[it]?.pathLabel }.groupingBy { it }.eachCount()
+                    val pathSummary = pathCounts.entries.joinToString(" · ") { (path, count) -> "$count $path" }
+                    buildString {
+                        append("${included.size} inclus")
+                        append(" · $connected connecté")
+                        if (connected > 1) append("s")
+                        if (pathSummary.isNotBlank()) {
+                            append(" · ")
+                            append(pathSummary)
+                        }
+                    }
+                }
+            }
+        }
+
+        if (included.isEmpty()) {
             return if (knownCrewUids.isEmpty()) "Recherche de coéquipiers…" else "Aucun destinataire actif"
         }
-        val connected = recipients.count { uid ->
-            peerMetrics[uid]?.linkState is PeerLink.LinkState.Connected
+        val connected = included.count { uid ->
+            metrics[uid]?.linkState is PeerLink.LinkState.Connected
         }
-        val pathCounts = recipients.mapNotNull { peerMetrics[it]?.pathLabel }.groupingBy { it }.eachCount()
+        val pathCounts = included.mapNotNull { metrics[it]?.pathLabel }.groupingBy { it }.eachCount()
         val pathSummary = pathCounts.entries.joinToString(" · ") { (path, count) -> "$count $path" }
         return buildString {
-            append("${recipients.size} actif")
-            if (recipients.size > 1) append("s")
+            append("${included.size} actif")
+            if (included.size > 1) append("s")
             append(" · $connected connecté")
             if (connected > 1) append("s")
             if (pathSummary.isNotBlank()) {
@@ -965,6 +1149,7 @@ class LanIntercomEngine(
         stopVoxCapture()
         setOutboundMediaActive(false)
         mediaDemandState.endSession()
+        mediaInboundPlayer.stop()
         playback.stop()
         telecomSession.stop()
         audioPrepared = false

@@ -1,0 +1,31 @@
+appId: com.nblaisot.voxcrew
+androidDir: android
+apkGradle: ":app:assembleDebug"
+apkPath: android/app/build/outputs/apk/debug/app-debug.apk
+permissions:
+  - android.permission.RECORD_AUDIO
+  - android.permission.BLUETOOTH_CONNECT
+  - android.permission.POST_NOTIFICATIONS
+devices:
+  phone:
+    avd: Play_Phone_1080x1920
+  tablet7:
+    avd: My_7_inch_tablet
+  tablet10:
+    avd: Pixel_Tablet
+setup:
+  - flows/capture-all.yaml
+shots:
+  # Executed as one continuous Maestro flow (capture-all.yaml) so the app stays foregrounded.
+  - id: profile-name
+    devices: [phone, tablet7, tablet10]
+  - id: main-crew-demo
+    devices: [phone, tablet7, tablet10]
+  - id: audio-bluetooth
+    devices: [phone, tablet7, tablet10]
+  - id: solo-marc
+    devices: [phone, tablet7, tablet10]
+  - id: vox-bluetooth-ptt
+    devices: [phone, tablet7, tablet10]
+  - id: forget-quentin
+    devices: [phone, tablet7, tablet10]

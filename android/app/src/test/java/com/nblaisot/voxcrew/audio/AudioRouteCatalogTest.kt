@@ -1,6 +1,7 @@
 package com.nblaisot.voxcrew.audio
 
 import androidx.core.telecom.CallEndpointCompat
+import com.nblaisot.voxcrew.demo.DemoFixtures
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
@@ -76,6 +77,18 @@ class AudioRouteCatalogTest {
             "endpoint:${buds.identifier}",
             selectedAudioRouteChoice(choicesAfterRemoval, selectedBuds).key,
         )
+    }
+
+    @Test
+    fun demoBluetoothFixturesAppearAsNamedChoices() {
+        val choices = buildAudioRouteChoices(listOf(speaker) + DemoFixtures.bluetoothEndpoints())
+        val bluetooth = choices.filter { it.inputKind == CaptureInputKind.BLUETOOTH }
+
+        assertEquals(
+            listOf("Galaxy Watch 8", "Nicolas' earbuds"),
+            bluetooth.map { it.name },
+        )
+        assertTrue(bluetooth.all { DemoFixtures.isDemoAudioRouteKey(it.key) })
     }
 
     private fun endpoint(id: String, name: String, type: Int) = TelecomEndpoint(id, name, type)

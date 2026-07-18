@@ -1,0 +1,17 @@
+appId: com.nblaisot.voxcrew
+---
+# Dismiss audio menu if open, then solo Marc (double tap).
+- runFlow:
+    when:
+      visible: "Cet appareil"
+    commands:
+      - back
+- extendedWaitUntil:
+    visible:
+      id: "crew_marc"
+    timeout: 10000
+- doubleTapOn:
+    id: "crew_marc"
+- extendedWaitUntil:
+    visible: "Marc"
+    timeout: 5000

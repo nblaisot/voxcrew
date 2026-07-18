@@ -1,0 +1,15 @@
+appId: com.nblaisot.voxcrew
+---
+# Open audio route menu showing demo Bluetooth accessories.
+- extendedWaitUntil:
+    visible:
+      id: "main_audio_route"
+    timeout: 10000
+- tapOn:
+    id: "main_audio_route"
+- extendedWaitUntil:
+    visible: "Nicolas' earbuds"
+    timeout: 5000
+- extendedWaitUntil:
+    visible: "Galaxy Watch 8"
+    timeout: 5000

@@ -6,4 +6,7 @@ data class LanPeer(
     val host: String,
     val port: Int,
     val lastSeenMs: Long,
+    /** Tailscale / overlay IPv4 learned from beacon, used when LAN host is unavailable. */
+    val overlayHost: String? = null,
+    val viaOverlay: Boolean = false,
 )

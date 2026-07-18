@@ -34,6 +34,7 @@ class PeerConnection(
     private val cloudTransport: CloudRunSignalingTransport,
     private val isStillWanted: () -> Boolean,
     private val localIpv4Provider: () -> String?,
+    private val cloudFallbackEnabled: Boolean = true,
 ) {
     val peerLink = PeerLink(scope)
     private val lanTcpClient = LanTcpClient(scope, localUid, peerLink, lanServer)
@@ -80,9 +81,63 @@ class PeerConnection(
         lanTcpClient.setTarget(peer)
     }
 
-    /** LAN beacon for this peer expired — tear down a local-only link promptly. */
-    fun onLanPeerAbsent() {
+    /**
+     * Apply discovery result for this peer: prefer LAN when visible, warm Tailscale standby
+     * after a missed beacon, and promote overlay when LAN is gone.
+     */
+    fun applyPathTargets(
+        lanPeer: LanPeer?,
+        overlayPeer: LanPeer?,
+        nowMs: Long = System.currentTimeMillis(),
+    ) {
         if (!started) return
+        val lan = lanPeer?.takeUnless { it.viaOverlay }
+        when {
+            lan != null -> {
+                val warm = OverlayFailoverPolicy.shouldWarmStandby(
+                    lanLastSeenMs = lan.lastSeenMs,
+                    nowMs = nowMs,
+                    hasOverlayEndpoint = overlayPeer != null,
+                    lanStillListed = true,
+                )
+                if (warm && overlayPeer != null) {
+                    lanTcpClient.warmStandby(overlayPeer)
+                } else {
+                    lanTcpClient.clearStandby()
+                }
+                val via = (peerLink.state.value as? PeerLink.LinkState.Connected)?.via
+                if (via == "VPN") {
+                    lanTcpClient.switchToLanMakeBeforeBreak(lan)
+                } else {
+                    lanTcpClient.setTarget(lan)
+                }
+            }
+            overlayPeer != null -> {
+                promoteToOverlay(overlayPeer)
+            }
+            else -> {
+                lanTcpClient.setTarget(null)
+                onPeerPresenceLost(localOnly = true)
+            }
+        }
+    }
+
+    fun promoteToOverlay(overlayPeer: LanPeer) {
+        if (!started) return
+        if (lanTcpClient.promoteStandby()) {
+            lanTcpClient.setTarget(overlayPeer, preserveSession = true)
+            return
+        }
+        lanTcpClient.setTarget(overlayPeer, forceRestart = true)
+    }
+
+    /** LAN beacon for this peer expired — switch to overlay if available, else tear down. */
+    fun onLanPeerAbsent(overlayPeer: LanPeer? = null) {
+        if (!started) return
+        if (overlayPeer != null) {
+            promoteToOverlay(overlayPeer)
+            return
+        }
         lanTcpClient.setTarget(null)
         onPeerPresenceLost(localOnly = true)
     }
@@ -194,6 +249,7 @@ class PeerConnection(
     }
 
     private fun triggerCloudFallback() {
+        if (!cloudFallbackEnabled) return
         if (fallbackJob?.isActive == true) return
         cloudFallbackEngaged = true
         fallbackJob = scope.launch(Dispatchers.IO) {
