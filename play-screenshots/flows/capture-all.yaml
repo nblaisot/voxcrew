@@ -1,0 +1,84 @@
+appId: com.nblaisot.voxcrew
+---
+# Single continuous capture on Play-compliant AVDs (native resolution, no crop).
+# Demo fixtures: intent extra enable_demo (About 5-tap easter egg remains for humans).
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible: "Choisissez un nom visible par les coéquipiers à proximité."
+    timeout: 20000
+- tapOn:
+    id: "profile_name_field"
+- eraseText
+- inputText: "Nicolas"
+# Keyboard is open → hideKeyboard only dismisses it (do not tap Back — exits profile).
+- hideKeyboard
+- takeScreenshot: 01-profile-name
+
+# Prefer testTag over %-points: Continuer Y differs phone vs tablet portrait.
+- tapOn:
+    id: "profile_continue"
+- extendedWaitUntil:
+    visible: "Participants"
+    timeout: 20000
+- runFlow:
+    when:
+      visible: "Autoriser"
+    commands:
+      - tapOn: "Autoriser"
+
+# Cold-start demo: Maestro launchApp arguments can be flaky — force-stop + intent is done
+# by run.sh for tablets when needed. Prefer intent extras here for the continuous flow.
+- launchApp:
+    clearState: false
+    stopApp: true
+    arguments:
+      enable_demo: "true"
+- extendedWaitUntil:
+    visible: "Marc"
+    timeout: 20000
+- extendedWaitUntil:
+    visible: "Anne"
+    timeout: 5000
+- extendedWaitUntil:
+    visible: "Quentin"
+    timeout: 5000
+- extendedWaitUntil:
+    visible: "Vox actif — en écoute"
+    timeout: 15000
+- takeScreenshot: 02-main-crew-demo
+
+- tapOn:
+    id: "main_audio_route"
+- extendedWaitUntil:
+    visible: "Nicolas' earbuds"
+    timeout: 5000
+- extendedWaitUntil:
+    visible: "Galaxy Watch 8"
+    timeout: 5000
+- takeScreenshot: 03-audio-bluetooth
+- back
+
+- extendedWaitUntil:
+    visible:
+      id: "crew_marc"
+    timeout: 10000
+- doubleTapOn:
+    id: "crew_marc"
+- takeScreenshot: 04-solo-marc
+
+- extendedWaitUntil:
+    visible: "Vox actif — en écoute"
+    timeout: 5000
+- takeScreenshot: 05-vox-bluetooth-ptt
+
+- extendedWaitUntil:
+    visible:
+      id: "crew_quentin"
+    timeout: 10000
+- longPressOn:
+    id: "crew_quentin"
+- extendedWaitUntil:
+    visible: "Oublier Quentin ?"
+    timeout: 5000
+- takeScreenshot: 06-forget-quentin

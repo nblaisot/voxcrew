@@ -1,0 +1,8 @@
+appId: com.nblaisot.voxcrew
+---
+# Deterministic start: clear app data then launch (caller should pm clear before this).
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible: "Votre nom"
+    timeout: 20000

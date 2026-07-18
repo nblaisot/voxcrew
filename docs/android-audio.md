@@ -167,25 +167,31 @@ de routage.
 
 ## Cycle de demande média
 
-Une demande média existe si au moins une condition est vraie :
+Une demande média **Telecom** existe si au moins une condition est vraie :
 
 - VoxCrew est au premier plan en mode PTT ;
-- VOX est activé, au premier plan comme en arrière-plan, car Silero doit écouter en continu ;
-- un pair distant a annoncé une transmission active ou des frames de ce pair restent en attente.
+- VOX est activé, au premier plan comme en arrière-plan, car Silero doit écouter en continu.
 
-La première demande ajoute/active l'appel Telecom. Lorsque la dernière demande disparaît,
+La réception distante en arrière-plan avec VOX désactivé **ne** réactive **pas** Telecom :
+les frames Opus sont jouées via un `MediaInboundPlayer` (`USAGE_MEDIA` +
+`AUDIOFOCUS_GAIN_TRANSIENT`) sur la route multimédia courante (haut-parleur / casque BT
+média). Le focus transitoire met en pause la musique d'une autre app pendant la parole,
+puis l'abandonne après ~700 ms d'inactivité pour qu'elle puisse reprendre.
+
+La première demande Telecom ajoute/active l'appel. Lorsque la dernière demande disparaît,
 VoxCrew libère le duplex puis termine complètement l'appel avec `disconnect(LOCAL)`.
 `setInactive()` correspond à une mise en attente et n'est pas utilisé comme état idle :
 sur certains Samsung, un appel self-managed `ON_HOLD` conserve le contexte de communication
 et peut perturber la sortie des autres applications. L'appel VoxCrew ne déclare donc plus
-la capacité hold. Il n'existe aucun délai d'inactivité ou heuristique de focus.
+la capacité hold. Il n'existe aucun délai d'inactivité ou heuristique de focus pour Telecom.
 
 En PTT, chaque pression réutilise le même `AudioRecord`, `AudioTrack` et appel Telecom tant
 que VoxCrew reste au premier plan. Une pression/relâchement ne crée ni ne détruit de route.
-Le passage en arrière-plan annule une pression éventuelle et libère Telecom si aucune
-réception distante n'est active. Le retour au premier plan reconstruit le chemin et garde
-PTT désactivé jusqu'à sa confirmation. Les changements de configuration de l'activité ne
-sont pas considérés comme un passage réel en arrière-plan.
+Le passage en arrière-plan annule une pression éventuelle et libère Telecom (VOX off) pour
+laisser la musique sur le chemin multimédia ; l'inbound utilise alors `MediaInboundPlayer`.
+Le retour au premier plan arrête le lecteur média et reconstruit le chemin Telecom. Les
+changements de configuration de l'activité ne sont pas considérés comme un passage réel
+en arrière-plan.
 
 La création, l'activation et l'arrêt de l'appel sont sérialisés. Les demandes concurrentes
 `start`/`refresh` partagent une seule génération Telecom et un seul `addCall`. Chaque callback
@@ -194,16 +200,19 @@ ne peut pas remplacer l'état `ACTIVE/READY` de la session courante.
 
 `LanFrame.MediaActivity` transporte les limites début/fin de parole dans le même espace de
 séquence accusé que les frames Opus. Elles survivent donc aux reconnexions et changements
-LAN/UDP/relais. Le récepteur active Telecom sur « début », conserve au maximum 250 événements
-(environ cinq secondes de parole) pendant `OPENING`, joue toutes les frames dans l'ordre,
-puis traite « fin » et déconnecte l'appel Telecom. Les paquets UDP reçus hors ordre attendent
-désormais leur séquence manquante au lieu de faire avancer artificiellement l'ACK.
+LAN/UDP/relais. Au premier plan (ou VOX on), le récepteur active Telecom sur « début »,
+conserve au maximum 250 événements (environ cinq secondes de parole) pendant `OPENING`,
+joue toutes les frames dans l'ordre, puis traite « fin » et déconnecte l'appel Telecom
+lorsque plus aucune demande n'existe. En arrière-plan + VOX off, Activity ne réveille pas
+Telecom ; les frames audio sont décodées et jouées immédiatement en multimédia. Les paquets
+UDP reçus hors ordre attendent désormais leur séquence manquante au lieu de faire avancer
+artificiellement l'ACK.
 
 En mode VOX, l'appareil local conserve nécessairement Telecom actif pendant que VOX est
 activé afin de garder le microphone duplex disponible. Ce comportement résulte d'un choix
 explicite de l'utilisateur et peut réduire, interrompre ou rerouter la musique d'une autre
-application. En PTT, cet impact est borné à la présence de VoxCrew au premier plan et aux
-réceptions distantes en arrière-plan.
+application. En PTT, cet impact Telecom est borné à la présence de VoxCrew au premier plan ;
+en arrière-plan, seule la parole entrante prend un focus média transitoire.
 
 ## Politique d'endpoints
 

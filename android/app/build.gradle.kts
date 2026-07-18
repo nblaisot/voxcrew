@@ -32,6 +32,7 @@ android {
         versionName = "0.1.0"
 
         buildConfigField("String", "SIGNALING_BASE_URL", "\"$signalingBaseUrl\"")
+        buildConfigField("boolean", "NO_BACKEND", "true")
     }
 
     buildFeatures {

@@ -5,8 +5,14 @@ import kotlinx.coroutines.flow.StateFlow
 
 data class AuthUser(
     val uid: String,
-    val email: String?,
-)
+    val email: String? = null,
+    val displayName: String? = null,
+) {
+    val label: String
+        get() = displayName?.takeIf { it.isNotBlank() }
+            ?: email?.takeIf { it.isNotBlank() }
+            ?: uid
+}
 
 interface AuthRepository {
     val currentUser: StateFlow<AuthUser?>
@@ -15,4 +21,4 @@ interface AuthRepository {
     suspend fun getIdToken(forceRefresh: Boolean = false): Result<String>
 }
 
-fun FirebaseUser.toAuthUser(): AuthUser = AuthUser(uid = uid, email = email)
+fun FirebaseUser.toAuthUser(): AuthUser = AuthUser(uid = uid, email = email, displayName = displayName)

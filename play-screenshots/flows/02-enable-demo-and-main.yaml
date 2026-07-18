@@ -1,0 +1,46 @@
+appId: com.nblaisot.voxcrew
+---
+# Finish onboarding, enable demo mode via About easter egg, return to main roster.
+- hideKeyboard
+- extendedWaitUntil:
+    visible: "Continuer"
+    timeout: 10000
+- tapOn: "Continuer"
+- extendedWaitUntil:
+    visible: "Participants"
+    timeout: 20000
+- runFlow:
+    when:
+      visible: "Autoriser"
+    commands:
+      - tapOn: "Autoriser"
+- tapOn: "Menu"
+- tapOn: "À propos"
+- extendedWaitUntil:
+    visible:
+      id: "about_app_title"
+    timeout: 10000
+- tapOn:
+    id: "about_app_title"
+- tapOn:
+    id: "about_app_title"
+- tapOn:
+    id: "about_app_title"
+- tapOn:
+    id: "about_app_title"
+- tapOn:
+    id: "about_app_title"
+- tapOn:
+    id: "about_back"
+- extendedWaitUntil:
+    visible: "Marc"
+    timeout: 10000
+- extendedWaitUntil:
+    visible: "Anne"
+    timeout: 5000
+- extendedWaitUntil:
+    visible: "Quentin"
+    timeout: 5000
+- extendedWaitUntil:
+    visible: "Vox actif — en écoute"
+    timeout: 15000

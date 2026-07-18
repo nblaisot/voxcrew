@@ -46,3 +46,9 @@ render.experimental.xml
 # Log/OS
 *.log
 *.hprof
+
+# Play Store screenshot captures (generated)
+play-screenshots/out/
+# Maestro may also dump into CWD if run outside play-screenshots/out/
+/0*-*.png
+/android/0*-*.png

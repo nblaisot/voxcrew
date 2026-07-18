@@ -10,7 +10,7 @@ class VoxCrewApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        if (FirebaseApp.getApps(this).isEmpty()) {
+        if (!BuildConfig.NO_BACKEND && FirebaseApp.getApps(this).isEmpty()) {
             FirebaseApp.initializeApp(this)
         }
         container = AppContainer(this)

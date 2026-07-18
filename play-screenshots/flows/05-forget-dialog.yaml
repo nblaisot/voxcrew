@@ -1,0 +1,15 @@
+appId: com.nblaisot.voxcrew
+---
+# Long-press Quentin to show the forget confirmation dialog (do not confirm).
+- extendedWaitUntil:
+    visible:
+      id: "crew_quentin"
+    timeout: 10000
+- longPressOn:
+    id: "crew_quentin"
+- extendedWaitUntil:
+    visible: "Oublier Quentin ?"
+    timeout: 5000
+- extendedWaitUntil:
+    visible: "Annuler"
+    timeout: 3000

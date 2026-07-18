@@ -18,6 +18,16 @@ class CrewMemberDisplayTest {
     }
 
     @Test
+    fun `connected vpn path shows overlay availability`() {
+        val result = displayAvailability(
+            rosterAvailability = MemberAvailability.OFFLINE,
+            pathLabel = "VPN",
+            linkState = PeerLink.LinkState.Connected("peer-b", "VPN"),
+        )
+        assertEquals(MemberAvailability.ONLINE_OVERLAY, result)
+    }
+
+    @Test
     fun `connected local path shows wifi icon`() {
         val result = displayAvailability(
             rosterAvailability = MemberAvailability.OFFLINE,

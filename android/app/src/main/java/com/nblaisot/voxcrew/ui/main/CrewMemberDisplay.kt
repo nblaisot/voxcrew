@@ -16,6 +16,7 @@ internal fun displayAvailability(
     when (linkState) {
         is PeerLink.LinkState.Connected -> return when (pathLabel) {
             "Local" -> MemberAvailability.ONLINE_LOCAL
+            "VPN" -> MemberAvailability.ONLINE_OVERLAY
             else -> MemberAvailability.ONLINE_CLOUD
         }
         is PeerLink.LinkState.Disconnected -> return MemberAvailability.OFFLINE

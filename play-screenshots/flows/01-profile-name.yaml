@@ -1,0 +1,10 @@
+appId: com.nblaisot.voxcrew
+---
+# Leave onboarding visible with a display name typed (do not continue yet).
+- extendedWaitUntil:
+    visible: "Votre nom"
+    timeout: 15000
+- tapOn: "Votre nom"
+- eraseText
+- inputText: "Nicolas"
+- hideKeyboard

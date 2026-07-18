@@ -38,16 +38,30 @@ class MediaDemandStateTest {
     }
 
     @Test
-    fun `remote media activates Telecom in background until peer finishes`() {
+    fun `remote media does not activate Telecom in background when VOX is off`() {
         val state = readySession()
 
         assertTrue(state.setRemote("peer-a", true))
-        assertTrue(state.isDemanded())
+        assertFalse(state.isDemanded())
+        assertTrue(state.hasRemoteDemand())
         state.setRemote("peer-b", true)
         state.setRemote("peer-a", false)
-        assertTrue(state.isDemanded())
+        assertFalse(state.isDemanded())
+        assertTrue(state.hasRemoteDemand())
         state.setRemote("peer-b", false)
         assertFalse(state.isDemanded())
+        assertFalse(state.hasRemoteDemand())
+    }
+
+    @Test
+    fun `remote media while foreground still has Telecom from app visibility`() {
+        val state = readySession()
+        state.setAppForeground(true)
+        assertTrue(state.isDemanded())
+        state.setRemote("peer-a", true)
+        assertTrue(state.isDemanded())
+        state.setRemote("peer-a", false)
+        assertTrue(state.isDemanded())
     }
 
     @Test

@@ -60,10 +60,17 @@ internal class MediaDemandState {
     fun isDemanded(): Boolean = sessionActive &&
         microphonePermissionGranted &&
         pipelineUsable &&
-        (voxEnabled || appForeground || remotePeers.isNotEmpty())
+        (voxEnabled || appForeground)
 
     @Synchronized
     fun isOutbound(): Boolean = outbound
+
+    /**
+     * Tracks remote talkers for diagnostics / UI; does **not** keep Telecom alive in
+     * background+VOX-off (inbound uses [MediaInboundPlayer] instead).
+     */
+    @Synchronized
+    fun hasRemoteDemand(): Boolean = remotePeers.isNotEmpty()
 
     @Synchronized
     fun endSession() {

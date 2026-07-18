@@ -20,6 +20,10 @@ import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.audio.deviceAudioRouteChoice
 import com.nblaisot.voxcrew.audio.isConfirmedDuplexReady
 import com.nblaisot.voxcrew.auth.AuthRepository
+import com.nblaisot.voxcrew.auth.LocalProfileRepository
+import com.nblaisot.voxcrew.demo.DemoFixtures
+import com.nblaisot.voxcrew.demo.DemoModeStore
+import com.nblaisot.voxcrew.demo.DemoRosterPolicy
 import com.nblaisot.voxcrew.lanlink.LanIntercomEngine
 import com.nblaisot.voxcrew.lanlink.PeerMetrics
 import com.nblaisot.voxcrew.roster.CrewMember
@@ -34,7 +38,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 data class MainUiState(
-    val localEmail: String? = null,
+    val localDisplayName: String? = null,
     val statusMessage: String = "Recherche de coéquipiers…",
     val bannerMessage: String? = null,
     val showAudioRetry: Boolean = false,
@@ -66,10 +70,13 @@ data class MainUiState(
  */
 class MainViewModel(
     private val appContext: Context,
+    private val noBackend: Boolean,
     private val authRepository: AuthRepository,
-    private val signalingClient: SignalingClient,
+    private val localProfileRepository: LocalProfileRepository?,
+    private val signalingClient: SignalingClient?,
     private val rosterRepository: CrewRosterRepository,
     private val lanEngine: LanIntercomEngine,
+    private val demoModeStore: DemoModeStore,
 ) : ViewModel() {
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
@@ -78,11 +85,30 @@ class MainViewModel(
 
     init {
         viewModelScope.launch {
-            combine(authRepository.currentUser, rosterRepository.members) { user, crew -> user?.email to crew }
-                .collect { (email, crew) ->
-                    _uiState.update { it.copy(localEmail = email, crew = crew) }
-                    lanEngine.syncCrewPeers(crew.map { it.uid }.toSet())
+            combine(
+                authRepository.currentUser,
+                rosterRepository.members,
+                demoModeStore.enabled,
+                demoModeStore.demoMembers,
+            ) { user, crew, demoEnabled, demoMembers ->
+                val displayCrew = if (demoEnabled) {
+                    DemoRosterPolicy.mergeIntoCrew(crew, demoMembers)
+                } else {
+                    crew
                 }
+                Triple(user?.label, displayCrew, DemoRosterPolicy.realCrewUids(displayCrew.map { it.uid }.toSet()))
+            }.collect { (label, displayCrew, realUids) ->
+                _uiState.update { it.copy(localDisplayName = label, crew = displayCrew) }
+                lanEngine.syncCrewPeers(realUids)
+            }
+        }
+        viewModelScope.launch {
+            demoModeStore.enabled.collect { enabled ->
+                if (!enabled) return@collect
+                // Play Store fixtures: VOX on + earbuds so the PTT control shows the BT icon.
+                lanEngine.setVoxEnabled(true)
+                lanEngine.selectAudioRoute(DemoFixtures.audioRouteKey(DemoFixtures.EARBUDS_ID))
+            }
         }
         viewModelScope.launch {
             lanEngine.isTransmitting.collect { tx ->
@@ -125,19 +151,27 @@ class MainViewModel(
                 lanEngine.audioRoute,
                 lanEngine.audioPipelineState,
                 lanEngine.captureInputKind,
-                lanEngine.appForeground,
-            ) { selection, route, pipeline, input, appForeground ->
-                AudioUiSnapshot(selection, route, pipeline, input, appForeground)
+                combine(lanEngine.appForeground, demoModeStore.enabled) { foreground, demo ->
+                    foreground to demo
+                },
+            ) { selection, route, pipeline, input, foregroundAndDemo ->
+                val (appForeground, demoEnabled) = foregroundAndDemo
+                AudioUiSnapshot(selection, route, pipeline, input, appForeground, demoEnabled)
             }.collect { snapshot ->
                 val selection = snapshot.selection
                 val route = snapshot.route
                 val pipeline = snapshot.pipeline
                 val input = snapshot.input
                 val appForeground = snapshot.appForeground
-                val ready = isConfirmedDuplexReady(route, pipeline)
+                val demoEnabled = snapshot.demoEnabled
+                val demoRoute = DemoFixtures.isDemoAudioRouteKey(selection.selectedChoice.key)
+                val ready = isConfirmedDuplexReady(route, pipeline) || (demoEnabled && demoRoute)
                 val pipelineFailure = pipeline as? AudioPipelineState.Failed
                 val startAllowed = route.sessionIssue == null && pipelineFailure == null
-                val manualStatus = selection.status
+                val manualStatus = when {
+                    demoEnabled && demoRoute -> ManualRouteStatus.CONFIRMED
+                    else -> selection.status
+                }
                 val confirmedChoice = selection.availableChoices.firstOrNull { choice ->
                     if (choice.key == DEVICE_AUDIO_ROUTE_KEY) {
                         route.currentEndpoint?.type == CallEndpointCompat.TYPE_SPEAKER
@@ -146,10 +180,20 @@ class MainViewModel(
                     }
                 }
                 val displayedInput = when {
+                    demoEnabled && demoRoute -> selection.selectedChoice.inputKind
                     ready -> input
                     route.currentEndpoint != null -> confirmedChoice?.inputKind ?: route.micKind
                     else -> selection.selectedChoice.inputKind
                 }
+                val rawBanner = route.sessionIssue?.toUserMessage()
+                    ?: pipelineFailure?.let { failure ->
+                        "Audio indisponible : ${failure.reason}"
+                    }
+                    ?: manualStatus.toUserMessage(
+                        selectedName = selection.selectedChoice.name,
+                        currentName = route.currentEndpoint?.name,
+                        errorCode = selection.errorCode,
+                    )
                 _uiState.update {
                     it.copy(
                         audioRouteChoices = selection.availableChoices,
@@ -165,16 +209,10 @@ class MainViewModel(
                         pttMicIconKind = displayedInput,
                         audioRouteReady = ready,
                         audioStartAllowed = startAllowed,
-                        bannerMessage = route.sessionIssue?.toUserMessage()
-                            ?: pipelineFailure?.let { failure ->
-                                "Audio indisponible : ${failure.reason}"
-                            }
-                            ?: manualStatus.toUserMessage(
-                                selectedName = selection.selectedChoice.name,
-                                currentName = route.currentEndpoint?.name,
-                                errorCode = selection.errorCode,
-                            ),
-                        showAudioRetry = route.sessionIssue != null || pipelineFailure != null,
+                        // Demo fixtures must not show Telecom "unavailable" / pipeline banners.
+                        bannerMessage = if (demoEnabled) null else rawBanner,
+                        showAudioRetry = !demoEnabled &&
+                            (route.sessionIssue != null || pipelineFailure != null),
                     ).withPttEnabled()
                 }
             }
@@ -226,12 +264,13 @@ class MainViewModel(
         if (intercomStarted) return
         intercomStarted = true
         startForegroundIfAllowed()
-        runCatching { signalingClient.connect() }
+        if (!noBackend) {
+            runCatching { signalingClient?.connect() }
+        }
         viewModelScope.launch {
             val user = authRepository.currentUser.value ?: return@launch
-            val uid = user.uid
-            rosterRepository.start(uid, user.email)
-            lanEngine.start(uid, user.email?.takeIf { it.isNotBlank() } ?: uid)
+            rosterRepository.start(user.uid, user.label)
+            lanEngine.start(user.uid, user.label)
         }
     }
 
@@ -313,12 +352,30 @@ class MainViewModel(
 
     fun toggleRecipient(member: CrewMember) {
         if (member.isSelf) return
+        if (DemoFixtures.isDemoUid(member.uid)) {
+            demoModeStore.toggleRecipient(member.uid)
+            return
+        }
         lanEngine.toggleRecipient(member.uid)
     }
 
     fun soloRecipient(member: CrewMember) {
         if (member.isSelf) return
+        if (DemoFixtures.isDemoUid(member.uid)) {
+            demoModeStore.soloRecipient(member.uid)
+            return
+        }
         lanEngine.soloRecipient(member.uid)
+    }
+
+    fun forgetMember(member: CrewMember) {
+        if (member.isSelf) return
+        if (DemoFixtures.isDemoUid(member.uid)) {
+            demoModeStore.forgetMember(member.uid)
+            return
+        }
+        lanEngine.removeRecipient(member.uid)
+        rosterRepository.forgetMember(member.uid)
     }
 
     fun setVoxEnabled(enabled: Boolean) {
@@ -341,15 +398,21 @@ class MainViewModel(
     }
 
     fun signOut() {
-        signalingClient.disconnect()
+        signalingClient?.disconnect()
         lanEngine.releaseAudioSession()
         rosterRepository.stop()
         SessionForegroundService.stop(appContext)
-        viewModelScope.launch { authRepository.signOut() }
+        viewModelScope.launch {
+            if (noBackend) {
+                localProfileRepository?.signOut()
+            } else {
+                authRepository.signOut()
+            }
+        }
     }
 
     fun quitApplication() {
-        signalingClient.disconnect()
+        signalingClient?.disconnect()
         lanEngine.shutdown()
         rosterRepository.stop()
         SessionForegroundService.stop(appContext)
@@ -394,6 +457,7 @@ private data class AudioUiSnapshot(
     val pipeline: AudioPipelineState,
     val input: CaptureInputKind,
     val appForeground: Boolean,
+    val demoEnabled: Boolean = false,
 )
 
 internal fun computePttEnabled(

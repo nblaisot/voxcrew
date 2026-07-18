@@ -18,12 +18,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.platform.LocalConfiguration
 import android.Manifest
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -39,6 +41,7 @@ import androidx.compose.material.icons.filled.Headset
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Usb
+import androidx.compose.material.icons.filled.VpnLock
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -76,6 +79,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -101,6 +105,7 @@ import kotlin.math.roundToInt
 @Composable
 fun MainScreen(
     viewModel: MainViewModel,
+    noBackend: Boolean = false,
     onNavigateToAbout: () -> Unit,
     onSignOut: () -> Unit,
     onQuitApplication: () -> Unit,
@@ -108,8 +113,11 @@ fun MainScreen(
     val state by viewModel.uiState.collectAsState()
     val haptic = LocalHapticFeedback.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val landscape = LocalConfiguration.current.orientation ==
+        android.content.res.Configuration.ORIENTATION_LANDSCAPE
     var menuExpanded by remember { mutableStateOf(false) }
     var audioMenuExpanded by remember { mutableStateOf(false) }
+    var memberPendingForget by remember { mutableStateOf<CrewMember?>(null) }
 
     RequestAppPermissions(onResult = viewModel::onPermissionsResult)
 
@@ -167,11 +175,37 @@ fun MainScreen(
         )
     }
 
+    memberPendingForget?.let { member ->
+        AlertDialog(
+            onDismissRequest = { memberPendingForget = null },
+            title = { Text("Oublier ${member.displayName} ?") },
+            text = { Text("Il réapparaîtra s’il est à proximité.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.forgetMember(member)
+                        memberPendingForget = null
+                    },
+                ) {
+                    Text("Oublier")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { memberPendingForget = null }) {
+                    Text("Annuler")
+                }
+            },
+        )
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 navigationIcon = {
-                    IconButton(onClick = { menuExpanded = true }) {
+                    IconButton(
+                        onClick = { menuExpanded = true },
+                        modifier = Modifier.testTag("main_menu"),
+                    ) {
                         Icon(Icons.Filled.Menu, contentDescription = "Menu")
                     }
                     DropdownMenu(
@@ -186,7 +220,7 @@ fun MainScreen(
                             },
                         )
                         DropdownMenuItem(
-                            text = { Text("Déconnexion") },
+                            text = { Text(if (noBackend) "Changer de nom" else "Déconnexion") },
                             onClick = {
                                 menuExpanded = false
                                 viewModel.signOut()
@@ -225,6 +259,7 @@ fun MainScreen(
                     IconButton(
                         enabled = routeMenuEnabled,
                         onClick = { audioMenuExpanded = true },
+                        modifier = Modifier.testTag("main_audio_route"),
                     ) {
                         Icon(
                             imageVector = audioRouteIcon(state.pttMicIconKind),
@@ -296,15 +331,20 @@ fun MainScreen(
                 color = MaterialTheme.colorScheme.primary,
             )
             Text(
-                "Toucher pour activer/désactiver · Appui long = envoi privé",
+                "Toucher = inclure/muet · Double tap = solo · Appui long = oublier",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            LazyColumn(
-                modifier = Modifier.weight(1f),
+            // Column (not LazyColumn): MVP crews are small, and landscape tablets
+            // otherwise only compose ~1 row above the PTT — demo peers vanish from a11y.
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 220.dp)
+                    .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                items(state.crew, key = { it.uid }) { member ->
+                state.crew.forEach { member ->
                     val metrics = state.peerMetrics[member.uid]
                     CrewMemberRow(
                         member = member,
@@ -314,7 +354,8 @@ fun MainScreen(
                         linkState = metrics?.linkState,
                         backlogMs = metrics?.backlogMs?.takeIf { it > 0L },
                         onClick = { viewModel.toggleRecipient(member) },
-                        onLongClick = { viewModel.soloRecipient(member) },
+                        onDoubleClick = { viewModel.soloRecipient(member) },
+                        onLongClick = { memberPendingForget = member },
                     )
                 }
             }
@@ -328,6 +369,7 @@ fun MainScreen(
                 Switch(
                     checked = state.voxEnabled,
                     onCheckedChange = viewModel::setVoxEnabled,
+                    modifier = Modifier.testTag("main_vox_switch"),
                     colors = SwitchDefaults.colors(
                         checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
                         checkedTrackColor = MaterialTheme.colorScheme.primary,
@@ -336,7 +378,7 @@ fun MainScreen(
                     ),
                 )
             }
-            if (state.voxEnabled) {
+            if (state.voxEnabled && !landscape) {
                 VoxSensitivitySlider(
                     sensitivity = state.voxSensitivity,
                     onSensitivityChange = viewModel::setVoxSensitivity,
@@ -361,9 +403,10 @@ fun MainScreen(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(140.dp)
+                    .height(if (landscape) 64.dp else 140.dp)
                     .clip(RoundedCornerShape(16.dp))
                     .background(pttColor)
+                    .testTag("main_ptt")
                     .pointerInput(state.pttEnabled) {
                         if (!state.pttEnabled) return@pointerInput
                         detectTapGestures(
@@ -477,6 +520,7 @@ private fun CrewMemberRow(
     linkState: PeerLink.LinkState?,
     backlogMs: Long?,
     onClick: () -> Unit,
+    onDoubleClick: () -> Unit,
     onLongClick: () -> Unit,
 ) {
     val inactiveAlpha = if (member.isActiveRecipient) 1f else 0.45f
@@ -498,8 +542,10 @@ private fun CrewMemberRow(
     Card(
         modifier = Modifier
             .fillMaxWidth()
+            .testTag("crew_${member.displayName.lowercase()}")
             .combinedClickable(
                 onClick = onClick,
+                onDoubleClick = onDoubleClick,
                 onLongClick = onLongClick,
             ),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -517,7 +563,11 @@ private fun CrewMemberRow(
                 ) {
                     Icon(
                         imageVector = Icons.Filled.CheckCircle,
-                        contentDescription = if (member.isActiveRecipient) "Destinataire actif" else "Destinataire inactif",
+                        contentDescription = if (member.isActiveRecipient) {
+                            "Inclus dans le groupe"
+                        } else {
+                            "Muet (non inclus)"
+                        },
                         tint = if (member.isActiveRecipient) {
                             MaterialTheme.colorScheme.primary
                         } else {
@@ -532,7 +582,7 @@ private fun CrewMemberRow(
                     )
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = member.email,
+                            text = member.displayName,
                             style = MaterialTheme.typography.bodyLarge,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -611,6 +661,7 @@ private fun AvailabilityIcon(
 ) {
     val (icon, tint, desc) = when (availability) {
         MemberAvailability.ONLINE_LOCAL -> Triple(Icons.Filled.Wifi, MaterialTheme.colorScheme.primary, "Local")
+        MemberAvailability.ONLINE_OVERLAY -> Triple(Icons.Filled.VpnLock, MaterialTheme.colorScheme.secondary, "VPN")
         MemberAvailability.ONLINE_CLOUD -> Triple(Icons.Filled.Cloud, MaterialTheme.colorScheme.tertiary, "Cloud")
         MemberAvailability.OFFLINE -> Triple(Icons.Filled.CloudOff, MaterialTheme.colorScheme.onSurfaceVariant, "Hors ligne")
     }
