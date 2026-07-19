@@ -15,7 +15,6 @@ object AppPermissions {
         add(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             add(Manifest.permission.POST_NOTIFICATIONS)
-            add(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
     }
 }
