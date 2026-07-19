@@ -1,44 +1,20 @@
 # Roadmap VoxCrew
 
-## MVP (en cours)
+Produit actuel : intercom LAN (+ Tailscale optionnel), identité locale, PTT/VOX.
 
-- [x] Documentation et conventions
-- [x] Backend signaling local + Docker
-- [ ] GCP / Firebase (configuration manuelle — voir docs/gcp-setup.md)
-- [x] Terraform + scripts déploiement Cloud Run
-- [x] Android scaffold Compose
-- [x] Client signaling authentifié
-- [x] Intercom LAN (UDP beacon + TCP Opus)
-- [x] Repli cloud (hole punching UDP + relais WebSocket)
-- [x] Push-to-talk et Vox (interfaces)
-- [x] Vox — détection de voix réelle (Silero VAD, curseur de sensibilité)
-- [x] Foreground service
-- [x] CI GitHub
-- [ ] Validation terrain Galaxy réels (local ↔ cloud)
-- [ ] Validation terrain Vox en extérieur (vent, bruit ambiant)
+## Fait
 
-## Post-MVP proche
+- [x] Découverte UDP + audio TCP Opus
+- [x] Mesh multi-équipiers (inclusion / solo / oubli)
+- [x] Jetpack Telecom + routes audio
+- [x] Foreground service session
+- [x] Silero VAD (VOX)
+- [x] Localisation EN / FR
+- [x] Retrait backend cloud (signaling / Firebase / Cloud Run)
 
-- Reconnexion robuste après changement réseau
-- 3+ participants
-- Chiffrement applicatif LAN (évaluer)
-- Workload Identity Federation pour CI deploy
+## Pistes
 
-## Moyen terme
-
-- Profils audio (vent, extérieur)
-- Wear OS (exploration)
-- Gestion groupes / invitations
-
-## Long terme
-
-- SFU pour grands groupes
-- Reconnaissance locuteur (hors scope actuel)
-- Whisper / transcription (opt-in explicite uniquement)
-- Publication Play Store (si un jour public)
-
-## Hors scope permanent (sauf décision produit)
-
-- Enregistrement conversations par défaut
-- Stockage audio cloud
-- OpenClaw / assistants vocaux intégrés
+- [ ] Validation terrain outdoor (VOX, Bluetooth, écran éteint)
+- [ ] Améliorations UX roster / feedback audio
+- [ ] Packaging Play Store (Data safety, captures)
+- [ ] Évaluer chiffrement de lien si besoin hors réseau de confiance

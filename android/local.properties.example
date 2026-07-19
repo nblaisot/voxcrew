@@ -1,2 +1,2 @@
-# Copy to android/local.properties (gitignored) to override defaults.
-# SIGNALING_BASE_URL=https://voxcrew-signaling-xxxxx-ew.a.run.app
+# Copy to android/local.properties (gitignored) if you need local SDK overrides.
+# sdk.dir=/path/to/Android/sdk

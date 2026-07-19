@@ -6,20 +6,6 @@ plugins {
     alias(libs.plugins.aboutlibraries.plugin.android)
 }
 
-import java.util.Properties
-
-if (file("google-services.json").exists()) {
-    apply(plugin = "com.google.gms.google-services")
-}
-
-val localProperties = Properties()
-val localPropertiesFile = rootProject.file("local.properties")
-if (localPropertiesFile.exists()) {
-    localPropertiesFile.inputStream().use { localProperties.load(it) }
-}
-val signalingBaseUrl = localProperties.getProperty("SIGNALING_BASE_URL")
-    ?: "https://voxcrew-signaling-PLACEHOLDER.run.app"
-
 android {
     namespace = "com.nblaisot.voxcrew"
     compileSdk = 36
@@ -30,9 +16,6 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
-
-        buildConfigField("String", "SIGNALING_BASE_URL", "\"$signalingBaseUrl\"")
-        buildConfigField("boolean", "NO_BACKEND", "true")
     }
 
     buildFeatures {
@@ -79,9 +62,6 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
-    implementation(libs.okhttp)
-    implementation(platform(libs.firebase.bom))
-    implementation(libs.firebase.auth.ktx)
     implementation(libs.concentus)
     // Silero VAD (ONNX Runtime Mobile) — neural voice-activity detection for VOX, chosen
     // over an RMS/energy gate or WebRTC's GMM VAD for robustness to outdoor noise (wind,

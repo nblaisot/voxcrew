@@ -7,7 +7,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
 
 /**
- * Device-local identity for the no-backend flavor: stable random UID and user-chosen display name.
+ * Device-local identity: stable random UID and user-chosen display name.
  */
 class LocalProfileRepository(context: Context) : AuthRepository {
     private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -46,9 +46,6 @@ class LocalProfileRepository(context: Context) : AuthRepository {
         prefs.edit().clear().apply()
         _currentUser.value = null
     }
-
-    override suspend fun getIdToken(forceRefresh: Boolean): Result<String> =
-        Result.failure(UnsupportedOperationException("No cloud auth in local profile mode"))
 
     private fun loadUser(): AuthUser? {
         val uid = prefs.getString(KEY_UID, null) ?: return null

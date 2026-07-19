@@ -3,7 +3,6 @@ package com.nblaisot.voxcrew.roster
 enum class MemberAvailability {
     ONLINE_LOCAL,
     ONLINE_OVERLAY,
-    ONLINE_CLOUD,
     OFFLINE,
 }
 

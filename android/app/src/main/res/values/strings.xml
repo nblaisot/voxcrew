@@ -14,7 +14,6 @@
     <string name="menu_about">About</string>
     <string name="menu_quit">QUIT</string>
     <string name="menu_change_name">Change name</string>
-    <string name="menu_sign_out">Sign out</string>
     <string name="menu_content_description">Menu</string>
     <string name="about_title">About</string>
     <string name="about_intro">This app uses open-source software.</string>
@@ -22,12 +21,6 @@
     <string name="about_version">Version %1$s</string>
     <string name="demo_mode_enabled">Demo mode enabled</string>
     <string name="demo_mode_disabled">Demo mode disabled</string>
-
-    <!-- Login -->
-    <string name="login_email">Email</string>
-    <string name="login_password">Password</string>
-    <string name="login_sign_in">Sign in</string>
-    <string name="login_error_credentials_required">Email and password required</string>
 
     <!-- Profile -->
     <string name="profile_subtitle">Choose a name visible to nearby crewmates.</string>
@@ -76,9 +69,6 @@
     <string name="audio_route_this_device">This device</string>
     <string name="path_local">Local</string>
     <string name="path_vpn">VPN</string>
-    <string name="path_cloud">Cloud</string>
-    <string name="path_direct_internet">Direct internet</string>
-    <string name="path_cloud_relay">Cloud relay</string>
     <string name="another_output">another output</string>
 
     <!-- Audio / route banners -->
@@ -109,15 +99,4 @@
         <item quantity="one">%d connected</item>
         <item quantity="other">%d connected</item>
     </plurals>
-
-    <!-- Signaling / cloud errors -->
-    <string name="signaling_cloud_unavailable">Cloud unavailable — local mode if possible</string>
-    <string name="signaling_not_allowed">Account not authorized on the server</string>
-    <string name="signaling_session_expired">Session expired — sign in again</string>
-    <string name="signaling_auth_rejected">Authentication rejected — sign in again</string>
-    <string name="signaling_timeout">Connection timed out</string>
-    <string name="signaling_protocol_error">Protocol error — reconnecting…</string>
-    <string name="signaling_not_connected">Not connected — sign in again</string>
-    <string name="signaling_disconnected">Signaling disconnected — reconnecting…</string>
-    <string name="signaling_connection_failed">Unable to connect</string>
 </resources>

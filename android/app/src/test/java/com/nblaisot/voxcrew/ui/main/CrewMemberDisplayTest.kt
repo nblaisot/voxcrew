@@ -9,16 +9,6 @@ import org.junit.Test
 class CrewMemberDisplayTest {
 
     @Test
-    fun `connected relay path shows active cloud even when roster says offline`() {
-        val result = displayAvailability(
-            rosterAvailability = MemberAvailability.OFFLINE,
-            pathLabel = PathLabels.CLOUD_RELAY,
-            linkState = PeerLink.LinkState.Connected("peer-b", PathLabels.CLOUD_RELAY),
-        )
-        assertEquals(MemberAvailability.ONLINE_CLOUD, result)
-    }
-
-    @Test
     fun `connected vpn path shows overlay availability`() {
         val result = displayAvailability(
             rosterAvailability = MemberAvailability.OFFLINE,
@@ -34,6 +24,16 @@ class CrewMemberDisplayTest {
             rosterAvailability = MemberAvailability.OFFLINE,
             pathLabel = PathLabels.LOCAL,
             linkState = PeerLink.LinkState.Connected("peer-b", PathLabels.LOCAL),
+        )
+        assertEquals(MemberAvailability.ONLINE_LOCAL, result)
+    }
+
+    @Test
+    fun `unknown connected path defaults to local`() {
+        val result = displayAvailability(
+            rosterAvailability = MemberAvailability.OFFLINE,
+            pathLabel = "something-else",
+            linkState = PeerLink.LinkState.Connected("peer-b", "something-else"),
         )
         assertEquals(MemberAvailability.ONLINE_LOCAL, result)
     }
@@ -61,7 +61,7 @@ class CrewMemberDisplayTest {
     @Test
     fun `connecting link state does not inherit roster online hint`() {
         val result = displayAvailability(
-            rosterAvailability = MemberAvailability.ONLINE_CLOUD,
+            rosterAvailability = MemberAvailability.ONLINE_OVERLAY,
             pathLabel = null,
             linkState = PeerLink.LinkState.Connecting("peer-b"),
         )

@@ -34,7 +34,6 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Headset
@@ -106,7 +105,6 @@ import kotlin.math.roundToInt
 @Composable
 fun MainScreen(
     viewModel: MainViewModel,
-    noBackend: Boolean = false,
     onNavigateToAbout: () -> Unit,
     onSignOut: () -> Unit,
     onQuitApplication: () -> Unit,
@@ -226,12 +224,7 @@ fun MainScreen(
                         )
                         DropdownMenuItem(
                             text = {
-                                Text(
-                                    stringResource(
-                                        if (noBackend) R.string.menu_change_name
-                                        else R.string.menu_sign_out,
-                                    ),
-                                )
+                                Text(stringResource(R.string.menu_change_name))
                             },
                             onClick = {
                                 menuExpanded = false
@@ -678,8 +671,6 @@ private fun audioShimmerBrush(): Brush {
 private fun localizedPathLabel(pathLabel: String): String = when (pathLabel) {
     PathLabels.LOCAL -> stringResource(R.string.path_local)
     PathLabels.VPN -> stringResource(R.string.path_vpn)
-    PathLabels.DIRECT_INTERNET -> stringResource(R.string.path_direct_internet)
-    PathLabels.CLOUD_RELAY -> stringResource(R.string.path_cloud_relay)
     else -> pathLabel
 }
 
@@ -699,11 +690,6 @@ private fun AvailabilityIcon(
             Icons.Filled.VpnLock,
             MaterialTheme.colorScheme.secondary,
             stringResource(R.string.path_vpn),
-        )
-        MemberAvailability.ONLINE_CLOUD -> Triple(
-            Icons.Filled.Cloud,
-            MaterialTheme.colorScheme.tertiary,
-            stringResource(R.string.path_cloud),
         )
         MemberAvailability.OFFLINE -> Triple(
             Icons.Filled.CloudOff,
