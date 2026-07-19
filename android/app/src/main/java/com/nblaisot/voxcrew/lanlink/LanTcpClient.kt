@@ -34,9 +34,9 @@ class LanTcpClient(
         get() {
             val peer = targetPeer
             return when {
-                peer?.viaOverlay == true -> "VPN"
-                peer != null && TailscaleInterface.isTailscaleAddress(peer.host) -> "VPN"
-                else -> "Local"
+                peer?.viaOverlay == true -> PathLabels.VPN
+                peer != null && TailscaleInterface.isTailscaleAddress(peer.host) -> PathLabels.VPN
+                else -> PathLabels.LOCAL
             }
         }
 
@@ -54,7 +54,7 @@ class LanTcpClient(
 
     fun hasHealthyLocalSession(): Boolean {
         val s = session
-        return s != null && !s.closed && label == "Local"
+        return s != null && !s.closed && label == PathLabels.LOCAL
     }
 
     fun hasStandbyReady(): Boolean =

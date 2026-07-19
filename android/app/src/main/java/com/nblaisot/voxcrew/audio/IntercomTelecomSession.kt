@@ -54,7 +54,8 @@ class IntercomTelecomSession(
         AndroidAudioPermissionChecker(context.applicationContext),
     private val demoModeStore: DemoModeStore? = null,
 ) {
-    private val audioManager = context.applicationContext.getSystemService(AudioManager::class.java)
+    private val appContext = context.applicationContext
+    private val audioManager = appContext.getSystemService(AudioManager::class.java)
     private val lifecycleLock = Any()
     private val activationMutex = Mutex()
     private var endpointCatalogJob: Job? = null
@@ -533,6 +534,7 @@ class IntercomTelecomSession(
         val choices = buildAudioRouteChoices(
             endpoints = withDemo,
             usbProductNames = connectedUsbProductNames(),
+            deviceRouteName = appContext.getString(com.nblaisot.voxcrew.R.string.audio_route_this_device),
         )
         val previous = _routeSelection.value
         val preferredDemo = if (demoOn) {
@@ -671,6 +673,7 @@ internal class TelecomSessionGenerationArbiter {
 internal fun buildAudioRouteChoices(
     endpoints: List<TelecomEndpoint>,
     usbProductNames: Set<String> = emptySet(),
+    deviceRouteName: String = "This device",
 ): List<AudioRouteChoice> {
     val speaker = endpoints.firstOrNull { it.type == CallEndpointCompat.TYPE_SPEAKER }
     val wiredEndpoints = endpoints.filter { it.type == CallEndpointCompat.TYPE_WIRED_HEADSET }
@@ -698,7 +701,7 @@ internal fun buildAudioRouteChoices(
             endpointType = endpoint.type,
         )
     }.sortedWith(compareBy<AudioRouteChoice>({ it.inputKind.routeOrder() }, { it.name.lowercase() }))
-    return listOf(deviceAudioRouteChoice(speaker?.identifier)) + accessories
+    return listOf(deviceAudioRouteChoice(speaker?.identifier, deviceRouteName)) + accessories
 }
 
 internal fun selectedAudioRouteChoice(

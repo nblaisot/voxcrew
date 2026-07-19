@@ -38,14 +38,22 @@ fun VoxCrewNavHost(
             composable(Routes.PROFILE) {
                 val repo = container.localProfileRepository
                     ?: error("Local profile repository required in no-backend mode")
-                val vm: ProfileViewModel = viewModel(factory = simpleFactory { ProfileViewModel(repo) })
+                val appContext = LocalContext.current.applicationContext
+                val vm: ProfileViewModel = viewModel(
+                    factory = simpleFactory { ProfileViewModel(appContext, repo) },
+                )
                 ProfileScreen(vm) {
                     navController.navigate(Routes.MAIN) { popUpTo(Routes.PROFILE) { inclusive = true } }
                 }
             }
         } else {
             composable(Routes.LOGIN) {
-                val vm: LoginViewModel = viewModel(factory = simpleFactory { LoginViewModel(container.authRepository) })
+                val appContext = LocalContext.current.applicationContext
+                val vm: LoginViewModel = viewModel(
+                    factory = simpleFactory {
+                        LoginViewModel(appContext, container.authRepository)
+                    },
+                )
                 LoginScreen(vm) {
                     navController.navigate(Routes.MAIN) { popUpTo(Routes.LOGIN) { inclusive = true } }
                 }

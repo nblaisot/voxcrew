@@ -1,0 +1,20 @@
+appId: com.nblaisot.voxcrew
+---
+- launchApp:
+    clearState: true
+    arguments:
+      locale: "en-US"
+- extendedWaitUntil:
+    visible: "Choose a name visible to nearby crewmates."
+    timeout: 30000
+- tapOn:
+    id: "profile_name_field"
+- eraseText
+- inputText: "Nicolas"
+- hideKeyboard
+- takeScreenshot: 01-profile-name_US
+- tapOn:
+    id: "profile_continue"
+- extendedWaitUntil:
+    visible: "Participants"
+    timeout: 20000

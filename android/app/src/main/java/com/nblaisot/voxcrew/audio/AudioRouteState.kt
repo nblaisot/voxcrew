@@ -45,10 +45,13 @@ data class AudioRouteSelectionState(
     val errorCode: Int? = null,
 )
 
-fun deviceAudioRouteChoice(endpointIdentifier: String? = null): AudioRouteChoice =
+fun deviceAudioRouteChoice(
+    endpointIdentifier: String? = null,
+    name: String = "This device",
+): AudioRouteChoice =
     AudioRouteChoice(
         key = DEVICE_AUDIO_ROUTE_KEY,
-        name = "Cet appareil",
+        name = name,
         inputKind = CaptureInputKind.BUILTIN,
         target = AudioRouteTarget.DEVICE,
         endpointIdentifier = endpointIdentifier,

@@ -22,6 +22,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.nblaisot.voxcrew.R
@@ -41,12 +42,12 @@ fun LoginScreen(viewModel: LoginViewModel, onLoggedIn: () -> Unit) {
     ) {
         Image(
             painter = painterResource(R.drawable.logo_voxcrew),
-            contentDescription = "VoxCrew",
+            contentDescription = stringResource(R.string.app_name),
             modifier = Modifier.size(180.dp),
         )
         Spacer(modifier = Modifier.height(16.dp))
         Text(
-            text = "VoxCrew",
+            text = stringResource(R.string.app_name),
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.primary,
@@ -55,7 +56,7 @@ fun LoginScreen(viewModel: LoginViewModel, onLoggedIn: () -> Unit) {
         OutlinedTextField(
             value = state.email,
             onValueChange = viewModel::onEmailChange,
-            label = { Text("Email") },
+            label = { Text(stringResource(R.string.login_email)) },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
             colors = OutlinedTextFieldDefaults.colors(
@@ -67,7 +68,7 @@ fun LoginScreen(viewModel: LoginViewModel, onLoggedIn: () -> Unit) {
         OutlinedTextField(
             value = state.password,
             onValueChange = viewModel::onPasswordChange,
-            label = { Text("Mot de passe") },
+            label = { Text(stringResource(R.string.login_password)) },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
             colors = OutlinedTextFieldDefaults.colors(
@@ -99,7 +100,7 @@ fun LoginScreen(viewModel: LoginViewModel, onLoggedIn: () -> Unit) {
                     strokeWidth = 2.dp,
                 )
             } else {
-                Text("Connexion")
+                Text(stringResource(R.string.login_sign_in))
             }
         }
     }

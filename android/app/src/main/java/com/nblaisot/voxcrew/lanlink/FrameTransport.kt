@@ -10,7 +10,7 @@ package com.nblaisot.voxcrew.lanlink
  * [sendFrame].
  */
 interface FrameTransport {
-    /** Human-readable path name surfaced in the UI, e.g. "Local", "Internet direct", "Relais". */
+    /** Locale-independent path token surfaced in the UI, e.g. [PathLabels.LOCAL]. */
     val label: String
 
     /**

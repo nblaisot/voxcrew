@@ -1,5 +1,6 @@
 package com.nblaisot.voxcrew.ui.main
 
+import com.nblaisot.voxcrew.lanlink.PathLabels
 import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.roster.MemberAvailability
 
@@ -15,8 +16,8 @@ internal fun displayAvailability(
 ): MemberAvailability {
     when (linkState) {
         is PeerLink.LinkState.Connected -> return when (pathLabel) {
-            "Local" -> MemberAvailability.ONLINE_LOCAL
-            "VPN" -> MemberAvailability.ONLINE_OVERLAY
+            PathLabels.LOCAL -> MemberAvailability.ONLINE_LOCAL
+            PathLabels.VPN -> MemberAvailability.ONLINE_OVERLAY
             else -> MemberAvailability.ONLINE_CLOUD
         }
         is PeerLink.LinkState.Disconnected -> return MemberAvailability.OFFLINE
