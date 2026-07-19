@@ -1,68 +1,41 @@
 # VoxCrew
 
-Application Android privée de communication vocale de groupe pour activités extérieures (ski, gyroroue, randonnée, vélo). Expérience type intercom : session vocale persistante, micro transmis selon une politique locale (PTT, VAD future, ou micro ouvert).
+Application Android privée de communication vocale de groupe pour activités extérieures (ski, gyroroue, randonnée, vélo). Expérience type intercom : session vocale persistante, micro transmis selon une politique locale (PTT, VOX/VAD, ou micro ouvert).
 
-## Architecture (MVP)
+## Architecture
 
-- **Mode local (priorité)** : intercom LAN direct entre participants — découverte par broadcast UDP, audio sur socket TCP. Aucun signaling, aucun transit par le backend tant que le LAN fonctionne. Voir [Mode local (LAN intercom)](#mode-local-lan-intercom) ci-dessous.
-- **Repli cloud (fallback)** : quand le LAN est indisponible ou se dégrade, le même protocole (`PeerLink`) bascule sur un chemin assisté par le backend — hole punching UDP (STUN + rendez-vous via WebSocket) puis, en dernier recours, relais WebSocket binaire. Le backend ne relaie jamais l'audio en clair sauf sur ce dernier chemin, et uniquement des trames opaques (non stockées, non parsées). Voir [Repli cloud](#repli-cloud-fallback) ci-dessous.
-- **Backend** : Node.js / TypeScript / Fastify sur Google Cloud Run — signaling WebSocket, auth Firebase, présence, rendez-vous P2P (`p2p_connect_request`/`p2p_endpoints`) et relais binaire pour le repli cloud.
-- **Android** : Kotlin, Jetpack Compose, Firebase Authentication, sockets TCP/UDP natifs + codec Opus pour le mode local et le repli cloud.
+- **LAN d’abord** : intercom direct entre participants — découverte par broadcast UDP, audio Opus sur socket TCP. Aucun serveur, aucun compte cloud.
+- **Overlay Tailscale (optionnel)** : si un équipier n’est plus visible en LAN mais annonce une adresse overlay, bascule TCP sur le VPN (chemin « VPN » dans l’UI).
+- **Identité locale** : UUID stable + nom d’affichage choisis sur l’appareil (`LocalProfileRepository`).
+- **Android** : Kotlin, Jetpack Compose, sockets TCP/UDP natifs, codec Opus, Jetpack Telecom pour le routage audio.
 
 ```
-LAN (priorité) :
-Galaxy A <== UDP beacon (découverte) + TCP audio Opus (LAN/hotspot) ==> Galaxy B
-
-Repli cloud (si LAN indisponible ou dégradé) :
-Galaxy A <== UDP hole-punch (STUN) ==> Galaxy B         [1er repli]
-Galaxy A <====== relais WebSocket (Cloud Run) ======> Galaxy B   [dernier recours]
-     \                                              /
-      \---- WSS signaling + rendez-vous (Cloud Run) ----/
+Galaxy A <== UDP beacon (découverte) + TCP audio Opus (LAN / hotspot / Tailscale) ==> Galaxy B
 ```
 
 ## Mode local (LAN intercom)
 
-Le mode local a été reconstruit autour d'un principe simple : **préserver la qualité et la complétude de l'audio avant la latence**, façon « téléchargement progressif ». Le détail est dans [android/app/src/main/java/com/nblaisot/voxcrew/lanlink/](android/app/src/main/java/com/nblaisot/voxcrew/lanlink/) :
+Détail dans [android/app/src/main/java/com/nblaisot/voxcrew/lanlink/](android/app/src/main/java/com/nblaisot/voxcrew/lanlink/) :
 
-- **Découverte** : `LanBeacon` diffuse un identifiant (`uid`, nom, port TCP) en broadcast UDP (port `47100`) toutes les 2 s, et écoute les mêmes annonces. Fonctionne aussi bien entre deux appareils sur le même Wi-Fi qu'en hotspot (l'appareil hotspot et l'appareil connecté partagent le même domaine de broadcast).
-- **Protocole transport-agnostique** : `PeerLink` porte la logique de protocole (numéros de séquence, `SendBuffer`, RTT, backlog) indépendamment du transport ; `FrameTransport` est l'interface implémentée par `LanTcpTransport` (LAN), `UdpP2pTransport` (repli cloud, hole punching) et `RelayTransport` (repli cloud, relais WebSocket) — un seul espace de séquence survit à chaque changement de chemin.
-- **Reprise après coupure** : chaque trame audio porte un `seq` croissant ; l'émetteur garde les trames non confirmées dans un `SendBuffer` (~2 min, ring buffer, avec horodatage pour le backlog) ; à la reconnexion (même sur un autre transport), chaque côté annonce le dernier `seq` reçu et l'autre rejoue exactement le manque — aucun audio perdu, seulement retardé.
-- **Audio** : codec Opus (`OpusCodec`, implémentation pure Java via Concentus pour compatibilité `minSdk`) par trames de 20 ms (`AudioCapture`/`AudioPlayback`) ; Jetpack Telecom possède seul le routage/focus duplex mais n'est actif qu'en présence d'une demande média locale ou distante, la capture `VOICE_COMMUNICATION` utilise le prétraitement calibré par Android, et un niveleur PCM borné stabilise uniquement la parole émise.
-- **Arrière-plan** : `LanIntercomEngine` vit dans `AppContainer` (portée application), piloté par un `SessionForegroundService` permanent dès la connexion — la réception audio et l'émission VOX continuent écran éteint ou app en arrière-plan ; la notification affiche l'état VOX (actif/désactivé) et le statut de la liaison.
-- **Roster** : les équipiers détectés en LAN apparaissent directement (icône Wifi) dès réception de leur beacon, indépendamment du cloud. Le dernier équipier sélectionné est persisté (`SharedPreferences`) et redevient la cible dès le lancement suivant.
-
-## Repli cloud (fallback)
-
-Quand `LanIntercomEngine` détecte que le LAN est indisponible (aucune connexion locale après 5 s) ou perdu (déconnecté depuis plus de 3 s), ou que la liaison locale s'est dégradée (RTT > 2 s ou trame la plus ancienne non confirmée depuis > 1 s), il déclenche un repli cloud sans jamais faire transiter l'audio par le backend en clair :
-
-1. **Rendez-vous** : ouverture (à la demande) de la connexion WebSocket signaling vers Cloud Run, envoi de `p2p_connect_request` puis de `p2p_endpoints` (découverte STUN de l'adresse publique) — le backend relaie ces messages uid-à-uid sans les interpréter côté audio.
-2. **Hole punching UDP** (`UdpP2pTransport`) : les deux appareils s'envoient des paquets sur les adresses échangées pour ouvrir les routes NAT ; premier chemin essayé, le plus direct.
-3. **Relais WebSocket** (`RelayTransport`) : si le hole punching n'a pas abouti après quelques secondes, l'audio (déjà encodé Opus) est envoyé en trames binaires opaques sur le WebSocket signaling existant — dernier recours, le backend ne fait que forwarder (limite de débit, jamais stocké ni parsé).
-4. **Retour au local** : le beacon LAN continue d'émettre/écouter en permanence sur tous les chemins ; dès qu'il retrouve l'équipier, `LanTcpTransport` redial et reprend la main automatiquement (« make-before-break »), sans perte ni doublon grâce au `seq` partagé.
-5. **Changement de réseau** : un `NetworkMonitor` redéclenche l'annonce d'endpoints dès que l'interface réseau change (ex. retour au Wi-Fi après un hotspot), pour retrouver rapidement le meilleur chemin.
-
-L'UI affiche, à côté de l'e-mail de l'équipier sélectionné, le RTT courant (ms) et le chemin actif (Local / P2P cloud / Relais cloud), ainsi qu'une jauge horizontale représentant le backlog audio non encore accusé réception (plafonnée à 10 s), visible quel que soit le chemin utilisé.
+- **Découverte** : `LanBeacon` diffuse `uid`, nom et port TCP en broadcast UDP (port `47100`) toutes les 2 s.
+- **Protocole** : `PeerLink` (séquences, `SendBuffer`, RTT, backlog) au-dessus de `LanTcpClient` / `LanTcpServer`.
+- **Reprise** : à la reconnexion, rejeu du gap de séquences — pas de perte, seulement du retard.
+- **Audio** : Opus 20 ms, Telecom pour le duplex, PTT / VOX (Silero VAD).
+- **Arrière-plan** : `SessionForegroundService` + `LanIntercomEngine` en portée application.
+- **Roster** : équipiers visibles dès le beacon ; inclusion/muet à la demande ; oubli doux persisté.
 
 ## État actuel
 
 | Composant | Statut |
 |-----------|--------|
-| Documentation | En place |
-| Backend signaling | Auth + presence + rendez-vous P2P + relais binaire, tests, déployé sur Cloud Run |
-| Terraform / GCP | Configuration prête, déploiement manuel |
-| Android — mode local | Intercom LAN (UDP beacon + TCP audio Opus), reprise sur coupure, service permanent, PTT/Vox |
-| Android — repli cloud | Hole punching UDP (STUN) + relais WebSocket, bascule auto vers/depuis le local, RTT + backlog affichés |
-| CI GitHub | Workflows backend, Android, Terraform |
+| Documentation | En place (LAN-only) |
+| Android — LAN + Tailscale | Intercom, PTT/VOX, Telecom, service permanent |
+| CI GitHub | Workflow Android |
 
 ## Prérequis
 
 - **Java 17+**
 - **Android SDK** (`ANDROID_HOME` → `~/Library/Android/sdk`)
-- **Node.js 22 LTS** (recommandé ; `engines` dans `backend/package.json`)
-- **Docker** (build image backend)
-- **Terraform** (infrastructure)
-- **gcloud CLI** + **gh** (déploiement)
-- **google-services.json** (hors Git — voir [docs/gcp-setup.md](docs/gcp-setup.md))
 
 ```bash
 export ANDROID_HOME="$HOME/Library/Android/sdk"
@@ -71,68 +44,29 @@ export PATH="$ANDROID_HOME/platform-tools:$PATH"
 
 ## Commandes principales
 
-### Backend
-
-```bash
-cd backend
-cp .env.example .env   # éditer localement, jamais committer
-npm ci
-npm run lint
-npm run typecheck
-npm test
-npm run build
-npm run dev            # développement local
-docker build -t voxcrew-signaling .
-```
-
-### Android
-
 ```bash
 cd android
 cp local.properties.example local.properties   # ajuster sdk.dir si besoin
 ./gradlew lintDebug testDebugUnitTest assembleDebug
 ```
 
-### Infrastructure
+Screenshots Play Store : voir [play-screenshots/README.md](play-screenshots/README.md).
 
-```bash
-cd infrastructure/terraform
-cp terraform.tfvars.example terraform.tfvars   # hors Git
-terraform fmt
-terraform init
-terraform plan
-# terraform apply  — uniquement après validation explicite
-```
+## Sécurité / secrets
 
-## Secrets — ne jamais committer
+Ne jamais committer :
 
-- `backend/.env`, `terraform.tfvars`
-- `android/app/google-services.json`, `local.properties`
-- Clés de compte de service, tokens Firebase, mots de passe
+- `android/local.properties`, `android/app/google-services.json` (obsolète, ne plus utiliser)
+- Mots de passe, clés, tokens
 
 Voir [docs/security.md](docs/security.md) et [AGENTS.md](AGENTS.md).
 
 ## Documentation
 
-- [architecture.md](docs/architecture.md)
-- [signaling-protocol.md](docs/signaling-protocol.md)
-- [android-audio.md](docs/android-audio.md)
-- [gcp-setup.md](docs/gcp-setup.md)
-- [security.md](docs/security.md)
-- [testing.md](docs/testing.md)
-- [roadmap.md](docs/roadmap.md)
-- [cost-control.md](docs/cost-control.md)
-
-## Configuration par défaut
-
-| Paramètre | Valeur |
-|-----------|--------|
-| Application | VoxCrew |
-| Android package | `com.nblaisot.voxcrew` |
-| Région GCP | `europe-west1` |
-| Service Cloud Run | `voxcrew-signaling` |
-| Firestore | Native, `eur3` |
-
-## Licence
-
-Dépôt privé — pas de licence open source par défaut.
+| Document | Contenu |
+|----------|---------|
+| [docs/architecture.md](docs/architecture.md) | Vue d’ensemble LAN |
+| [docs/android-audio.md](docs/android-audio.md) | Pipeline audio, Telecom, VOX |
+| [docs/testing.md](docs/testing.md) | Tests unitaires et manuels |
+| [docs/security.md](docs/security.md) | Secrets et bonnes pratiques |
+| [docs/roadmap.md](docs/roadmap.md) | Pistes produit |

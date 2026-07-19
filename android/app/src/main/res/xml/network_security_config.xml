@@ -5,7 +5,7 @@
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <!-- Debug builds: allow ws:// on LAN for local signaling MVP -->
+    <!-- Debug: allow cleartext for local tooling / emulators if needed -->
     <debug-overrides>
         <base-config cleartextTrafficPermitted="true" />
     </debug-overrides>

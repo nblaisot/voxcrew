@@ -30,7 +30,6 @@ import com.nblaisot.voxcrew.lanlink.PeerMetrics
 import com.nblaisot.voxcrew.roster.CrewMember
 import com.nblaisot.voxcrew.roster.CrewRosterRepository
 import com.nblaisot.voxcrew.service.SessionForegroundService
-import com.nblaisot.voxcrew.signaling.SignalingClient
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -71,10 +70,8 @@ data class MainUiState(
  */
 class MainViewModel(
     private val appContext: Context,
-    private val noBackend: Boolean,
     private val authRepository: AuthRepository,
-    private val localProfileRepository: LocalProfileRepository?,
-    private val signalingClient: SignalingClient?,
+    private val localProfileRepository: LocalProfileRepository,
     private val rosterRepository: CrewRosterRepository,
     private val lanEngine: LanIntercomEngine,
     private val demoModeStore: DemoModeStore,
@@ -307,9 +304,6 @@ class MainViewModel(
         if (intercomStarted) return
         intercomStarted = true
         startForegroundIfAllowed()
-        if (!noBackend) {
-            runCatching { signalingClient?.connect() }
-        }
         viewModelScope.launch {
             val user = authRepository.currentUser.value ?: return@launch
             rosterRepository.start(user.uid, user.label)
@@ -441,21 +435,15 @@ class MainViewModel(
     }
 
     fun signOut() {
-        signalingClient?.disconnect()
         lanEngine.releaseAudioSession()
         rosterRepository.stop()
         SessionForegroundService.stop(appContext)
         viewModelScope.launch {
-            if (noBackend) {
-                localProfileRepository?.signOut()
-            } else {
-                authRepository.signOut()
-            }
+            localProfileRepository.signOut()
         }
     }
 
     fun quitApplication() {
-        signalingClient?.disconnect()
         lanEngine.shutdown()
         rosterRepository.stop()
         SessionForegroundService.stop(appContext)

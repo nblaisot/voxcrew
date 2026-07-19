@@ -14,7 +14,6 @@
     <string name="menu_about">À propos</string>
     <string name="menu_quit">QUITTER</string>
     <string name="menu_change_name">Changer de nom</string>
-    <string name="menu_sign_out">Déconnexion</string>
     <string name="menu_content_description">Menu</string>
     <string name="about_title">À propos</string>
     <string name="about_intro">Cette application utilise des logiciels open source.</string>
@@ -22,12 +21,6 @@
     <string name="about_version">Version %1$s</string>
     <string name="demo_mode_enabled">Mode démo activé</string>
     <string name="demo_mode_disabled">Mode démo désactivé</string>
-
-    <!-- Login -->
-    <string name="login_email">Email</string>
-    <string name="login_password">Mot de passe</string>
-    <string name="login_sign_in">Connexion</string>
-    <string name="login_error_credentials_required">Email et mot de passe requis</string>
 
     <!-- Profile -->
     <string name="profile_subtitle">Choisissez un nom visible par les coéquipiers à proximité.</string>
@@ -76,9 +69,6 @@
     <string name="audio_route_this_device">Cet appareil</string>
     <string name="path_local">Local</string>
     <string name="path_vpn">VPN</string>
-    <string name="path_cloud">Cloud</string>
-    <string name="path_direct_internet">Internet direct</string>
-    <string name="path_cloud_relay">Relais cloud</string>
     <string name="another_output">une autre sortie</string>
 
     <!-- Audio / route banners -->
@@ -109,15 +99,4 @@
         <item quantity="one">%d connecté</item>
         <item quantity="other">%d connectés</item>
     </plurals>
-
-    <!-- Signaling / cloud errors -->
-    <string name="signaling_cloud_unavailable">Cloud indisponible — mode local si possible</string>
-    <string name="signaling_not_allowed">Compte non autorisé sur le serveur</string>
-    <string name="signaling_session_expired">Session expirée — reconnectez-vous</string>
-    <string name="signaling_auth_rejected">Authentification refusée — reconnectez-vous</string>
-    <string name="signaling_timeout">Délai de connexion dépassé</string>
-    <string name="signaling_protocol_error">Erreur protocole — reconnexion…</string>
-    <string name="signaling_not_connected">Non connecté — reconnectez-vous</string>
-    <string name="signaling_disconnected">Signaling déconnecté — reconnexion…</string>
-    <string name="signaling_connection_failed">Connexion impossible</string>
 </resources>

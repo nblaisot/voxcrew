@@ -16,10 +16,6 @@ import com.nblaisot.voxcrew.audio.VoiceActivatedTransmissionPolicy
 import com.nblaisot.voxcrew.audio.VoxGate
 import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.connectivity.NetworkMonitor
-import com.nblaisot.voxcrew.connectivity.transport.CloudRunSignalingTransport
-import com.nblaisot.voxcrew.signaling.SignalingClient
-import com.nblaisot.voxcrew.signaling.SignalingEnvelope
-import com.nblaisot.voxcrew.signaling.SignalingMessageTypes
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -39,29 +35,20 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonPrimitive
 import android.util.Log
-import java.io.IOException
-import java.net.DatagramPacket
-import java.net.Inet4Address
-import java.net.InetSocketAddress
-import java.net.NetworkInterface
 import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Facade for the whole intercom audio path: discovery, one [PeerConnection] per peer
- * (each with independent Local / cloud path), capture fan-out and shared playback.
+ * (LAN TCP with optional Tailscale overlay), capture fan-out and shared playback.
  */
 class LanIntercomEngine(
     context: Context,
     private val scope: CoroutineScope,
-    private val cloudTransport: CloudRunSignalingTransport,
-    private val signalingClient: SignalingClient? = null,
     private val networkMonitor: NetworkMonitor = NetworkMonitor(context),
     telecomSession: IntercomTelecomSession? = null,
-    private val cloudFallbackEnabled: Boolean = true,
-    private val optInRecipients: Boolean = false,
-    private val overlayFallbackEnabled: Boolean = false,
+    private val optInRecipients: Boolean = true,
+    private val overlayFallbackEnabled: Boolean = true,
 ) {
     private val appContext = context.applicationContext
     private val telecomSession = telecomSession ?: IntercomTelecomSession(appContext, scope)
@@ -69,7 +56,6 @@ class LanIntercomEngine(
     private val json = Json { ignoreUnknownKeys = true }
     private val beacon = LanBeacon(context, scope)
     private val lanServer = LanTcpServer(scope)
-    private val sharedUdp = SharedUdpSocket()
     private val capture = AudioCapture(
         scope = scope,
         telecomSession = this.telecomSession,
@@ -144,7 +130,6 @@ class LanIntercomEngine(
         .stateIn(scope, SharingStarted.Eagerly, false)
 
     private var voxJob: Job? = null
-    private var udpReceiveJob: Job? = null
     private var receivingSweepJob: Job? = null
     private var metricsJob: Job? = null
     private var routeWatchJob: Job? = null
@@ -206,8 +191,6 @@ class LanIntercomEngine(
         val overlayHost = if (overlayFallbackEnabled) TailscaleInterface.localOverlayIpv4() else null
         beacon.start(uid, displayName, lanServer.localPort, overlayHost)
         networkMonitor.start()
-        sharedUdp.open()
-        startSharedUdpReceiver()
         startReceivingSweep()
 
         val restoreVoxEnabled = prefs.getBoolean(KEY_VOX_ENABLED, false)
@@ -229,16 +212,6 @@ class LanIntercomEngine(
                     delay(LanBeacon.PRUNE_INTERVAL_MS)
                     if (started) updateLanTargets(beacon.peers.value)
                 }
-            }
-        }
-        if (cloudFallbackEnabled) {
-            lifecycleJobs += scope.launch {
-                cloudTransport.incomingMessages.collect { handleCloudMessage(it) }
-            }
-        }
-        signalingClient?.let { client ->
-            lifecycleJobs += scope.launch {
-                client.peerOffline.collect { uid -> connections[uid]?.onPeerPresenceLost() }
             }
         }
         lifecycleJobs += scope.launch {
@@ -674,11 +647,7 @@ class LanIntercomEngine(
                 scope = scope,
                 localUid = localUid,
                 lanServer = lanServer,
-                sharedUdp = sharedUdp,
-                cloudTransport = cloudTransport,
                 isStillWanted = { peerUid in knownCrewUids || peerUid in _activeRecipientUids.value },
-                localIpv4Provider = ::localIpv4Address,
-                cloudFallbackEnabled = cloudFallbackEnabled,
             )
             startAudioCollection(conn)
             startConnectionFeedback(conn)
@@ -954,51 +923,6 @@ class LanIntercomEngine(
         beacon.setOverlayProbeTargets(targets)
     }
 
-    private fun startSharedUdpReceiver() {
-        udpReceiveJob?.cancel()
-        udpReceiveJob = scope.launch(Dispatchers.IO) {
-            val socket = sharedUdp.open()
-            val buffer = ByteArray(2048)
-            try {
-                while (currentCoroutineContext().isActive) {
-                    val packet = DatagramPacket(buffer, buffer.size)
-                    socket.receive(packet)
-                    val from = InetSocketAddress(packet.address, packet.port)
-                    val data = packet.data.copyOf(packet.length)
-                    routeUdpDatagram(data, from)
-                }
-            } catch (e: IOException) {
-                // socket closed on shutdown
-            }
-        }
-    }
-
-    private fun routeUdpDatagram(data: ByteArray, from: InetSocketAddress) {
-        connections.values.firstOrNull { it.tryHandleUdpDatagram(data, from) }?.let { return }
-        val frame = LanProtocol.decodeFrame(data) ?: return
-        if (frame is LanFrame.Hello) {
-            connections[frame.uid]?.tryHandleUdpDatagram(data, from)
-        }
-    }
-
-    private fun handleCloudMessage(envelope: SignalingEnvelope) {
-        when (envelope.type) {
-            SignalingMessageTypes.RELAY_UNAVAILABLE -> {
-                val recipientId = envelope.payload["recipientId"]?.jsonPrimitive?.content ?: return
-                connections[recipientId]?.onPeerPresenceLost()
-            }
-            SignalingMessageTypes.P2P_CONNECT_REQUEST,
-            SignalingMessageTypes.P2P_ENDPOINTS,
-            -> {
-                val sender = envelope.senderId ?: return
-                ensureConnection(sender).apply {
-                    start()
-                    handleCloudMessage(envelope)
-                }
-            }
-        }
-    }
-
     private fun onNetworkChanged() {
         if (started) {
             val overlayHost = if (overlayFallbackEnabled) TailscaleInterface.localOverlayIpv4() else null
@@ -1059,16 +983,6 @@ class LanIntercomEngine(
     private fun saveActiveRecipients(uids: Set<String>) {
         prefs.edit().putString(KEY_ACTIVE_RECIPIENTS, json.encodeToString(uids)).apply()
     }
-
-    private fun localIpv4Address(): String? = runCatching {
-        NetworkInterface.getNetworkInterfaces()?.toList()
-            ?.asSequence()
-            ?.filter { it.isUp && !it.isLoopback }
-            ?.flatMap { it.inetAddresses.toList().asSequence() }
-            ?.filterIsInstance<Inet4Address>()
-            ?.map { it.hostAddress }
-            ?.firstOrNull()
-    }.getOrNull()
 
     private fun startMetricsWatcher() {
         metricsJob?.cancel()
@@ -1204,8 +1118,6 @@ class LanIntercomEngine(
         receivingSweepJob = null
         metricsJob?.cancel()
         metricsJob = null
-        udpReceiveJob?.cancel()
-        udpReceiveJob = null
         lifecycleJobs.forEach { it.cancel() }
         lifecycleJobs.clear()
 
@@ -1220,7 +1132,6 @@ class LanIntercomEngine(
         lanServer.onUnknownInboundPeer = null
         lanServer.stop()
         networkMonitor.stop()
-        sharedUdp.close()
 
         receivingUntilMs.clear()
         _receivingFromUids.value = emptySet()
