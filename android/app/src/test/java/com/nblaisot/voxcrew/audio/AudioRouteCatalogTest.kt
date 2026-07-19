@@ -18,7 +18,7 @@ class AudioRouteCatalogTest {
         val choices = buildAudioRouteChoices(listOf(watch, buds, speaker))
 
         assertEquals(DEVICE_AUDIO_ROUTE_KEY, choices.first().key)
-        assertEquals("Cet appareil", choices.first().name)
+        assertEquals("This device", choices.first().name)
         assertEquals(CaptureInputKind.BUILTIN, choices.first().inputKind)
         assertEquals(AudioRouteTarget.DEVICE, choices.first().target)
         assertEquals(speaker.identifier, choices.first().endpointIdentifier)

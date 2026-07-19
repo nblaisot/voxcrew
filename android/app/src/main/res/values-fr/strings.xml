@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VoxCrew</string>
+
+    <!-- Notifications -->
+    <string name="notification_channel_session">Session vocale</string>
+    <string name="notification_session_title">VoxCrew — session active</string>
+    <string name="notification_session_text">Communication vocale en cours</string>
+    <string name="notification_vox_on">VOX actif — micro à l\'écoute</string>
+    <string name="notification_vox_off">VOX désactivé — PTT</string>
+    <string name="action_leave_session">Quitter</string>
+
+    <!-- Menu / About -->
+    <string name="menu_about">À propos</string>
+    <string name="menu_quit">QUITTER</string>
+    <string name="menu_change_name">Changer de nom</string>
+    <string name="menu_sign_out">Déconnexion</string>
+    <string name="menu_content_description">Menu</string>
+    <string name="about_title">À propos</string>
+    <string name="about_intro">Cette application utilise des logiciels open source.</string>
+    <string name="about_back">Retour</string>
+    <string name="about_version">Version %1$s</string>
+    <string name="demo_mode_enabled">Mode démo activé</string>
+    <string name="demo_mode_disabled">Mode démo désactivé</string>
+
+    <!-- Login -->
+    <string name="login_email">Email</string>
+    <string name="login_password">Mot de passe</string>
+    <string name="login_sign_in">Connexion</string>
+    <string name="login_error_credentials_required">Email et mot de passe requis</string>
+
+    <!-- Profile -->
+    <string name="profile_subtitle">Choisissez un nom visible par les coéquipiers à proximité.</string>
+    <string name="profile_name_label">Votre nom</string>
+    <string name="profile_continue">Continuer</string>
+    <string name="profile_error_name_required">Choisissez un nom</string>
+    <string name="profile_error_save_failed">Impossible d\'enregistrer le profil</string>
+
+    <!-- Permissions -->
+    <string name="permission_mic_title">Autorisation micro</string>
+    <string name="permission_mic_body">Pour transmettre votre voix, autorisez l\'accès au micro.</string>
+    <string name="permission_bluetooth_title">Autorisation Bluetooth</string>
+    <string name="permission_bluetooth_body">Pour utiliser un casque ou des écouteurs Bluetooth, autorisez la connexion Bluetooth.</string>
+    <string name="permission_allow">Autoriser</string>
+    <string name="permission_later">Plus tard</string>
+
+    <!-- Forget member -->
+    <string name="forget_title">Oublier %1$s ?</string>
+    <string name="forget_body">Il réapparaîtra s\'il est à proximité.</string>
+    <string name="forget_confirm">Oublier</string>
+    <string name="forget_cancel">Annuler</string>
+
+    <!-- Main screen -->
+    <string name="participants_title">Participants</string>
+    <string name="participants_gesture_help">Toucher = inclure/muet · Double tap = solo · Appui long = oublier</string>
+    <string name="retry">Réessayer</string>
+    <string name="audio_route_content_description">Audio : %1$s</string>
+    <string name="audio_route_selected">Sélectionné</string>
+    <string name="included_in_group">Inclus dans le groupe</string>
+    <string name="muted_not_included">Muet (non inclus)</string>
+    <string name="availability_offline">Hors ligne</string>
+    <string name="ptt_hold_to_talk">PTT — maintenir pour parler</string>
+    <string name="ptt_transmitting">Transmission…</string>
+    <string name="vox_listening">Vox actif — en écoute</string>
+    <string name="vox_transmitting">Vox — transmission…</string>
+    <string name="audio_connecting">Connexion audio — %1$s…</string>
+    <string name="audio_choose_output">Choisir une sortie audio</string>
+    <string name="vox_sensitivity">Sensibilité Vox</string>
+    <string name="vox_sensitivity_1">Faible — voix seule</string>
+    <string name="vox_sensitivity_2">Réduite</string>
+    <string name="vox_sensitivity_3">Moyenne</string>
+    <string name="vox_sensitivity_4">Élevée</string>
+    <string name="vox_sensitivity_5">Maximale</string>
+
+    <!-- Audio routes / path labels -->
+    <string name="audio_route_this_device">Cet appareil</string>
+    <string name="path_local">Local</string>
+    <string name="path_vpn">VPN</string>
+    <string name="path_cloud">Cloud</string>
+    <string name="path_direct_internet">Internet direct</string>
+    <string name="path_cloud_relay">Relais cloud</string>
+    <string name="another_output">une autre sortie</string>
+
+    <!-- Audio / route banners -->
+    <string name="audio_session_unavailable">Session audio Android indisponible</string>
+    <string name="audio_pipeline_error">Le pipeline audio a rencontré une erreur</string>
+    <string name="audio_unavailable_reason">Audio indisponible : %1$s</string>
+    <string name="audio_route_diverged">Android utilise « %1$s ». Choisissez la sortie voulue dans le menu audio.</string>
+    <string name="audio_route_unavailable">La sortie « %1$s » n\'est plus disponible. Choisissez une sortie audio.</string>
+    <string name="audio_route_failed">Android a refusé « %1$s »%2$s. Choisissez une sortie audio pour reconstruire la session.</string>
+    <string name="audio_route_failed_code"> (code %1$d)</string>
+
+    <!-- Status line -->
+    <string name="status_searching_crewmates">Recherche de coéquipiers…</string>
+    <string name="status_no_active_recipient">Aucun destinataire actif</string>
+    <plurals name="status_crewmates_nearby_none_included">
+        <item quantity="one">%d coéquipier à proximité · aucun inclus</item>
+        <item quantity="other">%d coéquipiers à proximité · aucun inclus</item>
+    </plurals>
+    <plurals name="status_included">
+        <item quantity="one">%d inclus</item>
+        <item quantity="other">%d inclus</item>
+    </plurals>
+    <plurals name="status_active">
+        <item quantity="one">%d actif</item>
+        <item quantity="other">%d actifs</item>
+    </plurals>
+    <plurals name="status_connected">
+        <item quantity="one">%d connecté</item>
+        <item quantity="other">%d connectés</item>
+    </plurals>
+
+    <!-- Signaling / cloud errors -->
+    <string name="signaling_cloud_unavailable">Cloud indisponible — mode local si possible</string>
+    <string name="signaling_not_allowed">Compte non autorisé sur le serveur</string>
+    <string name="signaling_session_expired">Session expirée — reconnectez-vous</string>
+    <string name="signaling_auth_rejected">Authentification refusée — reconnectez-vous</string>
+    <string name="signaling_timeout">Délai de connexion dépassé</string>
+    <string name="signaling_protocol_error">Erreur protocole — reconnexion…</string>
+    <string name="signaling_not_connected">Non connecté — reconnectez-vous</string>
+    <string name="signaling_disconnected">Signaling déconnecté — reconnexion…</string>
+    <string name="signaling_connection_failed">Connexion impossible</string>
+</resources>

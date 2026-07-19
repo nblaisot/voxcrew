@@ -1,7 +1,10 @@
 package com.nblaisot.voxcrew
 
+import android.app.LocaleManager
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
+import android.os.LocaleList
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -25,7 +28,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val container = (application as VoxCrewApp).container
-        applyDemoIntent(intent, container)
+        applyAutomationIntent(intent, container)
         setContent {
             VoxCrewTheme {
                 Box(Modifier.semantics { testTagsAsResourceId = true }) {
@@ -41,18 +44,28 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        applyDemoIntent(intent, (application as VoxCrewApp).container)
+        applyAutomationIntent(intent, (application as VoxCrewApp).container)
     }
 
     /**
-     * Automation / deep-link hook for Play screenshots.
+     * Automation / deep-link hooks for Play screenshots.
      * Human easter egg remains: 5 taps on the About title.
      */
-    private fun applyDemoIntent(intent: Intent?, container: AppContainer) {
+    private fun applyAutomationIntent(intent: Intent?, container: AppContainer) {
+        applyLocaleExtra(intent)
         val enable = intent?.getBooleanExtra(EXTRA_ENABLE_DEMO, false) == true ||
             intent?.getStringExtra(EXTRA_ENABLE_DEMO)?.equals("true", ignoreCase = true) == true
         if (enable) {
             container.demoModeStore.setEnabled(true)
+        }
+    }
+
+    /** Optional BCP-47 tag, e.g. `en-US` / `fr-FR`, for screenshot automation. */
+    private fun applyLocaleExtra(intent: Intent?) {
+        val tag = intent?.getStringExtra(EXTRA_LOCALE)?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getSystemService(LocaleManager::class.java)
+                .applicationLocales = LocaleList.forLanguageTags(tag)
         }
     }
 
@@ -74,5 +87,6 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_ENABLE_DEMO = "enable_demo"
+        const val EXTRA_LOCALE = "locale"
     }
 }

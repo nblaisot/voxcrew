@@ -23,6 +23,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.nblaisot.voxcrew.R
@@ -42,19 +43,19 @@ fun ProfileScreen(viewModel: ProfileViewModel, onConfigured: () -> Unit) {
     ) {
         Image(
             painter = painterResource(R.drawable.logo_voxcrew),
-            contentDescription = "VoxCrew",
+            contentDescription = stringResource(R.string.app_name),
             modifier = Modifier.size(180.dp),
         )
         Spacer(modifier = Modifier.height(16.dp))
         Text(
-            text = "VoxCrew",
+            text = stringResource(R.string.app_name),
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.primary,
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "Choisissez un nom visible par les coéquipiers à proximité.",
+            text = stringResource(R.string.profile_subtitle),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -62,7 +63,7 @@ fun ProfileScreen(viewModel: ProfileViewModel, onConfigured: () -> Unit) {
         OutlinedTextField(
             value = state.displayName,
             onValueChange = viewModel::onDisplayNameChange,
-            label = { Text("Votre nom") },
+            label = { Text(stringResource(R.string.profile_name_label)) },
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("profile_name_field"),
@@ -98,7 +99,7 @@ fun ProfileScreen(viewModel: ProfileViewModel, onConfigured: () -> Unit) {
                     strokeWidth = 2.dp,
                 )
             } else {
-                Text("Continuer")
+                Text(stringResource(R.string.profile_continue))
             }
         }
     }

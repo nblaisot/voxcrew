@@ -1,7 +1,9 @@
 package com.nblaisot.voxcrew.ui.profile
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.nblaisot.voxcrew.R
 import com.nblaisot.voxcrew.auth.LocalProfileRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,6 +19,7 @@ data class ProfileUiState(
 )
 
 class ProfileViewModel(
+    private val appContext: Context,
     private val profileRepository: LocalProfileRepository,
 ) : ViewModel() {
     private val _uiState = MutableStateFlow(ProfileUiState())
@@ -42,7 +45,9 @@ class ProfileViewModel(
     fun saveProfile() {
         val name = _uiState.value.displayName
         if (name.isBlank()) {
-            _uiState.update { it.copy(error = "Choisissez un nom") }
+            _uiState.update {
+                it.copy(error = appContext.getString(R.string.profile_error_name_required))
+            }
             return
         }
         viewModelScope.launch {
@@ -55,7 +60,8 @@ class ProfileViewModel(
                     _uiState.update {
                         it.copy(
                             isLoading = false,
-                            error = error.message ?: "Impossible d'enregistrer le profil",
+                            error = error.message
+                                ?: appContext.getString(R.string.profile_error_save_failed),
                         )
                     }
                 }

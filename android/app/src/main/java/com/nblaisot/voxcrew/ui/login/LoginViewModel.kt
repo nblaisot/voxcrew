@@ -1,7 +1,9 @@
 package com.nblaisot.voxcrew.ui.login
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.nblaisot.voxcrew.R
 import com.nblaisot.voxcrew.auth.AuthRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,7 +19,10 @@ data class LoginUiState(
     val isLoggedIn: Boolean = false,
 )
 
-class LoginViewModel(private val authRepository: AuthRepository) : ViewModel() {
+class LoginViewModel(
+    private val appContext: Context,
+    private val authRepository: AuthRepository,
+) : ViewModel() {
     private val _uiState = MutableStateFlow(LoginUiState())
     val uiState: StateFlow<LoginUiState> = _uiState.asStateFlow()
 
@@ -36,7 +41,9 @@ class LoginViewModel(private val authRepository: AuthRepository) : ViewModel() {
         val email = _uiState.value.email.trim()
         val password = _uiState.value.password
         if (email.isBlank() || password.isBlank()) {
-            _uiState.update { it.copy(error = "Email et mot de passe requis") }
+            _uiState.update {
+                it.copy(error = appContext.getString(R.string.login_error_credentials_required))
+            }
             return
         }
         viewModelScope.launch {

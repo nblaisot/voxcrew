@@ -106,7 +106,7 @@ class PeerConnection(
                     lanTcpClient.clearStandby()
                 }
                 val via = (peerLink.state.value as? PeerLink.LinkState.Connected)?.via
-                if (via == "VPN") {
+                if (via == PathLabels.VPN) {
                     lanTcpClient.switchToLanMakeBeforeBreak(lan)
                 } else {
                     lanTcpClient.setTarget(lan)

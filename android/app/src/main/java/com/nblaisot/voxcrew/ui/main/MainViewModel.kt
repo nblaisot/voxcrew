@@ -9,6 +9,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.telecom.CallEndpointCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.nblaisot.voxcrew.R
 import com.nblaisot.voxcrew.audio.AudioPermissionIssue
 import com.nblaisot.voxcrew.audio.AudioPipelineState
 import com.nblaisot.voxcrew.audio.AudioRouteChoice
@@ -39,7 +40,7 @@ import kotlinx.coroutines.launch
 
 data class MainUiState(
     val localDisplayName: String? = null,
-    val statusMessage: String = "Recherche de coéquipiers…",
+    val statusMessage: String = "",
     val bannerMessage: String? = null,
     val showAudioRetry: Boolean = false,
     val crew: List<CrewMember> = emptyList(),
@@ -56,7 +57,7 @@ data class MainUiState(
     val audioRouteReady: Boolean = false,
     val audioStartAllowed: Boolean = true,
     val permissionPrompt: AudioPermissionIssue? = null,
-    val audioRouteChoices: List<AudioRouteChoice> = listOf(deviceAudioRouteChoice()),
+    val audioRouteChoices: List<AudioRouteChoice> = emptyList(),
     val selectedAudioRoute: AudioRouteChoice = deviceAudioRouteChoice(),
     val audioRouteStatus: ManualRouteStatus = ManualRouteStatus.STARTING,
     val audioRoutePending: Boolean = false,
@@ -78,10 +79,52 @@ class MainViewModel(
     private val lanEngine: LanIntercomEngine,
     private val demoModeStore: DemoModeStore,
 ) : ViewModel() {
-    private val _uiState = MutableStateFlow(MainUiState())
+    private val _uiState = MutableStateFlow(
+        MainUiState(
+            statusMessage = appContext.getString(R.string.status_searching_crewmates),
+            audioRouteChoices = listOf(
+                deviceAudioRouteChoice(
+                    name = appContext.getString(R.string.audio_route_this_device),
+                ),
+            ),
+            selectedAudioRoute = deviceAudioRouteChoice(
+                name = appContext.getString(R.string.audio_route_this_device),
+            ),
+        ),
+    )
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
     private var intercomStarted = false
+
+    private fun AudioSessionIssue.toUserMessage(): String = when (this) {
+        AudioSessionIssue.TELECOM_UNAVAILABLE ->
+            appContext.getString(R.string.audio_session_unavailable)
+        AudioSessionIssue.AUDIO_PIPELINE_FAILED ->
+            appContext.getString(R.string.audio_pipeline_error)
+    }
+
+    private fun ManualRouteStatus.toUserMessage(
+        selectedName: String,
+        currentName: String?,
+        errorCode: Int?,
+    ): String? = when (this) {
+        ManualRouteStatus.DIVERGED ->
+            appContext.getString(
+                R.string.audio_route_diverged,
+                currentName ?: appContext.getString(R.string.another_output),
+            )
+        ManualRouteStatus.UNAVAILABLE ->
+            appContext.getString(R.string.audio_route_unavailable, selectedName)
+        ManualRouteStatus.FAILED ->
+            appContext.getString(
+                R.string.audio_route_failed,
+                selectedName,
+                errorCode?.let { appContext.getString(R.string.audio_route_failed_code, it) }.orEmpty(),
+            )
+        ManualRouteStatus.STARTING,
+        ManualRouteStatus.REQUESTING,
+        ManualRouteStatus.CONFIRMED -> null
+    }
 
     init {
         viewModelScope.launch {
@@ -187,7 +230,7 @@ class MainViewModel(
                 }
                 val rawBanner = route.sessionIssue?.toUserMessage()
                     ?: pipelineFailure?.let { failure ->
-                        "Audio indisponible : ${failure.reason}"
+                        appContext.getString(R.string.audio_unavailable_reason, failure.reason)
                     }
                     ?: manualStatus.toUserMessage(
                         selectedName = selection.selectedChoice.name,
@@ -424,30 +467,6 @@ class MainViewModel(
 
     private companion object {
         const val TAG = "VoxCrewVM"
-
-        fun AudioSessionIssue.toUserMessage(): String = when (this) {
-            AudioSessionIssue.TELECOM_UNAVAILABLE -> "Session audio Android indisponible"
-            AudioSessionIssue.AUDIO_PIPELINE_FAILED -> "Le pipeline audio a rencontré une erreur"
-        }
-
-        fun ManualRouteStatus.toUserMessage(
-            selectedName: String,
-            currentName: String?,
-            errorCode: Int?,
-        ): String? = when (this) {
-            ManualRouteStatus.DIVERGED ->
-                "Android utilise « ${currentName ?: "une autre sortie"} ». " +
-                    "Choisissez la sortie voulue dans le menu audio."
-            ManualRouteStatus.UNAVAILABLE ->
-                "La sortie « $selectedName » n'est plus disponible. Choisissez une sortie audio."
-            ManualRouteStatus.FAILED ->
-                "Android a refusé « $selectedName »" +
-                    (errorCode?.let { " (code $it)" } ?: "") +
-                    ". Choisissez une sortie audio pour reconstruire la session."
-            ManualRouteStatus.STARTING,
-            ManualRouteStatus.REQUESTING,
-            ManualRouteStatus.CONFIRMED -> null
-        }
     }
 }
 

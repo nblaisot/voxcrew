@@ -32,7 +32,7 @@ class UdpP2pTransport(
     private val rtoMs: Long = RTO_MS,
     private val rtoCheckIntervalMs: Long = RTO_CHECK_INTERVAL_MS,
 ) : FrameTransport {
-    override val label: String = "Internet direct"
+    override val label: String = PathLabels.DIRECT_INTERNET
 
     private var ownedSocket: DatagramSocket? = null
     private var localUid: String = ""

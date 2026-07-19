@@ -2,6 +2,12 @@
 # Capture Play Store screenshots for VoxCrew using the android-play-screenshots skill.
 # Compatible with macOS Bash 3.2.
 # Uses native AVD resolutions only (no crop/scale). Phone AVD must be ≤2:1 (1080×1920).
+#
+# Locale (optional):
+#   LOCALE=en-US NAME_SUFFIX=_US ./play-screenshots/run.sh
+#   LOCALE=fr-FR ./play-screenshots/run.sh   # unsupported — leave LOCALE empty for FR flow
+#
+# Does not delete existing PNGs for other locales (only overwrites matching shot names).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,7 +15,22 @@ SKILL="${HOME}/.cursor/skills/android-play-screenshots/scripts"
 CONFIG="$ROOT/play-screenshots/config.yaml"
 OUT="$ROOT/play-screenshots/out"
 FLOWS="$ROOT/play-screenshots/flows"
-CAPTURE_FLOW="$FLOWS/capture-all.yaml"
+
+LOCALE="${LOCALE:-}"
+NAME_SUFFIX="${NAME_SUFFIX:-}"
+if [[ "$LOCALE" == "en-US" || "$LOCALE" == "en" ]]; then
+  CAPTURE_FLOW="$FLOWS/capture-all-en-US.yaml"
+  PROFILE_FLOW="$FLOWS/capture-profile-en-US.yaml"
+  MAIN_FLOW="$FLOWS/capture-main-en-US.yaml"
+  NAME_SUFFIX="${NAME_SUFFIX:-_US}"
+elif [[ -n "$LOCALE" ]]; then
+  echo "Unsupported LOCALE=$LOCALE (use en-US or leave empty for default FR flow)" >&2
+  exit 1
+else
+  CAPTURE_FLOW="$FLOWS/capture-all.yaml"
+  PROFILE_FLOW=""
+  MAIN_FLOW=""
+fi
 
 export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
 export PATH="$HOME/.maestro/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
@@ -55,6 +76,13 @@ grant_perms() {
   done < <(awk '/^- android\.permission/{print $2}' "$CONFIG")
 }
 
+set_app_locale() {
+  local serial="$1"
+  local tag="$2"
+  [[ -z "$tag" ]] && return 0
+  "$ANDROID_HOME/platform-tools/adb" -s "$serial" shell cmd locale set-app-locales "$APP_ID" --locales "$tag" >/dev/null 2>&1 || true
+}
+
 while IFS=$'\t' read -r avd serial; do
   [[ -z "${serial:-}" ]] && continue
   "$SKILL/wait-for-device.sh" "$serial"
@@ -75,9 +103,8 @@ slot_for_avd() {
   esac
 }
 
-SHOT_NAMES="01-profile-name 02-main-crew-demo 03-audio-bluetooth 04-solo-marc 05-vox-bluetooth-ptt 06-forget-quentin"
+SHOT_BASES="01-profile-name 02-main-crew-demo 03-audio-bluetooth 04-solo-marc 05-vox-bluetooth-ptt 06-forget-quentin"
 
-rm -rf "$OUT"
 mkdir -p "$OUT"
 
 # Index-based loop — Maestro (and other tools) must not consume the boot-list via stdin.
@@ -91,7 +118,7 @@ while [ "$i" -le "$device_count" ]; do
   [[ -z "$serial" ]] && continue
   slot="$(slot_for_avd "$avd")"
   mkdir -p "$OUT/$slot"
-  echo "=== Device $avd ($serial) → $slot ==="
+  echo "=== Device $avd ($serial) → $slot (locale=${LOCALE:-default}) ==="
 
   # Tablets ship landscape natively; ensure width > height for Play tablet shots.
   if [[ "$slot" == tablet7 || "$slot" == tablet10 ]]; then
@@ -108,15 +135,42 @@ while [ "$i" -le "$device_count" ]; do
 
   "$ANDROID_HOME/platform-tools/adb" -s "$serial" shell pm clear "$APP_ID" >/dev/null
   grant_perms "$serial"
+  set_app_locale "$serial" "$LOCALE"
 
-  # Maestro takeScreenshot writes into the process CWD — run from the slot folder.
+  capture_ok=0
   (
     cd "$OUT/$slot"
     maestro --device "$serial" test "$CAPTURE_FLOW" </dev/null
-  )
+  ) && capture_ok=1
 
-  for name in $SHOT_NAMES; do
-    png="$OUT/$slot/${name}.png"
+  # Reliable tablet/path fallback: profile flow → force-stop → demo+locale cold start → main flow.
+  if [[ "$capture_ok" -ne 1 && -n "$PROFILE_FLOW" && -n "$MAIN_FLOW" ]]; then
+    echo "Continuous flow failed — retrying split profile/main with adb demo+locale" >&2
+    (
+      cd "$OUT/$slot"
+      maestro --device "$serial" test "$PROFILE_FLOW" </dev/null
+    )
+    "$ANDROID_HOME/platform-tools/adb" -s "$serial" shell am force-stop "$APP_ID"
+    sleep 1
+    set_app_locale "$serial" "$LOCALE"
+    if [[ -n "$LOCALE" ]]; then
+      "$ANDROID_HOME/platform-tools/adb" -s "$serial" shell am start -n "$APP_ID/.MainActivity" \
+        --ez enable_demo true --es locale "$LOCALE"
+    else
+      "$ANDROID_HOME/platform-tools/adb" -s "$serial" shell am start -n "$APP_ID/.MainActivity" \
+        --ez enable_demo true
+    fi
+    sleep 3
+    (
+      cd "$OUT/$slot"
+      maestro --device "$serial" test "$MAIN_FLOW" </dev/null
+    )
+  elif [[ "$capture_ok" -ne 1 ]]; then
+    exit 1
+  fi
+
+  for base in $SHOT_BASES; do
+    png="$OUT/$slot/${base}${NAME_SUFFIX}.png"
     if [[ ! -f "$png" ]]; then
       echo "Missing screenshot $png" >&2
       exit 1
@@ -128,4 +182,8 @@ done
 rm -f "$BOOT_TMP"
 
 echo "Done. Screenshots:"
-find "$OUT" -name '*.png' | sort
+if [[ -n "$NAME_SUFFIX" ]]; then
+  find "$OUT" -name "*${NAME_SUFFIX}.png" | sort
+else
+  find "$OUT" -name '*.png' | sort
+fi

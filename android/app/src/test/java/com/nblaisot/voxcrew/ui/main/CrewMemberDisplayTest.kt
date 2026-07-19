@@ -1,5 +1,6 @@
 package com.nblaisot.voxcrew.ui.main
 
+import com.nblaisot.voxcrew.lanlink.PathLabels
 import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.roster.MemberAvailability
 import org.junit.Assert.assertEquals
@@ -11,8 +12,8 @@ class CrewMemberDisplayTest {
     fun `connected relay path shows active cloud even when roster says offline`() {
         val result = displayAvailability(
             rosterAvailability = MemberAvailability.OFFLINE,
-            pathLabel = "Relais cloud",
-            linkState = PeerLink.LinkState.Connected("peer-b", "Relais cloud"),
+            pathLabel = PathLabels.CLOUD_RELAY,
+            linkState = PeerLink.LinkState.Connected("peer-b", PathLabels.CLOUD_RELAY),
         )
         assertEquals(MemberAvailability.ONLINE_CLOUD, result)
     }
@@ -21,8 +22,8 @@ class CrewMemberDisplayTest {
     fun `connected vpn path shows overlay availability`() {
         val result = displayAvailability(
             rosterAvailability = MemberAvailability.OFFLINE,
-            pathLabel = "VPN",
-            linkState = PeerLink.LinkState.Connected("peer-b", "VPN"),
+            pathLabel = PathLabels.VPN,
+            linkState = PeerLink.LinkState.Connected("peer-b", PathLabels.VPN),
         )
         assertEquals(MemberAvailability.ONLINE_OVERLAY, result)
     }
@@ -31,8 +32,8 @@ class CrewMemberDisplayTest {
     fun `connected local path shows wifi icon`() {
         val result = displayAvailability(
             rosterAvailability = MemberAvailability.OFFLINE,
-            pathLabel = "Local",
-            linkState = PeerLink.LinkState.Connected("peer-b", "Local"),
+            pathLabel = PathLabels.LOCAL,
+            linkState = PeerLink.LinkState.Connected("peer-b", PathLabels.LOCAL),
         )
         assertEquals(MemberAvailability.ONLINE_LOCAL, result)
     }
@@ -51,7 +52,7 @@ class CrewMemberDisplayTest {
     fun `disconnected link state overrides roster online hint`() {
         val result = displayAvailability(
             rosterAvailability = MemberAvailability.ONLINE_LOCAL,
-            pathLabel = "Local",
+            pathLabel = PathLabels.LOCAL,
             linkState = PeerLink.LinkState.Disconnected("peer-b"),
         )
         assertEquals(MemberAvailability.OFFLINE, result)

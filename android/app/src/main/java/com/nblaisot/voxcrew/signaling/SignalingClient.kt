@@ -1,6 +1,8 @@
 package com.nblaisot.voxcrew.signaling
 
+import android.content.Context
 import com.nblaisot.voxcrew.BuildConfig
+import com.nblaisot.voxcrew.R
 import com.nblaisot.voxcrew.auth.AuthRepository
 import com.nblaisot.voxcrew.connectivity.transport.CloudRunSignalingTransport
 import kotlinx.coroutines.CoroutineScope
@@ -27,11 +29,13 @@ import kotlinx.serialization.json.jsonPrimitive
 import java.util.UUID
 
 class SignalingClient(
+    context: Context,
     baseUrl: String,
     authRepository: AuthRepository,
     private val transport: CloudRunSignalingTransport = CloudRunSignalingTransport(baseUrl, authRepository),
     scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
 ) {
+    private val appContext = context.applicationContext
     private val _state = MutableStateFlow(SignalingUiState())
     val state: StateFlow<SignalingUiState> = _state.asStateFlow()
 
@@ -339,30 +343,32 @@ class SignalingClient(
         if (raw.isNullOrBlank() && code.isNullOrBlank()) return null
         val text = raw.orEmpty()
         val normalizedCode = code?.uppercase().orEmpty()
-        if (!isCloudConfigured) return "Cloud indisponible — mode local si possible"
+        if (!isCloudConfigured) return appContext.getString(R.string.signaling_cloud_unavailable)
         if (text.contains("Unable to resolve host", ignoreCase = true)) {
-            return "Cloud indisponible — mode local si possible"
+            return appContext.getString(R.string.signaling_cloud_unavailable)
         }
         if (text.contains("failed to connect", ignoreCase = true) || text.contains("Failed to connect", ignoreCase = true)) {
-            return "Cloud indisponible — mode local si possible"
+            return appContext.getString(R.string.signaling_cloud_unavailable)
         }
         when {
             normalizedCode == "NOT_ALLOWED" || text.contains("not allowed", ignoreCase = true) ->
-                return "Compte non autorisé sur le serveur"
+                return appContext.getString(R.string.signaling_not_allowed)
             normalizedCode == "TOKEN_EXPIRED" || text.contains("expired", ignoreCase = true) ->
-                return "Session expirée — reconnectez-vous"
+                return appContext.getString(R.string.signaling_session_expired)
             normalizedCode == "TOKEN_INVALID" || text.contains("Invalid token", ignoreCase = true) ->
-                return "Authentification refusée — reconnectez-vous"
+                return appContext.getString(R.string.signaling_auth_rejected)
             normalizedCode == "TIMEOUT" || text.contains("timeout", ignoreCase = true) ->
-                return "Délai de connexion dépassé"
+                return appContext.getString(R.string.signaling_timeout)
             normalizedCode == "INVALID_MESSAGE" || text.contains("Invalid message envelope", ignoreCase = true) ->
-                return "Erreur protocole — reconnexion…"
-            text.contains("Non connecté", ignoreCase = true) || text.contains("Jeton indisponible", ignoreCase = true) ->
-                return "Non connecté — reconnectez-vous"
-            text.contains("WebSocket non connecté", ignoreCase = true) ->
-                return "Signaling déconnecté — reconnexion…"
+                return appContext.getString(R.string.signaling_protocol_error)
+            text.contains("Non connecté", ignoreCase = true) || text.contains("Jeton indisponible", ignoreCase = true) ||
+                text.contains("Not connected", ignoreCase = true) || text.contains("Token unavailable", ignoreCase = true) ->
+                return appContext.getString(R.string.signaling_not_connected)
+            text.contains("WebSocket non connecté", ignoreCase = true) ||
+                text.contains("WebSocket not connected", ignoreCase = true) ->
+                return appContext.getString(R.string.signaling_disconnected)
         }
-        return text.ifBlank { "Connexion impossible" }
+        return text.ifBlank { appContext.getString(R.string.signaling_connection_failed) }
     }
 }
 

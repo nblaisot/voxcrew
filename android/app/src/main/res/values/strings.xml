@@ -1,15 +1,123 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">VoxCrew</string>
-    <string name="notification_channel_session">Session vocale</string>
+
+    <!-- Notifications -->
+    <string name="notification_channel_session">Voice session</string>
     <string name="notification_session_title">VoxCrew — session active</string>
-    <string name="notification_session_text">Communication vocale en cours</string>
-    <string name="notification_vox_on">VOX actif — micro à l\'écoute</string>
-    <string name="notification_vox_off">VOX désactivé — PTT</string>
-    <string name="action_leave_session">Quitter</string>
-    <string name="menu_about">À propos</string>
-    <string name="menu_quit">QUITTER</string>
-    <string name="about_title">À propos</string>
-    <string name="about_intro">Cette application utilise des logiciels open source.</string>
-    <string name="about_back">Retour</string>
+    <string name="notification_session_text">Voice communication in progress</string>
+    <string name="notification_vox_on">VOX on — mic listening</string>
+    <string name="notification_vox_off">VOX off — PTT</string>
+    <string name="action_leave_session">Leave</string>
+
+    <!-- Menu / About -->
+    <string name="menu_about">About</string>
+    <string name="menu_quit">QUIT</string>
+    <string name="menu_change_name">Change name</string>
+    <string name="menu_sign_out">Sign out</string>
+    <string name="menu_content_description">Menu</string>
+    <string name="about_title">About</string>
+    <string name="about_intro">This app uses open-source software.</string>
+    <string name="about_back">Back</string>
+    <string name="about_version">Version %1$s</string>
+    <string name="demo_mode_enabled">Demo mode enabled</string>
+    <string name="demo_mode_disabled">Demo mode disabled</string>
+
+    <!-- Login -->
+    <string name="login_email">Email</string>
+    <string name="login_password">Password</string>
+    <string name="login_sign_in">Sign in</string>
+    <string name="login_error_credentials_required">Email and password required</string>
+
+    <!-- Profile -->
+    <string name="profile_subtitle">Choose a name visible to nearby crewmates.</string>
+    <string name="profile_name_label">Your name</string>
+    <string name="profile_continue">Continue</string>
+    <string name="profile_error_name_required">Choose a name</string>
+    <string name="profile_error_save_failed">Could not save profile</string>
+
+    <!-- Permissions -->
+    <string name="permission_mic_title">Microphone permission</string>
+    <string name="permission_mic_body">To transmit your voice, allow microphone access.</string>
+    <string name="permission_bluetooth_title">Bluetooth permission</string>
+    <string name="permission_bluetooth_body">To use a Bluetooth headset or earbuds, allow Bluetooth connection.</string>
+    <string name="permission_allow">Allow</string>
+    <string name="permission_later">Later</string>
+
+    <!-- Forget member -->
+    <string name="forget_title">Forget %1$s?</string>
+    <string name="forget_body">They will reappear if nearby.</string>
+    <string name="forget_confirm">Forget</string>
+    <string name="forget_cancel">Cancel</string>
+
+    <!-- Main screen -->
+    <string name="participants_title">Participants</string>
+    <string name="participants_gesture_help">Tap = include/mute · Double tap = solo · Long press = forget</string>
+    <string name="retry">Retry</string>
+    <string name="audio_route_content_description">Audio: %1$s</string>
+    <string name="audio_route_selected">Selected</string>
+    <string name="included_in_group">Included in group</string>
+    <string name="muted_not_included">Muted (not included)</string>
+    <string name="availability_offline">Offline</string>
+    <string name="ptt_hold_to_talk">PTT — hold to talk</string>
+    <string name="ptt_transmitting">Transmitting…</string>
+    <string name="vox_listening">Vox on — listening</string>
+    <string name="vox_transmitting">Vox — transmitting…</string>
+    <string name="audio_connecting">Connecting audio — %1$s…</string>
+    <string name="audio_choose_output">Choose an audio output</string>
+    <string name="vox_sensitivity">Vox sensitivity</string>
+    <string name="vox_sensitivity_1">Low — voice only</string>
+    <string name="vox_sensitivity_2">Reduced</string>
+    <string name="vox_sensitivity_3">Medium</string>
+    <string name="vox_sensitivity_4">High</string>
+    <string name="vox_sensitivity_5">Maximum</string>
+
+    <!-- Audio routes / path labels (canonical tokens stay English in logic) -->
+    <string name="audio_route_this_device">This device</string>
+    <string name="path_local">Local</string>
+    <string name="path_vpn">VPN</string>
+    <string name="path_cloud">Cloud</string>
+    <string name="path_direct_internet">Direct internet</string>
+    <string name="path_cloud_relay">Cloud relay</string>
+    <string name="another_output">another output</string>
+
+    <!-- Audio / route banners -->
+    <string name="audio_session_unavailable">Android audio session unavailable</string>
+    <string name="audio_pipeline_error">The audio pipeline encountered an error</string>
+    <string name="audio_unavailable_reason">Audio unavailable: %1$s</string>
+    <string name="audio_route_diverged">Android is using “%1$s”. Choose the desired output in the audio menu.</string>
+    <string name="audio_route_unavailable">Output “%1$s” is no longer available. Choose an audio output.</string>
+    <string name="audio_route_failed">Android rejected “%1$s”%2$s. Choose an audio output to rebuild the session.</string>
+    <string name="audio_route_failed_code"> (code %1$d)</string>
+
+    <!-- Status line -->
+    <string name="status_searching_crewmates">Searching for crewmates…</string>
+    <string name="status_no_active_recipient">No active recipient</string>
+    <plurals name="status_crewmates_nearby_none_included">
+        <item quantity="one">%d crewmate nearby · none included</item>
+        <item quantity="other">%d crewmates nearby · none included</item>
+    </plurals>
+    <plurals name="status_included">
+        <item quantity="one">%d included</item>
+        <item quantity="other">%d included</item>
+    </plurals>
+    <plurals name="status_active">
+        <item quantity="one">%d active</item>
+        <item quantity="other">%d active</item>
+    </plurals>
+    <plurals name="status_connected">
+        <item quantity="one">%d connected</item>
+        <item quantity="other">%d connected</item>
+    </plurals>
+
+    <!-- Signaling / cloud errors -->
+    <string name="signaling_cloud_unavailable">Cloud unavailable — local mode if possible</string>
+    <string name="signaling_not_allowed">Account not authorized on the server</string>
+    <string name="signaling_session_expired">Session expired — sign in again</string>
+    <string name="signaling_auth_rejected">Authentication rejected — sign in again</string>
+    <string name="signaling_timeout">Connection timed out</string>
+    <string name="signaling_protocol_error">Protocol error — reconnecting…</string>
+    <string name="signaling_not_connected">Not connected — sign in again</string>
+    <string name="signaling_disconnected">Signaling disconnected — reconnecting…</string>
+    <string name="signaling_connection_failed">Unable to connect</string>
 </resources>

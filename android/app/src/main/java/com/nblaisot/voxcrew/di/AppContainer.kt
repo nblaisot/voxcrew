@@ -48,6 +48,7 @@ class AppContainer(context: Context) {
         null
     } else {
         SignalingClient(
+            context = appContext,
             baseUrl = BuildConfig.SIGNALING_BASE_URL,
             authRepository = authRepository,
             transport = cloudTransport,

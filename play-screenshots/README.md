@@ -5,8 +5,16 @@ Project config for the personal Cursor skill `android-play-screenshots`.
 ## Quick run
 
 ```bash
+# French (default flow / device locale with values-fr)
 ./play-screenshots/run.sh
+
+# English Play listing assets (*_US.png); does not delete FR shots
+LOCALE=en-US ./play-screenshots/run.sh
 ```
+
+Automation also accepts intent extras `enable_demo=true` and `locale=en-US`
+(`MainActivity`), and `run.sh` sets per-app locales via
+`adb shell cmd locale set-app-locales` after `pm clear`.
 
 Outputs land in `play-screenshots/out/{phone,tablet7,tablet10}/` at **native** AVD
 resolution (no crop/scale):
@@ -18,6 +26,8 @@ resolution (no crop/scale):
 | tablet10 | `Pixel_Tablet` | 2560×1600 landscape |
 
 Keep tablet AVDs in landscape before capture (`wm size` width > height).
+
+English files are named `01-profile-name_US.png` … `06-forget-quentin_US.png`.
 
 ## Compose testTags
 

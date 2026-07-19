@@ -31,7 +31,7 @@ class RelayTransport(
     private val cloudChannel: BinaryRelayChannel,
     private val helloRetryIntervalMs: Long = HELLO_RETRY_INTERVAL_MS,
 ) : FrameTransport {
-    override val label: String = "Relais cloud"
+    override val label: String = PathLabels.CLOUD_RELAY
 
     private var localUid: String = ""
     private var peerUid: String = ""

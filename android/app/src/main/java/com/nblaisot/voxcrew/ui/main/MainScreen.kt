@@ -90,6 +90,7 @@ import com.nblaisot.voxcrew.audio.AudioPermissionIssue
 import com.nblaisot.voxcrew.audio.CaptureInputKind
 import com.nblaisot.voxcrew.audio.ManualRouteStatus
 import com.nblaisot.voxcrew.audio.VoxSensitivity
+import com.nblaisot.voxcrew.lanlink.PathLabels
 import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.roster.CrewMember
 import com.nblaisot.voxcrew.roster.MemberAvailability
@@ -143,15 +144,19 @@ fun MainScreen(
         AlertDialog(
             onDismissRequest = viewModel::dismissPermissionPrompt,
             title = {
-                Text(if (isBluetoothIssue) "Autorisation Bluetooth" else "Autorisation micro")
+                Text(
+                    stringResource(
+                        if (isBluetoothIssue) R.string.permission_bluetooth_title
+                        else R.string.permission_mic_title,
+                    ),
+                )
             },
             text = {
                 Text(
-                    if (isBluetoothIssue) {
-                        "Pour utiliser un casque ou des écouteurs Bluetooth, autorisez la connexion Bluetooth."
-                    } else {
-                        "Pour transmettre votre voix, autorisez l'accès au micro."
-                    },
+                    stringResource(
+                        if (isBluetoothIssue) R.string.permission_bluetooth_body
+                        else R.string.permission_mic_body,
+                    ),
                 )
             },
             confirmButton = {
@@ -164,12 +169,12 @@ fun MainScreen(
                         }
                     },
                 ) {
-                    Text("Autoriser")
+                    Text(stringResource(R.string.permission_allow))
                 }
             },
             dismissButton = {
                 TextButton(onClick = viewModel::dismissPermissionPrompt) {
-                    Text("Plus tard")
+                    Text(stringResource(R.string.permission_later))
                 }
             },
         )
@@ -178,8 +183,8 @@ fun MainScreen(
     memberPendingForget?.let { member ->
         AlertDialog(
             onDismissRequest = { memberPendingForget = null },
-            title = { Text("Oublier ${member.displayName} ?") },
-            text = { Text("Il réapparaîtra s’il est à proximité.") },
+            title = { Text(stringResource(R.string.forget_title, member.displayName)) },
+            text = { Text(stringResource(R.string.forget_body)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -187,12 +192,12 @@ fun MainScreen(
                         memberPendingForget = null
                     },
                 ) {
-                    Text("Oublier")
+                    Text(stringResource(R.string.forget_confirm))
                 }
             },
             dismissButton = {
                 TextButton(onClick = { memberPendingForget = null }) {
-                    Text("Annuler")
+                    Text(stringResource(R.string.forget_cancel))
                 }
             },
         )
@@ -206,7 +211,7 @@ fun MainScreen(
                         onClick = { menuExpanded = true },
                         modifier = Modifier.testTag("main_menu"),
                     ) {
-                        Icon(Icons.Filled.Menu, contentDescription = "Menu")
+                        Icon(Icons.Filled.Menu, contentDescription = stringResource(R.string.menu_content_description))
                     }
                     DropdownMenu(
                         expanded = menuExpanded,
@@ -220,7 +225,14 @@ fun MainScreen(
                             },
                         )
                         DropdownMenuItem(
-                            text = { Text(if (noBackend) "Changer de nom" else "Déconnexion") },
+                            text = {
+                                Text(
+                                    stringResource(
+                                        if (noBackend) R.string.menu_change_name
+                                        else R.string.menu_sign_out,
+                                    ),
+                                )
+                            },
                             onClick = {
                                 menuExpanded = false
                                 viewModel.signOut()
@@ -240,7 +252,7 @@ fun MainScreen(
                 title = {
                     Column(modifier = Modifier.padding(end = 8.dp)) {
                         Text(
-                            "VoxCrew",
+                            stringResource(R.string.app_name),
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary,
                         )
@@ -263,7 +275,10 @@ fun MainScreen(
                     ) {
                         Icon(
                             imageVector = audioRouteIcon(state.pttMicIconKind),
-                            contentDescription = "Audio : ${state.selectedAudioRoute.name}",
+                            contentDescription = stringResource(
+                                R.string.audio_route_content_description,
+                                state.selectedAudioRoute.name,
+                            ),
                         )
                     }
                     DropdownMenu(
@@ -284,7 +299,7 @@ fun MainScreen(
                                     {
                                         Icon(
                                             imageVector = Icons.Filled.Check,
-                                            contentDescription = "Sélectionné",
+                                            contentDescription = stringResource(R.string.audio_route_selected),
                                         )
                                     }
                                 } else {
@@ -320,18 +335,20 @@ fun MainScreen(
                         style = MaterialTheme.typography.bodySmall,
                     )
                     if (state.showAudioRetry) {
-                        TextButton(onClick = viewModel::retryAudio) { Text("Réessayer") }
+                        TextButton(onClick = viewModel::retryAudio) {
+                            Text(stringResource(R.string.retry))
+                        }
                     }
                 }
             }
 
             Text(
-                "Participants",
+                stringResource(R.string.participants_title),
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.primary,
             )
             Text(
-                "Toucher = inclure/muet · Double tap = solo · Appui long = oublier",
+                stringResource(R.string.participants_gesture_help),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -438,15 +455,19 @@ fun MainScreen(
                     Text(
                         when {
                             state.audioRoutePending ->
-                                "Connexion audio — ${state.selectedAudioRoute.name}…"
+                                stringResource(
+                                    R.string.audio_connecting,
+                                    state.selectedAudioRoute.name,
+                                )
                             state.audioRouteStatus == ManualRouteStatus.DIVERGED ||
                                 state.audioRouteStatus == ManualRouteStatus.UNAVAILABLE ||
                                 state.audioRouteStatus == ManualRouteStatus.FAILED ->
-                                "Choisir une sortie audio"
-                            state.voxEnabled && state.isTransmitting -> "Vox — transmission…"
-                            state.voxEnabled -> "Vox actif — en écoute"
-                            state.isTransmitting -> "Transmission…"
-                            else -> "PTT — maintenir pour parler"
+                                stringResource(R.string.audio_choose_output)
+                            state.voxEnabled && state.isTransmitting ->
+                                stringResource(R.string.vox_transmitting)
+                            state.voxEnabled -> stringResource(R.string.vox_listening)
+                            state.isTransmitting -> stringResource(R.string.ptt_transmitting)
+                            else -> stringResource(R.string.ptt_hold_to_talk)
                         },
                         color = pttContentColor,
                         fontWeight = FontWeight.SemiBold,
@@ -478,12 +499,12 @@ private fun VoxSensitivitySlider(sensitivity: Int, onSensitivityChange: (Int) ->
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text(
-                "Sensibilité Vox",
+                stringResource(R.string.vox_sensitivity),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
-                voxSensitivityLabel(sensitivity),
+                stringResource(voxSensitivityLabelRes(sensitivity)),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -502,12 +523,12 @@ private fun VoxSensitivitySlider(sensitivity: Int, onSensitivityChange: (Int) ->
     }
 }
 
-private fun voxSensitivityLabel(level: Int): String = when (level) {
-    1 -> "Faible — voix seule"
-    2 -> "Réduite"
-    3 -> "Moyenne"
-    4 -> "Élevée"
-    else -> "Maximale"
+private fun voxSensitivityLabelRes(level: Int): Int = when (level) {
+    1 -> R.string.vox_sensitivity_1
+    2 -> R.string.vox_sensitivity_2
+    3 -> R.string.vox_sensitivity_3
+    4 -> R.string.vox_sensitivity_4
+    else -> R.string.vox_sensitivity_5
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -564,9 +585,9 @@ private fun CrewMemberRow(
                     Icon(
                         imageVector = Icons.Filled.CheckCircle,
                         contentDescription = if (member.isActiveRecipient) {
-                            "Inclus dans le groupe"
+                            stringResource(R.string.included_in_group)
                         } else {
-                            "Muet (non inclus)"
+                            stringResource(R.string.muted_not_included)
                         },
                         tint = if (member.isActiveRecipient) {
                             MaterialTheme.colorScheme.primary
@@ -590,7 +611,7 @@ private fun CrewMemberRow(
                         )
                         if (pathLabel != null) {
                             Text(
-                                text = pathLabel,
+                                text = localizedPathLabel(pathLabel),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = inactiveAlpha),
                             )
@@ -654,16 +675,41 @@ private fun audioShimmerBrush(): Brush {
 }
 
 @Composable
+private fun localizedPathLabel(pathLabel: String): String = when (pathLabel) {
+    PathLabels.LOCAL -> stringResource(R.string.path_local)
+    PathLabels.VPN -> stringResource(R.string.path_vpn)
+    PathLabels.DIRECT_INTERNET -> stringResource(R.string.path_direct_internet)
+    PathLabels.CLOUD_RELAY -> stringResource(R.string.path_cloud_relay)
+    else -> pathLabel
+}
+
+@Composable
 private fun AvailabilityIcon(
     availability: MemberAvailability,
     rttMs: Long? = null,
     inactiveAlpha: Float = 1f,
 ) {
     val (icon, tint, desc) = when (availability) {
-        MemberAvailability.ONLINE_LOCAL -> Triple(Icons.Filled.Wifi, MaterialTheme.colorScheme.primary, "Local")
-        MemberAvailability.ONLINE_OVERLAY -> Triple(Icons.Filled.VpnLock, MaterialTheme.colorScheme.secondary, "VPN")
-        MemberAvailability.ONLINE_CLOUD -> Triple(Icons.Filled.Cloud, MaterialTheme.colorScheme.tertiary, "Cloud")
-        MemberAvailability.OFFLINE -> Triple(Icons.Filled.CloudOff, MaterialTheme.colorScheme.onSurfaceVariant, "Hors ligne")
+        MemberAvailability.ONLINE_LOCAL -> Triple(
+            Icons.Filled.Wifi,
+            MaterialTheme.colorScheme.primary,
+            stringResource(R.string.path_local),
+        )
+        MemberAvailability.ONLINE_OVERLAY -> Triple(
+            Icons.Filled.VpnLock,
+            MaterialTheme.colorScheme.secondary,
+            stringResource(R.string.path_vpn),
+        )
+        MemberAvailability.ONLINE_CLOUD -> Triple(
+            Icons.Filled.Cloud,
+            MaterialTheme.colorScheme.tertiary,
+            stringResource(R.string.path_cloud),
+        )
+        MemberAvailability.OFFLINE -> Triple(
+            Icons.Filled.CloudOff,
+            MaterialTheme.colorScheme.onSurfaceVariant,
+            stringResource(R.string.availability_offline),
+        )
     }
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,

@@ -1,6 +1,7 @@
 package com.nblaisot.voxcrew.lanlink
 
 import android.content.Context
+import com.nblaisot.voxcrew.R
 import com.nblaisot.voxcrew.audio.AudioPipelineState
 import com.nblaisot.voxcrew.audio.CaptureInputKind
 import com.nblaisot.voxcrew.audio.IntercomTelecomSession
@@ -188,7 +189,7 @@ class LanIntercomEngine(
             metrics = metrics ?: emptyMap(),
             visiblePeerCount = peers.count { it.uid != localUid },
         )
-    }.stateIn(scope, SharingStarted.Eagerly, "Recherche de coéquipiers…")
+    }.stateIn(scope, SharingStarted.Eagerly, appContext.getString(R.string.status_searching_crewmates))
 
     fun start(uid: String, displayName: String) {
         if (started) {
@@ -1096,23 +1097,37 @@ class LanIntercomEngine(
         if (optInRecipients) {
             return when {
                 visiblePeerCount == 0 && knownCrewUids.isEmpty() ->
-                    "Recherche de coéquipiers…"
+                    appContext.getString(R.string.status_searching_crewmates)
                 included.isEmpty() ->
-                    if (visiblePeerCount == 1) {
-                        "1 coéquipier à proximité · aucun inclus"
-                    } else {
-                        "$visiblePeerCount coéquipiers à proximité · aucun inclus"
-                    }
+                    appContext.resources.getQuantityString(
+                        R.plurals.status_crewmates_nearby_none_included,
+                        visiblePeerCount,
+                        visiblePeerCount,
+                    )
                 else -> {
                     val connected = included.count { uid ->
                         metrics[uid]?.linkState is PeerLink.LinkState.Connected
                     }
                     val pathCounts = included.mapNotNull { metrics[it]?.pathLabel }.groupingBy { it }.eachCount()
-                    val pathSummary = pathCounts.entries.joinToString(" · ") { (path, count) -> "$count $path" }
+                    val pathSummary = pathCounts.entries.joinToString(" · ") { (path, count) ->
+                        "$count ${PathLabels.displayName(appContext, path)}"
+                    }
                     buildString {
-                        append("${included.size} inclus")
-                        append(" · $connected connecté")
-                        if (connected > 1) append("s")
+                        append(
+                            appContext.resources.getQuantityString(
+                                R.plurals.status_included,
+                                included.size,
+                                included.size,
+                            ),
+                        )
+                        append(" · ")
+                        append(
+                            appContext.resources.getQuantityString(
+                                R.plurals.status_connected,
+                                connected,
+                                connected,
+                            ),
+                        )
                         if (pathSummary.isNotBlank()) {
                             append(" · ")
                             append(pathSummary)
@@ -1123,18 +1138,35 @@ class LanIntercomEngine(
         }
 
         if (included.isEmpty()) {
-            return if (knownCrewUids.isEmpty()) "Recherche de coéquipiers…" else "Aucun destinataire actif"
+            return if (knownCrewUids.isEmpty()) {
+                appContext.getString(R.string.status_searching_crewmates)
+            } else {
+                appContext.getString(R.string.status_no_active_recipient)
+            }
         }
         val connected = included.count { uid ->
             metrics[uid]?.linkState is PeerLink.LinkState.Connected
         }
         val pathCounts = included.mapNotNull { metrics[it]?.pathLabel }.groupingBy { it }.eachCount()
-        val pathSummary = pathCounts.entries.joinToString(" · ") { (path, count) -> "$count $path" }
+        val pathSummary = pathCounts.entries.joinToString(" · ") { (path, count) ->
+            "$count ${PathLabels.displayName(appContext, path)}"
+        }
         return buildString {
-            append("${included.size} actif")
-            if (included.size > 1) append("s")
-            append(" · $connected connecté")
-            if (connected > 1) append("s")
+            append(
+                appContext.resources.getQuantityString(
+                    R.plurals.status_active,
+                    included.size,
+                    included.size,
+                ),
+            )
+            append(" · ")
+            append(
+                appContext.resources.getQuantityString(
+                    R.plurals.status_connected,
+                    connected,
+                    connected,
+                ),
+            )
             if (pathSummary.isNotBlank()) {
                 append(" · ")
                 append(pathSummary)
