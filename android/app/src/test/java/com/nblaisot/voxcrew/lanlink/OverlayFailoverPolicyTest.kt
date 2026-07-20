@@ -74,6 +74,44 @@ class OverlayFailoverPolicyTest {
     }
 
     @Test
+    fun `decide never tears healthy LAN session for overlay`() {
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = null,
+            hasOverlayEndpoint = true,
+            nowMs = 10_000L,
+            activeVia = PathLabels.LOCAL,
+            sessionHealthy = true,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.KEEP_SESSION, decision.action)
+        assertTrue(decision.warmStandby)
+    }
+
+    @Test
+    fun `decide keeps healthy LAN session without warming when no overlay endpoint`() {
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = null,
+            hasOverlayEndpoint = false,
+            nowMs = 10_000L,
+            activeVia = PathLabels.LOCAL,
+            sessionHealthy = true,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.KEEP_SESSION, decision.action)
+        assertFalse(decision.warmStandby)
+    }
+
+    @Test
+    fun `decide uses overlay when LAN session is dead and endpoint known`() {
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = null,
+            hasOverlayEndpoint = true,
+            nowMs = 10_000L,
+            activeVia = PathLabels.LOCAL,
+            sessionHealthy = false,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_OVERLAY, decision.action)
+    }
+
+    @Test
     fun `decide keeps healthy session when discovery is quiet`() {
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = null,

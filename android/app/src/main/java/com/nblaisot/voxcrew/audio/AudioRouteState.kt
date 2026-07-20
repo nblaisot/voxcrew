@@ -102,6 +102,18 @@ data class TelecomEndpoint(
 fun bluetoothAudioRouteKey(address: String): String = "bt:$address"
 
 /**
+ * Same physical device: exact Telecom identifier, or same Bluetooth MAC. Telecom mints a
+ * new identifier when buds flip SCO/LE Audio profiles, so identifier equality alone would
+ * report false divergence for the very device the user selected.
+ */
+fun sameTelecomEndpoint(a: TelecomEndpoint?, b: TelecomEndpoint?): Boolean =
+    a != null && b != null &&
+        (
+            a.identifier == b.identifier ||
+                (a.bluetoothAddress != null && a.bluetoothAddress == b.bluetoothAddress)
+            )
+
+/**
  * Telecom owns routing. The current endpoint is the only statement about where call media
  * actually flows; available endpoints are choices, never readiness signals.
  */
@@ -113,9 +125,7 @@ data class TelecomCallState(
     val sessionIssue: AudioSessionIssue? = null,
 ) {
     val selectionConfirmed: Boolean
-        get() = currentEndpoint != null &&
-            selectedEndpoint != null &&
-            currentEndpoint.identifier == selectedEndpoint.identifier
+        get() = sameTelecomEndpoint(currentEndpoint, selectedEndpoint)
 
     val mediaActive: Boolean
         get() = phase == TelecomCallPhase.ACTIVE && selectionConfirmed && sessionIssue == null

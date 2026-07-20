@@ -47,6 +47,8 @@ class LanTcpClient(
     @Volatile private var standbyInbound: ParkedSession? = null
     @Volatile private var standbyOutbound: ParkedSession? = null
     private var standbyDialJob: Job? = null
+    @Volatile private var dialFailures = 0
+    @Volatile private var lastTargetSeenMs = 0L
 
     fun lastContiguousInSeq(): Long = peerLink.lastContiguousInSeq()
 
@@ -84,6 +86,11 @@ class LanTcpClient(
             session = null
             return
         }
+        if (peer.lastSeenMs > lastTargetSeenMs) {
+            // A fresh sighting is evidence the peer is back — retry immediately.
+            lastTargetSeenMs = peer.lastSeenMs
+            dialFailures = 0
+        }
         val hostChanged = previous != null && (
             previous.host != peer.host ||
                 previous.port != peer.port ||
@@ -99,12 +106,29 @@ class LanTcpClient(
                 session = null
             }
         }
+        if (preserveSession && hostChanged && session?.closed == false && isClientRoleFor(peer.uid)) {
+            // The peer moved (e.g. new Tailscale IP): dial the new host make-before-break
+            // instead of waiting for the stale session's activity timeout.
+            if (connectJob?.isActive != true) {
+                connectJob = scope.launch(Dispatchers.IO) { dialMakeBeforeBreak(peer) }
+            }
+            return
+        }
         if (isClientRoleFor(peer.uid) &&
             session?.closed != false &&
             (connectJob == null || connectJob?.isActive == false)
         ) {
             connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
         }
+    }
+
+    /** Immediate retry credit after an explicit user action (PTT press, recipient toggle). */
+    fun resetDialBackoff() {
+        dialFailures = 0
+    }
+
+    internal fun recordDialFailureForTest() {
+        dialFailures++
     }
 
     /**
@@ -242,6 +266,16 @@ class LanTcpClient(
             LAN_RETRY_DELAY_MS
         }
 
+    /**
+     * Exponential backoff capped at [MAX_RETRY_DELAY_MS]. A fresh sighting or user action
+     * resets [dialFailures], so reconnect stays instant when the peer actually returns;
+     * the cap kills the endless fast-dial storm to offline crew.
+     */
+    internal fun backoffDelayMs(peer: LanPeer): Long {
+        val exponent = dialFailures.coerceIn(0, MAX_BACKOFF_EXPONENT)
+        return (retryDelayMs(peer) shl exponent).coerceAtMost(MAX_RETRY_DELAY_MS)
+    }
+
     private suspend fun connectLoop() {
         while (currentCoroutineContext().isActive) {
             val peer = targetPeer ?: return
@@ -259,6 +293,7 @@ class LanTcpClient(
             connectingSocket = socket
             try {
                 socket.connect(InetSocketAddress(peer.host, peer.port), connectTimeoutMs(peer))
+                socket.tcpNoDelay = true
                 if (connectingSocket !== socket) {
                     runCatching { socket.close() }
                     continue
@@ -268,7 +303,8 @@ class LanTcpClient(
             } catch (e: IOException) {
                 connectingSocket = null
                 runCatching { socket.close() }
-                delay(retryDelayMs(peer))
+                dialFailures++
+                delay(backoffDelayMs(peer))
             }
         }
     }
@@ -281,6 +317,7 @@ class LanTcpClient(
                 InetSocketAddress(overlayPeer.host, overlayPeer.port),
                 OVERLAY_CONNECT_TIMEOUT_MS,
             )
+            socket.tcpNoDelay = true
             val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
             LanProtocol.writeFrame(out, LanFrame.Hello(localUid, peerLink.lastContiguousInSeq()))
@@ -314,7 +351,8 @@ class LanTcpClient(
         val socket = Socket()
         connectingSocket = socket
         try {
-            socket.connect(InetSocketAddress(lanPeer.host, lanPeer.port), LAN_CONNECT_TIMEOUT_MS)
+            socket.connect(InetSocketAddress(lanPeer.host, lanPeer.port), connectTimeoutMs(lanPeer))
+            socket.tcpNoDelay = true
             if (connectingSocket !== socket) {
                 runCatching { socket.close() }
                 return
@@ -357,6 +395,7 @@ class LanTcpClient(
     }
 
     private fun adoptParkedSession(parked: ParkedSession) {
+        dialFailures = 0
         val previous = session
         sessionPathLabel = pathLabelForSocket(parked.socket)
         val newSession = LanTcpSession(
@@ -383,6 +422,7 @@ class LanTcpClient(
         peerAnnouncedLastContiguousSeq: Long,
     ) {
         clearStandby()
+        dialFailures = 0
         val previous = session
         sessionPathLabel = pathLabelForSocket(socket)
         val newSession = LanTcpSession(
@@ -431,5 +471,7 @@ class LanTcpClient(
         private const val OVERLAY_CONNECT_TIMEOUT_MS = 1_000
         private const val LAN_RETRY_DELAY_MS = 500L
         private const val OVERLAY_RETRY_DELAY_MS = 250L
+        internal const val MAX_RETRY_DELAY_MS = 30_000L
+        private const val MAX_BACKOFF_EXPONENT = 7
     }
 }

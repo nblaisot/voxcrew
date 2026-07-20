@@ -73,6 +73,7 @@ class LanTcpServer(
 
     private suspend fun handleAcceptedSocket(socket: Socket) {
         try {
+            socket.tcpNoDelay = true
             val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
             val hello = withTimeoutOrNull(HANDSHAKE_TIMEOUT_MS) {
@@ -83,19 +84,17 @@ class LanTcpServer(
                 return
             }
             val peerUid = hello.uid
-            val client = clients[peerUid]
-            if (client == null) {
+            val client = clients[peerUid] ?: run {
                 onUnknownInboundPeer?.invoke(peerUid)
-                val retryClient = clients[peerUid]
-                if (retryClient == null) {
-                    runCatching { socket.close() }
-                    return
-                }
-                retryClient.adoptInboundSession(peerUid, socket, out, input, hello.lastContiguousSeq)
-            } else {
-                LanProtocol.writeFrame(out, LanFrame.Hello(localUid, client.lastContiguousInSeq()))
-                client.adoptInboundSession(peerUid, socket, out, input, hello.lastContiguousSeq)
+                clients[peerUid]
             }
+            if (client == null) {
+                runCatching { socket.close() }
+                return
+            }
+            // The dialer blocks on our Hello reply; both adoption paths must send it.
+            LanProtocol.writeFrame(out, LanFrame.Hello(localUid, client.lastContiguousInSeq()))
+            client.adoptInboundSession(peerUid, socket, out, input, hello.lastContiguousSeq)
         } catch (e: IOException) {
             runCatching { socket.close() }
             Log.d(TAG, "accept handling failed: ${e.message}")

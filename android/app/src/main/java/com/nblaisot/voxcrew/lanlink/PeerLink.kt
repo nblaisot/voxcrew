@@ -96,6 +96,7 @@ class PeerLink(private val scope: CoroutineScope) {
         if (currentPeerUid == peerUid) return
         activeTransport?.stop()
         activeTransport = null
+        stopHealthLoop()
         currentPeerUid = peerUid
         sendBuffer.clear()
         outSeq = 0
@@ -107,12 +108,10 @@ class PeerLink(private val scope: CoroutineScope) {
         _backlogMs.value = 0
         _rttMs.value = null
         _state.value = LinkState.Idle
-        ensureHealthLoop()
     }
 
     fun clear() {
-        healthLoopJob?.cancel()
-        healthLoopJob = null
+        stopHealthLoop()
         activeTransport?.stop()
         activeTransport = null
         currentPeerUid = null
@@ -136,6 +135,7 @@ class PeerLink(private val scope: CoroutineScope) {
     /** Buffers immediately; flushes over the active transport right away if there is one. */
     @Synchronized
     fun send(payload: ByteArray) {
+        expireStaleFrames()
         val seq = outSeq++
         sendBuffer.add(seq, payload)
         updateBacklog()
@@ -144,6 +144,7 @@ class PeerLink(private val scope: CoroutineScope) {
 
     @Synchronized
     fun sendMediaActivity(active: Boolean) {
+        expireStaleFrames()
         val seq = outSeq++
         val kind = if (active) SendBuffer.Kind.MEDIA_ACTIVE else SendBuffer.Kind.MEDIA_INACTIVE
         sendBuffer.add(seq, ByteArray(0), kind = kind)
@@ -161,11 +162,13 @@ class PeerLink(private val scope: CoroutineScope) {
         awaitingPongSinceMs = null
         lastPingSentMs = 0L
         sendBuffer.trimTo(peerAnnouncedLastContiguousSeq)
+        expireStaleFrames()
         updateBacklog()
         _state.value = LinkState.Connected(peerUid, transport.label)
         sendBuffer.replayFrom(peerAnnouncedLastContiguousSeq).forEach {
             transport.sendFrame(it.toFrame())
         }
+        ensureHealthLoop()
     }
 
     /** Called by the active transport for every frame it decodes other than its own Hello. */
@@ -197,6 +200,7 @@ class PeerLink(private val scope: CoroutineScope) {
     fun onDisconnected(transport: FrameTransport, peerUid: String) {
         if (activeTransport !== transport) return
         activeTransport = null
+        stopHealthLoop()
         awaitingPongSinceMs = null
         _rttMs.value = null
         _state.value = LinkState.Disconnected(peerUid)
@@ -239,17 +243,18 @@ class PeerLink(private val scope: CoroutineScope) {
         awaitingPongSinceMs = nowMs
     }
 
+    /**
+     * ACK/ping loop runs only while a transport is attached (started on handshake,
+     * stopped on detach). Buffer expiry happens at event points ([send],
+     * [onHandshakeComplete]) so nothing polls per peer while disconnected.
+     */
     private fun ensureHealthLoop() {
         if (healthLoopJob?.isActive == true) return
         healthLoopJob = scope.launch(Dispatchers.IO) {
             while (currentCoroutineContext().isActive) {
                 delay(ACK_INTERVAL_MS)
-                val dropped = sendBuffer.expireOlderThan(SendBuffer.DEFAULT_MAX_AGE_MS)
-                if (dropped > 0) {
-                    updateBacklog()
-                    _bufferExpired.tryEmit(dropped)
-                }
-                val transport = activeTransport ?: continue
+                val transport = activeTransport ?: break
+                synchronized(this@PeerLink) { expireStaleFrames() }
                 transport.sendFrame(LanFrame.Ack(lastContiguousInSeq))
                 val now = System.currentTimeMillis()
                 if (now - lastPingSentMs > PING_INTERVAL_MS) {
@@ -263,6 +268,20 @@ class PeerLink(private val scope: CoroutineScope) {
                     markUnreachable()
                 }
             }
+        }
+    }
+
+    private fun stopHealthLoop() {
+        healthLoopJob?.cancel()
+        healthLoopJob = null
+    }
+
+    /** Caller must hold the [PeerLink] monitor (or be a @Synchronized member). */
+    private fun expireStaleFrames() {
+        val dropped = sendBuffer.expireOlderThan(SendBuffer.DEFAULT_MAX_AGE_MS)
+        if (dropped > 0) {
+            updateBacklog()
+            _bufferExpired.tryEmit(dropped)
         }
     }
 

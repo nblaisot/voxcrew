@@ -43,6 +43,7 @@ data class MainUiState(
     val statusMessage: String = "",
     val bannerMessage: String? = null,
     val showAudioRetry: Boolean = false,
+    val showUseThisDevice: Boolean = false,
     val crew: List<CrewMember> = emptyList(),
     val activeRecipientUids: Set<String> = emptySet(),
     val receivingAudioFromUid: String? = null,
@@ -264,6 +265,14 @@ class MainViewModel(
                         bannerMessage = if (demoEnabled) null else rawBanner,
                         showAudioRetry = !demoEnabled &&
                             (route.sessionIssue != null || pipelineFailure != null),
+                        // One-tap recovery: accessory lost/diverged -> offer "This device".
+                        showUseThisDevice = !demoEnabled &&
+                            selection.selectedChoice.key != DEVICE_AUDIO_ROUTE_KEY &&
+                            (
+                                manualStatus == ManualRouteStatus.UNAVAILABLE ||
+                                    manualStatus == ManualRouteStatus.DIVERGED ||
+                                    manualStatus == ManualRouteStatus.FAILED
+                                ),
                     ).withPttEnabled()
                 }
             }
@@ -292,6 +301,8 @@ class MainViewModel(
             SessionForegroundService.refreshForegroundTypes(appContext)
             lanEngine.onMicrophonePermissionGranted()
         } else {
+            // FGS must stop advertising the microphone type once the permission is gone.
+            SessionForegroundService.refreshForegroundTypes(appContext)
             lanEngine.onMicrophonePermissionDenied()
         }
         lanEngine.refreshAudioRouting()
@@ -324,6 +335,12 @@ class MainViewModel(
         )
     }
 
+    /** Restarts the mesh if it was stopped via the notification's "Leave session". */
+    fun ensureIntercomRunning() {
+        if (intercomStarted && !lanEngine.isStarted) intercomStarted = false
+        startIntercom()
+    }
+
     private fun startIntercom() {
         if (intercomStarted) return
         intercomStarted = true
@@ -331,6 +348,7 @@ class MainViewModel(
         viewModelScope.launch {
             val user = authRepository.currentUser.value ?: return@launch
             rosterRepository.start(user.uid, user.label)
+            lanEngine.seedOverlayProbeHosts(rosterRepository.cachedOverlayHosts())
             lanEngine.start(user.uid, user.label)
         }
     }
@@ -361,6 +379,8 @@ class MainViewModel(
             SessionForegroundService.refreshForegroundTypes(appContext)
             lanEngine.onMicrophonePermissionGranted()
         } else {
+            // FGS must stop advertising the microphone type once the permission is gone.
+            SessionForegroundService.refreshForegroundTypes(appContext)
             lanEngine.onMicrophonePermissionDenied()
         }
         if (btGranted) {
@@ -393,8 +413,10 @@ class MainViewModel(
         }
         if (granted) {
             startForegroundIfAllowed()
+            SessionForegroundService.refreshForegroundTypes(appContext)
             lanEngine.onMicrophonePermissionGranted()
         } else {
+            SessionForegroundService.refreshForegroundTypes(appContext)
             lanEngine.onMicrophonePermissionDenied()
         }
     }
@@ -459,7 +481,10 @@ class MainViewModel(
     }
 
     fun signOut() {
-        lanEngine.releaseAudioSession()
+        // Full mesh shutdown: releaseAudioSession() alone left beacon/TCP/dial loops
+        // polling on the app scope after the user left.
+        lanEngine.shutdown()
+        intercomStarted = false
         rosterRepository.stop()
         SessionForegroundService.stop(appContext)
         viewModelScope.launch {

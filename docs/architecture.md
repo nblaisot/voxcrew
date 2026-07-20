@@ -49,9 +49,15 @@ Un seul espace de séquence `PeerLink` survit au changement de chemin (make-befo
 | Registre overlay | Adresse `100.x` annoncée / vue — book d’adresses, pas un heartbeat |
 | Session TCP | Lien audio ; santé = activité de frames (ACK/média). Ping = RTT seulement |
 
-Les sightings LAN et overlay ne s’écrasent pas. Une session overlay saine **n’est pas** coupée parce que le beacon LAN a disparu. Le label de chemin (`Local` / `VPN`) vient de l’adresse du socket au Hello, pas de l’intention de dial seule.
+Les sightings LAN et overlay ne s’écrasent pas. Une session TCP saine (LAN **ou** overlay) **n’est jamais** coupée parce que le beacon a disparu — `OverlayFailoverPolicy` retourne `KEEP_SESSION` pour une session LOCAL saine même sans sighting. Le label de chemin (`Local` / `VPN`) vient de l’adresse du socket au Hello, pas de l’intention de dial seule.
 
-La cadence beacon (~3 s) sert au join/roster ; le basculement de chemin est piloté par la présence LAN vs registre overlay + santé TCP, pas par un heartbeat UDP agressif.
+La cadence beacon (~3 s) sert au join/roster ; la staleness (`STALE_MS` = 5 intervalles, 15 s) n’affecte que l’affichage roster et le pré-chauffage du standby overlay. **Le basculement appartient à la santé TCP** : la mort du `PeerLink` (timeout d’activité de frames 6 s ou fermeture socket) sur un lien LOCAL promeut immédiatement l’overlay quand un endpoint est connu.
+
+Dial sortant : `TCP_NODELAY` partout, backoff exponentiel plafonné à 30 s, remis à zéro par un sighting frais ou une action utilisateur (PTT, toggle destinataire). Un changement d’hôte overlay re-dial make-before-break au lieu d’attendre le timeout d’activité.
+
+Cold start overlay : les hôtes `100.x` persistés dans le roster (`CrewRosterRepository`) sont réinjectés comme cibles de probe UDP au démarrage — deux pairs qui ne se croisent que sur Tailscale se retrouvent après redémarrage (le port TCP périmé n’a pas d’importance, le probe vise le port beacon fixe). `NetworkMonitor` surveille aussi `TRANSPORT_VPN` et les changements d’adresses (`onLinkPropertiesChanged`) pour rebinder le beacon quand Tailscale monte après le lancement.
+
+Sorties de session : « Quitter la session » (notification) et la déconnexion (`signOut`) passent par `engine.shutdown()` — beacon, serveur TCP et boucles de dial s’arrêtent réellement. Boucles économes : la boucle ACK/ping de `PeerLink` ne tourne que transport attaché ; métriques et indicateur « receiving » sont pilotés par événements (pas de polling permanent).
 
 ## Cycle de vie intercom
 

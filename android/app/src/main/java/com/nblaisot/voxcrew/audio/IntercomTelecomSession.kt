@@ -25,8 +25,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -79,6 +82,10 @@ class IntercomTelecomSession(
 
     private val _routeSelection = MutableStateFlow(AudioRouteSelectionState())
     val routeSelection: StateFlow<AudioRouteSelectionState> = _routeSelection.asStateFlow()
+
+    /** Emits once each time a call is fully torn down ([hasCall] just became false). */
+    private val _callTornDown = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val callTornDown: SharedFlow<Unit> = _callTornDown.asSharedFlow()
 
     val currentState: TelecomCallState get() = _callState.value
     val isActive: Boolean get() = currentState.phase == TelecomCallPhase.ACTIVE
@@ -418,6 +425,7 @@ class IntercomTelecomSession(
             synchronized(lifecycleLock) {
                 if (stopJob === cleanup) stopJob = null
             }
+            if (!hasCall) _callTornDown.tryEmit(Unit)
         }
         cleanup.start()
     }
@@ -491,12 +499,14 @@ class IntercomTelecomSession(
     }
 
     private fun finishGeneration(generation: Long) {
-        synchronized(lifecycleLock) {
+        val finished = synchronized(lifecycleLock) {
             if (!sessionGenerations.isCurrent(generation)) return
             sessionGenerations.finish(generation)
             sessionJob = null
             controllerReady = completedNullController()
+            stopJob?.isActive != true
         }
+        if (finished) _callTornDown.tryEmit(Unit)
     }
 
     private fun publishCurrent(
@@ -624,10 +634,11 @@ class IntercomTelecomSession(
         val normalized = endpointName.normalizeAudioDeviceName()
         if (normalized.isEmpty()) return null
         return runCatching {
+            // Two bonded devices with the same name are ambiguous — no guessing;
+            // the endpoint stays unresolved and keeps its identifier-scoped key.
             adapter.bondedDevices.orEmpty()
-                .firstOrNull { device ->
-                    device.name?.normalizeAudioDeviceName() == normalized
-                }
+                .filter { device -> device.name?.normalizeAudioDeviceName() == normalized }
+                .singleOrNull()
                 ?.address
                 ?.normalizeBluetoothAddress()
         }.getOrNull()
@@ -935,7 +946,7 @@ internal class TelecomRouteCoordinator(
             selected = target
             requiresExplicitSelection = false
             errorCode = null
-            if (current?.identifier == target.identifier) {
+            if (sameTelecomEndpoint(current, target)) {
                 status = ManualRouteStatus.CONFIRMED
                 publish(reason = "User confirmed current audio endpoint")
                 return ManualRouteCommandResult.Accepted
@@ -986,7 +997,7 @@ internal class TelecomRouteCoordinator(
         status = when {
             phase != TelecomCallPhase.ACTIVE -> ManualRouteStatus.STARTING
             current == null -> ManualRouteStatus.STARTING
-            current?.identifier == selected?.identifier -> ManualRouteStatus.CONFIRMED
+            sameTelecomEndpoint(current, selected) -> ManualRouteStatus.CONFIRMED
             else -> ManualRouteStatus.DIVERGED
         }
         errorCode = null

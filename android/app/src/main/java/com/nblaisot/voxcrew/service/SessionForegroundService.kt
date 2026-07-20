@@ -47,6 +47,9 @@ class SessionForegroundService : Service() {
             ACTION_STOP -> {
                 observeJob?.cancel()
                 releaseWifiLock()
+                // "Leave session" must stop the mesh too: without shutdown() the beacon,
+                // TCP server and dial loops keep running unprotected after the FGS dies.
+                (application as? VoxCrewApp)?.container?.lanIntercomEngine?.shutdown()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }

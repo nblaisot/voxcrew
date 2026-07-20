@@ -38,10 +38,15 @@ object OverlayFailoverPolicy {
             )
             return Decision(PathAction.USE_LAN, warmStandby = warm)
         }
+        // A healthy LAN session must never be torn for overlay: UDP presence loss is not
+        // path death. TCP death (PeerLink unreachable / session close) triggers promotion.
+        if (sessionHealthy && activeVia == PathLabels.LOCAL) {
+            return Decision(PathAction.KEEP_SESSION, warmStandby = hasOverlayEndpoint)
+        }
         if (hasOverlayEndpoint) {
             return Decision(PathAction.USE_OVERLAY)
         }
-        // Healthy TCP must not be torn down solely because discovery went quiet.
+        // Healthy overlay TCP must not be torn down solely because discovery went quiet.
         if (sessionHealthy && activeVia != null) {
             return Decision(PathAction.KEEP_SESSION)
         }

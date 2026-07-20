@@ -4,8 +4,11 @@ import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRouting
 import android.media.AudioTrack
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.nblaisot.voxcrew.audio.ObservedAudioDeviceKind
 import com.nblaisot.voxcrew.audio.TelecomCallState
@@ -32,6 +35,18 @@ class AudioPlayback(
 
     private val _isReceiving = MutableStateFlow(false)
     val isReceiving: StateFlow<Boolean> = _isReceiving.asStateFlow()
+
+    /** Fired when the platform re-routes the live track (e.g. SCO drops to speaker). */
+    @Volatile var onRoutedDeviceChanged: ((ObservedAudioDeviceKind) -> Unit)? = null
+    private val routingHandler = Handler(Looper.getMainLooper())
+    private val routingListener = AudioRouting.OnRoutingChangedListener { router ->
+        onRoutedDeviceChanged?.invoke(observedDeviceKind(router.routedDevice?.type))
+    }
+
+    /** Current observed output kind of the live track, null when none is active. */
+    fun observedRoutedKind(): ObservedAudioDeviceKind? = synchronized(lock) {
+        track?.let { observedDeviceKind(routedDevice(it)?.type) }
+    }
 
     fun open(callState: TelecomCallState): PlaybackStartResult {
         if (!callState.mediaActive) return PlaybackStartResult.Failure("Telecom call is not media-active")
@@ -76,6 +91,7 @@ class AudioPlayback(
             }
             track = newTrack
             trackGeneration++
+            runCatching { newTrack.addOnRoutingChangedListener(routingListener, routingHandler) }
             val routedType = routedDevice(newTrack)?.type
             Log.i(
                 TAG,
@@ -139,6 +155,7 @@ class AudioPlayback(
     private fun releaseTrackLocked() {
         trackGeneration++
         track?.let { active ->
+            runCatching { active.removeOnRoutingChangedListener(routingListener) }
             runCatching { active.stop() }
             active.release()
         }

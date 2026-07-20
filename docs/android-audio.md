@@ -161,9 +161,13 @@ VoxCrew au premier plan prépare Telecom et le pipeline avant toute pression. Le
 gris et désactivé jusqu'à `ACTIVE + READY`; une fois prêt, la pression ne fait que changer
 `TransmissionPolicy` et l'encodage peut commencer sur la prochaine frame de 20 ms.
 
-`AudioRecord.routedDevice` et `AudioTrack.routedDevice` ne servent qu'aux diagnostics et
-aux icônes Bluetooth/USB/filaire. Aucun `AudioDeviceInfo` n'est conservé comme décision
-de routage.
+`AudioRecord.routedDevice` et `AudioTrack.routedDevice` servent aux diagnostics, aux
+icônes Bluetooth/USB/filaire et à la **vérification événementielle de route** : un
+`addOnRoutingChangedListener` sur le recorder et la track détecte le cas où Telecom croit
+l'appel sur Bluetooth mais la plateforme route ailleurs (SCO jamais démarré). Après une
+unique re-vérification de 1,5 s (temps de démarrage SCO), le pipeline passe `Failed` par
+le chemin existant (déconnexion + bannière Réessayer). Aucun `AudioDeviceInfo` n'est
+conservé comme décision de routage.
 
 ## Cycle de demande média
 
@@ -199,7 +203,10 @@ En PTT, chaque pression réutilise le même `AudioRecord`, `AudioTrack` et appel
 que VoxCrew reste au premier plan. Une pression/relâchement ne crée ni ne détruit de route.
 Le passage en arrière-plan annule une pression éventuelle et libère Telecom (VOX off) pour
 laisser la musique sur le chemin multimédia ; l'inbound utilise alors `MediaInboundPlayer`.
-Le retour au premier plan arrête le lecteur média et reconstruit le chemin Telecom. Les
+Les frames qui arrivent pendant que la déconnexion Telecom est encore en cours (`hasCall`)
+ne sont plus perdues : elles sont mises en tampon (~2 s max) et rejouées, pilotées par
+l'événement `callTornDown` — aucun polling. Le retour au premier plan arrête le lecteur
+média, vide ce tampon et reconstruit le chemin Telecom. Les
 changements de configuration de l'activité ne sont pas considérés comme un passage réel
 en arrière-plan.
 
@@ -232,6 +239,10 @@ le sélecteur audio du coin supérieur droit. Cette observation ne prend ni focu
 Les endpoints Bluetooth sont dédupliqués par **adresse MAC** (clé stable `bt:$mac`) : un
 renommage ou un dédoublement HEADSET/LE_AUDIO du même accessoire n'affiche qu'une ligne,
 avec le nom courant préféré. Watch et Buds restent distincts via des MAC différentes.
+La MAC vient du champ interne `mMackAddress` de Jetpack Telecom (accès réflexif gardé par
+un test unitaire — une montée de version qui casse le champ fait échouer la CI) avec repli
+sur le nom bonded **uniquement si unique** (deux appareils de même nom → non résolu, pas
+de fusion hasardeuse).
 Les endpoints USB/filaire
 sont ajoutés et retirés dynamiquement. La connexion d'un accessoire ne le sélectionne jamais
 automatiquement. Sa déconnexion conserve le choix devenu indisponible, ferme le duplex et
@@ -250,7 +261,12 @@ Une fois l'appel actif :
   fois et vers l'identifiant choisi ; les autres clics sont refusés pendant cette requête ;
 - si Samsung change spontanément de route, l'état devient `DIVERGED`, l'appel Telecom est
   déconnecté jusqu'à un nouveau choix utilisateur, et aucune correction automatique n'est
-  tentée ;
+  tentée. La confirmation compare l'identifiant Telecom **ou** la MAC Bluetooth
+  (`sameTelecomEndpoint`) : un flip de profil SCO↔LE Audio du même accessoire ne déclenche
+  pas de fausse divergence ;
+- la perte de l'accessoire sélectionné (comme `DIVERGED`/`FAILED`) affiche une action
+  « Cet appareil » dans la bannière — récupération en un geste via le chemin
+  `selectAudioRoute` normal, jamais de bascule automatique ;
 - un refus devient `FAILED`, déconnecte la génération Telecom potentiellement bloquée et
   interdit sa recréation automatique. Le prochain choix explicite crée une session propre ;
 - un endpoint disparu devient `UNAVAILABLE` et ne déclenche aucun repli ;

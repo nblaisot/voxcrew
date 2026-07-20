@@ -106,4 +106,5 @@
     </plurals>
     <string name="status_audio_unavailable">audio unavailable</string>
     <string name="status_audio_pending">audio pending</string>
+    <string name="status_discovery_unavailable">local discovery unavailable</string>
 </resources>

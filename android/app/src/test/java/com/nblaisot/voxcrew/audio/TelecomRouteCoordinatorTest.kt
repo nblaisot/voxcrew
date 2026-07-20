@@ -134,6 +134,58 @@ class TelecomRouteCoordinatorTest {
     }
 
     @Test
+    fun profileFlipSameMacStaysConfirmed() = runTest {
+        // Buds re-enumerated under a new Telecom identifier (SCO -> LE Audio) but same MAC.
+        val budsSco = endpoint("buds-sco", CallEndpointCompat.TYPE_BLUETOOTH, mac = "AA:BB:CC:DD:EE:FF")
+        val budsLe = endpoint("buds-le", CallEndpointCompat.TYPE_BLUETOOTH, mac = "AA:BB:CC:DD:EE:FF")
+        val harness = Harness(selected = budsSco)
+        harness.coordinator.onAvailableEndpoints(listOf(speaker, budsSco))
+        harness.coordinator.onCurrentEndpoint(budsSco)
+        harness.coordinator.onActivationResult(true)
+        assertEquals(ManualRouteStatus.CONFIRMED, harness.status)
+
+        harness.coordinator.onAvailableEndpoints(listOf(speaker, budsLe))
+        harness.coordinator.onCurrentEndpoint(budsLe)
+
+        assertEquals(ManualRouteStatus.CONFIRMED, harness.status)
+        assertTrue(harness.state.mediaActive)
+        assertTrue(harness.requests.isEmpty())
+    }
+
+    @Test
+    fun differentMacStillDiverges() = runTest {
+        val budsA = endpoint("buds-a", CallEndpointCompat.TYPE_BLUETOOTH, mac = "AA:AA:AA:AA:AA:AA")
+        val watchB = endpoint("watch-b", CallEndpointCompat.TYPE_BLUETOOTH, mac = "BB:BB:BB:BB:BB:BB")
+        val harness = Harness(selected = budsA)
+        harness.coordinator.onAvailableEndpoints(listOf(speaker, budsA, watchB))
+        harness.coordinator.onCurrentEndpoint(budsA)
+        harness.coordinator.onActivationResult(true)
+        assertEquals(ManualRouteStatus.CONFIRMED, harness.status)
+
+        harness.coordinator.onCurrentEndpoint(watchB)
+
+        assertEquals(ManualRouteStatus.DIVERGED, harness.status)
+        assertFalse(harness.state.mediaActive)
+    }
+
+    @Test
+    fun selectingCurrentDeviceByMacConfirmsWithoutRequest() = runTest {
+        val budsSco = endpoint("buds-sco", CallEndpointCompat.TYPE_BLUETOOTH, mac = "AA:BB:CC:DD:EE:FF")
+        val budsLe = endpoint("buds-le", CallEndpointCompat.TYPE_BLUETOOTH, mac = "AA:BB:CC:DD:EE:FF")
+        val harness = Harness(selected = speaker)
+        harness.coordinator.onAvailableEndpoints(listOf(speaker, budsLe))
+        harness.coordinator.onCurrentEndpoint(budsLe)
+        harness.coordinator.onActivationResult(true)
+
+        // Menu choice was built from the SCO enumeration; platform now reports the LE one.
+        val result = harness.coordinator.onUserSelected(choice(budsSco))
+
+        assertEquals(ManualRouteCommandResult.Accepted, result)
+        assertTrue(harness.requests.isEmpty())
+        assertEquals(ManualRouteStatus.CONFIRMED, harness.status)
+    }
+
+    @Test
     fun inactiveAndDisconnectStatesNeverExposeReadyMedia() = runTest {
         val harness = activeHarness(selected = speaker)
         assertTrue(harness.state.mediaActive)
@@ -169,7 +221,8 @@ class TelecomRouteCoordinatorTest {
         harness.coordinator.onActivationResult(true)
     }
 
-    private fun endpoint(id: String, type: Int) = TelecomEndpoint(id, id, type)
+    private fun endpoint(id: String, type: Int, mac: String? = null) =
+        TelecomEndpoint(id, id, type, bluetoothAddress = mac)
 
     private fun deviceChoice() = deviceAudioRouteChoice(speaker.identifier)
 

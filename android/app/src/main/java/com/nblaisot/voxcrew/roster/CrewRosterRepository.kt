@@ -54,6 +54,15 @@ class CrewRosterRepository(
         _members.value = emptyList()
     }
 
+    /**
+     * Persisted overlay hosts for cold-start probing. Tailscale addresses are node-stable,
+     * so two peers that only ever meet on the overlay can re-find each other after a restart.
+     */
+    fun cachedOverlayHosts(): Map<String, String> =
+        loadCache().values.mapNotNull { cached ->
+            cached.overlayHost?.takeIf { it.isNotBlank() }?.let { cached.uid to it }
+        }.toMap()
+
     fun setActiveRecipients(uids: Set<String>) {
         activeRecipientUids = uids
         _members.update { list -> list.map { it.copy(isActiveRecipient = it.uid in uids) } }

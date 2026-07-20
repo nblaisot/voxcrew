@@ -3,8 +3,11 @@ package com.nblaisot.voxcrew.lanlink
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioRouting
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import com.nblaisot.voxcrew.audio.IntercomTelecomSession
@@ -35,6 +38,17 @@ class AudioCapture(
     @Volatile private var activeRecorder: AudioRecord? = null
     @Volatile private var captureGeneration = 0
     private val lock = Any()
+
+    /** Fired when the platform re-routes the live recorder (e.g. SCO drops to builtin). */
+    @Volatile var onRoutedDeviceChanged: ((ObservedAudioDeviceKind) -> Unit)? = null
+    private val routingHandler = Handler(Looper.getMainLooper())
+    private val routingListener = AudioRouting.OnRoutingChangedListener { router ->
+        onRoutedDeviceChanged?.invoke(observedDeviceKind(router.routedDevice?.type))
+    }
+
+    /** Current observed input kind of the live recorder, null when none is active. */
+    fun observedRoutedKind(): ObservedAudioDeviceKind? =
+        activeRecorder?.let { observedDeviceKind(routedDevice(it)?.type) }
 
     fun attach(
         shouldTransmit: StateFlow<Boolean>,
@@ -132,6 +146,7 @@ class AudioCapture(
     private fun storeRecorder(generation: Int, recorder: AudioRecord): Boolean = synchronized(lock) {
         if (generation != captureGeneration) return@synchronized false
         activeRecorder = recorder
+        runCatching { recorder.addOnRoutingChangedListener(routingListener, routingHandler) }
         true
     }
 
@@ -339,6 +354,7 @@ class AudioCapture(
     }
 
     private fun releaseRecorder(recorder: AudioRecord) {
+        runCatching { recorder.removeOnRoutingChangedListener(routingListener) }
         runCatching { recorder.stop() }
         recorder.release()
     }

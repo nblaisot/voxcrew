@@ -47,6 +47,10 @@ class LanBeacon(
     private val _peers = MutableStateFlow<List<LanPeer>>(emptyList())
     val peers: StateFlow<List<LanPeer>> = _peers.asStateFlow()
 
+    /** True while the beacon socket could not bind — discovery is silently dead otherwise. */
+    private val _bindFailed = MutableStateFlow(false)
+    val bindFailed: StateFlow<Boolean> = _bindFailed.asStateFlow()
+
     private val lanSightings = ConcurrentHashMap<String, LanPeer>()
     private val overlaySightings = ConcurrentHashMap<String, LanPeer>()
     private var socket: DatagramSocket? = null
@@ -98,6 +102,7 @@ class LanBeacon(
     fun stop(clearPresence: Boolean = true) {
         closeSocketAndLoops()
         overlayProbeTargets.clear()
+        _bindFailed.value = false
         if (clearPresence) {
             lanSightings.clear()
             overlaySightings.clear()
@@ -106,6 +111,19 @@ class LanBeacon(
     }
 
     private fun openSocketAndLoops() {
+        socket = runCatching {
+            DatagramSocket(null).apply {
+                reuseAddress = true
+                broadcast = true
+                bind(InetSocketAddress(BEACON_PORT))
+            }
+        }.onFailure { error ->
+            Log.e(TAG, "beacon socket bind failed — LAN discovery disabled: ${error.message}")
+        }.getOrNull()
+        _bindFailed.value = socket == null
+        if (socket == null) return
+
+        // Lock is only useful with a live socket; acquiring first leaked it on bind failure.
         runCatching {
             val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             multicastLock = wifi?.createMulticastLock("voxcrew-lan-beacon")?.apply {
@@ -114,15 +132,6 @@ class LanBeacon(
             }
         }.onFailure { Log.w(TAG, "multicast lock unavailable: ${it.message}") }
 
-        socket = runCatching {
-            DatagramSocket(null).apply {
-                reuseAddress = true
-                broadcast = true
-                bind(InetSocketAddress(BEACON_PORT))
-            }
-        }.onFailure { Log.w(TAG, "beacon socket bind failed: ${it.message}") }.getOrNull()
-
-        if (socket == null) return
         listenJob = scope.launch(Dispatchers.IO) { listenLoop() }
         broadcastJob = scope.launch(Dispatchers.IO) { broadcastLoop() }
         pruneJob = scope.launch { pruneLoop() }
@@ -278,8 +287,12 @@ class LanBeacon(
         const val BEACON_PORT = 47100
         /** Calm join/roster cadence — path failover is owned by TCP health, not beacons. */
         const val BROADCAST_INTERVAL_MS = 3_000L
-        /** Drop a sighting after roughly three missed announces. */
-        const val STALE_MS = 9_000L
+        /**
+         * Drop a sighting after five missed announces. Presence staleness only affects
+         * roster display and warm-standby priming — failover is owned by TCP health —
+         * so a couple of lost UDP packets must not flap a peer offline.
+         */
+        const val STALE_MS = 5 * BROADCAST_INTERVAL_MS
         const val PRUNE_INTERVAL_MS = 1_000L
         /** Warm Tailscale standby after one missed announce interval while LAN still listed. */
         const val MISSED_BEACON_MS = BROADCAST_INTERVAL_MS

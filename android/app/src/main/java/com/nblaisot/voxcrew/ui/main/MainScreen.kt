@@ -88,6 +88,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.nblaisot.voxcrew.R
 import com.nblaisot.voxcrew.audio.AudioPermissionIssue
 import com.nblaisot.voxcrew.audio.CaptureInputKind
+import com.nblaisot.voxcrew.audio.DEVICE_AUDIO_ROUTE_KEY
 import com.nblaisot.voxcrew.audio.ManualRouteStatus
 import com.nblaisot.voxcrew.audio.VoxSensitivity
 import com.nblaisot.voxcrew.lanlink.PathLabels
@@ -123,7 +124,10 @@ fun MainScreen(
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) viewModel.refreshPermissions()
+            if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.refreshPermissions()
+                viewModel.ensureIntercomRunning()
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -331,6 +335,14 @@ fun MainScreen(
                     if (state.showAudioRetry) {
                         TextButton(onClick = viewModel::retryAudio) {
                             Text(stringResource(R.string.retry))
+                        }
+                    }
+                    if (state.showUseThisDevice) {
+                        TextButton(
+                            onClick = { viewModel.selectAudioRoute(DEVICE_AUDIO_ROUTE_KEY) },
+                            modifier = Modifier.testTag("main_use_this_device"),
+                        ) {
+                            Text(stringResource(R.string.audio_route_this_device))
                         }
                     }
                 }

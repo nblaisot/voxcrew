@@ -1,7 +1,9 @@
 package com.nblaisot.voxcrew.lanlink
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 
 /**
  * One intercom link to a single peer: own [PeerLink] and LAN TCP client, with optional
@@ -13,6 +15,7 @@ class PeerConnection(
     private val localUid: String,
     private val lanServer: LanTcpServer,
     private val isStillWanted: () -> Boolean,
+    private val overlayPeerProvider: () -> LanPeer? = { null },
 ) {
     val peerLink = PeerLink(scope)
     private val lanTcpClient = LanTcpClient(scope, localUid, peerLink, lanServer)
@@ -22,26 +25,59 @@ class PeerConnection(
     val backlogMs: StateFlow<Long> = peerLink.backlogMs
 
     private var started = false
+    private var linkDeathWatchJob: Job? = null
 
     fun start() {
         if (started) return
         started = true
         lanServer.registerClient(peerUid, lanTcpClient)
         peerLink.resetFor(peerUid)
+        watchLinkDeath()
     }
 
     fun stop() {
         if (!started) return
         started = false
+        linkDeathWatchJob?.cancel()
+        linkDeathWatchJob = null
         lanTcpClient.stop()
         lanTcpClient.setTarget(null)
         lanServer.unregisterClient(peerUid)
         peerLink.clear()
     }
 
+    /**
+     * TCP health owns failover: a LAN link dying (frame-activity timeout or socket close)
+     * promotes overlay immediately instead of waiting for the beacon sighting to go stale.
+     */
+    private fun watchLinkDeath() {
+        linkDeathWatchJob?.cancel()
+        linkDeathWatchJob = scope.launch {
+            var lastConnectedVia: String? = null
+            peerLink.state.collect { state ->
+                when (state) {
+                    is PeerLink.LinkState.Connected -> lastConnectedVia = state.via
+                    is PeerLink.LinkState.Disconnected -> {
+                        val diedVia = lastConnectedVia
+                        lastConnectedVia = null
+                        if (diedVia == PathLabels.LOCAL && started) {
+                            overlayPeerProvider()?.let { promoteToOverlay(it) }
+                        }
+                    }
+                    else -> Unit
+                }
+            }
+        }
+    }
+
     fun updateLanTarget(peer: LanPeer?) {
         if (!started) return
         lanTcpClient.setTarget(peer)
+    }
+
+    /** User action (PTT, recipient toggle) grants an immediate dial retry despite backoff. */
+    fun resetDialBackoff() {
+        lanTcpClient.resetDialBackoff()
     }
 
     /**
@@ -86,7 +122,12 @@ class PeerConnection(
                 }
                 promoteToOverlay(overlayPeer)
             }
-            OverlayFailoverPolicy.PathAction.KEEP_SESSION -> Unit
+            OverlayFailoverPolicy.PathAction.KEEP_SESSION -> {
+                // Beacon quiet but LAN TCP healthy: prime overlay so link-death promote is instant.
+                if (decision.warmStandby && overlayPeer != null) {
+                    lanTcpClient.warmStandby(overlayPeer)
+                }
+            }
             OverlayFailoverPolicy.PathAction.CLEAR -> {
                 lanTcpClient.setTarget(null)
                 if (connected != null) {

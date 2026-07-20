@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -69,7 +70,9 @@ class LanIntercomEngine(
     private val connections = ConcurrentHashMap<String, PeerConnection>()
     private val audioCollectJobs = ConcurrentHashMap<String, Job>()
     private val feedbackWatchJobs = ConcurrentHashMap<String, Job>()
+    private val metricsWatchJobs = ConcurrentHashMap<String, Job>()
     private val receivingUntilMs = ConcurrentHashMap<String, Long>()
+    private val receivingExpiryLock = Any()
 
     private val pttPolicy = PushToTalkTransmissionPolicy()
     private val voxPolicy = VoiceActivatedTransmissionPolicy()
@@ -133,7 +136,6 @@ class LanIntercomEngine(
 
     private var voxJob: Job? = null
     private var receivingSweepJob: Job? = null
-    private var metricsJob: Job? = null
     private var routeWatchJob: Job? = null
     private val lifecycleJobs = mutableListOf<Job>()
     private val audioInitMutex = Mutex()
@@ -144,16 +146,22 @@ class LanIntercomEngine(
     val mediaDemanded: StateFlow<Boolean> = _mediaDemanded.asStateFlow()
     private val incomingMediaMutex = Mutex()
     private val pendingIncomingMedia = mutableMapOf<String, ArrayDeque<IncomingMediaEvent>>()
+    /** Frames arriving while Telecom teardown still holds [IntercomTelecomSession.hasCall]. */
+    private val pendingMediaPlayback = mutableMapOf<String, ArrayDeque<ByteArray>>()
     private var audioPrepared = false
     private var lastFanOutDiagMs = 0L
     /** Pipeline Failed disconnects Telecom; block auto-reactivate until [retryAudioPipeline]. */
     @Volatile private var telecomBlockedUntilRetry = false
 
     private var started = false
+    /** True while the mesh (beacon, TCP server, dial loops) is running. */
+    val isStarted: Boolean get() = started
     private var localUid: String = ""
     private var displayName: String = ""
     private var knownCrewUids: Set<String> = emptySet()
     private val peerOverlayEndpoints = ConcurrentHashMap<String, OverlayEndpoint>()
+    /** Cold-start probe hosts from the persisted roster; live sightings take precedence. */
+    private val seededOverlayProbeHosts = ConcurrentHashMap<String, String>()
 
     private data class OverlayEndpoint(
         val host: String,
@@ -169,22 +177,73 @@ class LanIntercomEngine(
                 closeAudioForTelecomLifecycle(cancelTransmission = !preserveTransmission)
             },
         )
+        capture.onRoutedDeviceChanged = { kind -> onObservedRoutingChanged("capture", kind) }
+        playback.onRoutedDeviceChanged = { kind -> onObservedRoutingChanged("playback", kind) }
+    }
+
+    private var routingMismatchJob: Job? = null
+
+    /**
+     * Telecom believes the call is on Bluetooth but the platform routed the live
+     * recorder/track elsewhere (typically SCO never started). One settle re-check,
+     * then fail the pipeline through the existing path (disconnect + Retry banner).
+     */
+    private fun onObservedRoutingChanged(source: String, kind: ObservedAudioDeviceKind) {
+        if (kind == ObservedAudioDeviceKind.UNKNOWN) return
+        if (!bluetoothRouteMismatch(kind)) {
+            routingMismatchJob?.cancel()
+            routingMismatchJob = null
+            return
+        }
+        if (routingMismatchJob?.isActive == true) return
+        routingMismatchJob = scope.launch(Dispatchers.IO) {
+            delay(ROUTING_SETTLE_MS)
+            val inputKind = capture.observedRoutedKind()
+            val outputKind = playback.observedRoutedKind()
+            val stillMismatched =
+                (inputKind != null && bluetoothRouteMismatch(inputKind)) ||
+                    (outputKind != null && bluetoothRouteMismatch(outputKind))
+            if (stillMismatched) {
+                onAudioPipelineFailure(
+                    "$source routed to $kind while Bluetooth endpoint is confirmed " +
+                        "(input=$inputKind output=$outputKind)",
+                )
+            }
+        }
+    }
+
+    private fun bluetoothRouteMismatch(kind: ObservedAudioDeviceKind): Boolean {
+        if (kind == ObservedAudioDeviceKind.UNKNOWN) return false
+        val call = telecomSession.currentState
+        return call.mediaActive &&
+            call.outputKind == OutputKind.BLUETOOTH &&
+            _audioPipelineState.value is AudioPipelineState.Ready &&
+            kind != ObservedAudioDeviceKind.BLUETOOTH
     }
 
     val statusText: StateFlow<String> = combine(
-        _activeRecipientUids,
-        _peerMetrics,
-        beacon.peers,
-        _audioPipelineState,
-        routeReady,
-    ) { active, metrics, peers, pipeline, duplexReady ->
-        describeStatus(
-            active = active ?: emptySet(),
-            metrics = metrics ?: emptyMap(),
-            visiblePeerCount = peers.count { it.uid != localUid },
-            pipeline = pipeline,
-            duplexReady = duplexReady,
-        )
+        combine(
+            _activeRecipientUids,
+            _peerMetrics,
+            beacon.peers,
+            _audioPipelineState,
+            routeReady,
+        ) { active, metrics, peers, pipeline, duplexReady ->
+            describeStatus(
+                active = active ?: emptySet(),
+                metrics = metrics ?: emptyMap(),
+                visiblePeerCount = peers.count { it.uid != localUid },
+                pipeline = pipeline,
+                duplexReady = duplexReady,
+            )
+        },
+        beacon.bindFailed,
+    ) { status, bindFailed ->
+        if (bindFailed) {
+            "$status · ${appContext.getString(R.string.status_discovery_unavailable)}"
+        } else {
+            status
+        }
     }.stateIn(scope, SharingStarted.Eagerly, appContext.getString(R.string.status_searching_crewmates))
 
     fun start(uid: String, displayName: String) {
@@ -202,7 +261,6 @@ class LanIntercomEngine(
         val overlayHost = if (overlayFallbackEnabled) TailscaleInterface.localOverlayIpv4() else null
         beacon.start(uid, displayName, lanServer.localPort, overlayHost)
         networkMonitor.start()
-        startReceivingSweep()
 
         val restoreVoxEnabled = prefs.getBoolean(KEY_VOX_ENABLED, false)
         if (restoreVoxEnabled) {
@@ -228,9 +286,11 @@ class LanIntercomEngine(
         lifecycleJobs += scope.launch {
             networkMonitor.networkChanged.collect { onNetworkChanged() }
         }
+        lifecycleJobs += scope.launch(Dispatchers.IO) {
+            telecomSession.callTornDown.collect { flushPendingMediaPlayback() }
+        }
 
         loadPersistedActiveRecipients()
-        startMetricsWatcher()
         ensureAudioRoutingMonitor()
         watchDivergedRoutes()
         scheduleMediaDemandReconciliation()
@@ -262,7 +322,8 @@ class LanIntercomEngine(
             val removed = connections.keys - targetUids
             removed.forEach { removeConnection(it) }
         }
-        updateOverlayProbes(beacon.peers.value.map { it.uid }.toSet())
+        // Only live LAN sightings suppress overlay probes; overlay-visible peers still need them.
+        updateOverlayProbes(beacon.presence.value.lanSightings.keys.filter { it != localUid }.toSet())
     }
 
     fun toggleRecipient(uid: String) {
@@ -290,7 +351,12 @@ class LanIntercomEngine(
         val removed = previous - filtered
         _activeRecipientUids.value = filtered
         if (persist) saveActiveRecipients(filtered)
-        filtered.forEach { ensureConnection(it).start() }
+        filtered.forEach {
+            ensureConnection(it).apply {
+                start()
+                resetDialBackoff()
+            }
+        }
         if (isOutboundMediaActive()) {
             added.forEach { uid -> connections[uid]?.sendMediaActivity(true) }
             removed.forEach { uid -> connections[uid]?.sendMediaActivity(false) }
@@ -306,7 +372,10 @@ class LanIntercomEngine(
     }
 
     fun onMicrophonePermissionDenied() {
-        mediaDemandState.setMicrophonePermissionGranted(false)
+        // Reconcile demand so the Wi-Fi low-latency lock is released along with Telecom.
+        if (mediaDemandState.setMicrophonePermissionGranted(false)) {
+            scheduleMediaDemandReconciliation()
+        }
         pttPolicy.cancel()
         setOutboundMediaActive(false)
         if (!started) return
@@ -342,6 +411,9 @@ class LanIntercomEngine(
         if (foreground) {
             // Foreground restores the Telecom path; multimedia inbound must not keep playing.
             mediaInboundPlayer.stop()
+            scope.launch(Dispatchers.IO) {
+                incomingMediaMutex.withLock { pendingMediaPlayback.clear() }
+            }
         } else if (!_voxEnabled.value) {
             pttPolicy.cancel()
             setOutboundMediaActive(false)
@@ -376,6 +448,7 @@ class LanIntercomEngine(
     fun pttPress() {
         if (_voxEnabled.value) return
         logPttRouteSummary()
+        _activeRecipientUids.value.forEach { connections[it]?.resetDialBackoff() }
         pttPolicy.onPress()
     }
 
@@ -703,9 +776,21 @@ class LanIntercomEngine(
                 localUid = localUid,
                 lanServer = lanServer,
                 isStillWanted = { peerUid in knownCrewUids || peerUid in _activeRecipientUids.value },
+                overlayPeerProvider = {
+                    if (overlayFallbackEnabled) {
+                        overlayPeerFor(
+                            peerUid,
+                            beacon.presence.value.overlaySightings[peerUid]
+                                ?.takeIf { it.uid != localUid },
+                        )
+                    } else {
+                        null
+                    }
+                },
             )
             startAudioCollection(conn)
             startConnectionFeedback(conn)
+            startMetricsWatch(conn)
             conn
         }
     }
@@ -724,10 +809,15 @@ class LanIntercomEngine(
     private fun removeConnection(peerUid: String) {
         audioCollectJobs.remove(peerUid)?.cancel()
         feedbackWatchJobs.remove(peerUid)?.cancel()
+        metricsWatchJobs.remove(peerUid)?.cancel()
+        _peerMetrics.update { it - peerUid }
         connections.remove(peerUid)?.stop()
         setRemoteTelecomDemand(peerUid, false)
         scope.launch(Dispatchers.IO) {
-            incomingMediaMutex.withLock { pendingIncomingMedia.remove(peerUid) }
+            incomingMediaMutex.withLock {
+                pendingIncomingMedia.remove(peerUid)
+                pendingMediaPlayback.remove(peerUid)
+            }
         }
         receivingUntilMs.remove(peerUid)
         refreshReceivingUids()
@@ -881,24 +971,73 @@ class LanIntercomEngine(
 
     private fun playIncomingMediaLocked(peerUid: String, payload: ByteArray): Boolean {
         // Gate MEDIA focus until Telecom call is fully gone (FG→BG serialization).
-        if (telecomSession.hasCall) return false
+        // Buffer the speech onset instead of dropping it; callTornDown flushes it.
+        if (telecomSession.hasCall) {
+            val queue = pendingMediaPlayback.getOrPut(peerUid) { ArrayDeque() }
+            while (queue.size >= MAX_PENDING_MEDIA_FRAMES) queue.removeFirst()
+            queue.addLast(payload)
+            return false
+        }
+        flushPendingMediaPlaybackLocked(peerUid)
         if (!mediaInboundPlayer.play(payload)) return false
         markReceiving(peerUid)
         return true
     }
 
+    /** Event-driven flush once Telecom teardown completes ([IntercomTelecomSession.callTornDown]). */
+    private suspend fun flushPendingMediaPlayback() {
+        incomingMediaMutex.withLock {
+            if (telecomSession.hasCall) return
+            if (inboundPlaybackMode() != InboundPlaybackMode.MEDIA) {
+                pendingMediaPlayback.clear()
+                return
+            }
+            pendingMediaPlayback.keys.toList().forEach { flushPendingMediaPlaybackLocked(it) }
+        }
+    }
+
+    private fun flushPendingMediaPlaybackLocked(peerUid: String) {
+        val queue = pendingMediaPlayback.remove(peerUid) ?: return
+        var played = false
+        queue.forEach { payload ->
+            if (mediaInboundPlayer.play(payload)) played = true
+        }
+        if (played) markReceiving(peerUid)
+    }
+
     private fun markReceiving(peerUid: String) {
         receivingUntilMs[peerUid] = System.currentTimeMillis() + RECEIVING_IDLE_MS
         refreshReceivingUids()
+        ensureReceivingExpiryJob()
     }
 
-    private fun startReceivingSweep() {
-        receivingSweepJob?.cancel()
-        receivingSweepJob = scope.launch {
-            while (currentCoroutineContext().isActive) {
-                delay(200)
-                refreshReceivingUids()
+    /**
+     * Event-driven replacement for the old 200 ms polling sweep: one job sleeps until
+     * the earliest receiving deadline and exits when nothing is receiving.
+     */
+    private fun ensureReceivingExpiryJob() {
+        synchronized(receivingExpiryLock) {
+            if (receivingSweepJob?.isActive == true) return
+            receivingSweepJob = scope.launch { receivingExpiryLoop() }
+        }
+    }
+
+    private suspend fun receivingExpiryLoop() {
+        while (currentCoroutineContext().isActive) {
+            val next = receivingUntilMs.values.minOrNull()
+            if (next == null) {
+                val exit = synchronized(receivingExpiryLock) {
+                    receivingUntilMs.isEmpty().also { empty ->
+                        if (empty) receivingSweepJob = null
+                    }
+                }
+                if (exit) return
+                continue
             }
+            delay((next - System.currentTimeMillis()).coerceAtLeast(20L))
+            val now = System.currentTimeMillis()
+            receivingUntilMs.entries.removeIf { it.value <= now }
+            refreshReceivingUids()
         }
     }
 
@@ -962,11 +1101,25 @@ class LanIntercomEngine(
         )
     }
 
+    /**
+     * Known crew that only ever met this device on Tailscale would otherwise be
+     * unreachable until the next LAN encounter. UDP probes go to the fixed beacon
+     * port, so a stale TCP port in the cache does not matter.
+     */
+    fun seedOverlayProbeHosts(hosts: Map<String, String>) {
+        hosts.forEach { (uid, host) ->
+            if (uid.isNotBlank() && host.isNotBlank()) seededOverlayProbeHosts[uid] = host
+        }
+    }
+
     /** Probe overlay only for peers without a live LAN sighting. */
     private fun updateOverlayProbes(lanVisibleUids: Set<String>) {
         val targets = (knownCrewUids + _activeRecipientUids.value)
             .filter { it != localUid && it !in lanVisibleUids }
-            .mapNotNull { uid -> peerOverlayEndpoints[uid]?.host?.let { uid to it } }
+            .mapNotNull { uid ->
+                val host = peerOverlayEndpoints[uid]?.host ?: seededOverlayProbeHosts[uid]
+                host?.let { uid to it }
+            }
             .toMap()
         beacon.setOverlayProbeTargets(targets)
     }
@@ -1030,20 +1183,19 @@ class LanIntercomEngine(
         prefs.edit().putString(KEY_ACTIVE_RECIPIENTS, json.encodeToString(uids)).apply()
     }
 
-    private fun startMetricsWatcher() {
-        metricsJob?.cancel()
-        metricsJob = scope.launch {
-            while (currentCoroutineContext().isActive) {
-                _peerMetrics.value = connections.mapValues { (_, conn) ->
-                    val state = conn.linkState.value
-                    PeerMetrics(
-                        rttMs = conn.rttMs.value,
-                        pathLabel = (state as? PeerLink.LinkState.Connected)?.via,
-                        backlogMs = conn.backlogMs.value,
-                        linkState = state,
-                    )
-                }
-                delay(500)
+    /** Event-driven metrics: one collector per connection, no periodic polling. */
+    private fun startMetricsWatch(conn: PeerConnection) {
+        if (metricsWatchJobs.containsKey(conn.peerUid)) return
+        metricsWatchJobs[conn.peerUid] = scope.launch(Dispatchers.Default) {
+            combine(conn.linkState, conn.rttMs, conn.backlogMs) { state, rtt, backlog ->
+                PeerMetrics(
+                    rttMs = rtt,
+                    pathLabel = (state as? PeerLink.LinkState.Connected)?.via,
+                    backlogMs = backlog,
+                    linkState = state,
+                )
+            }.collect { metrics ->
+                _peerMetrics.update { it + (conn.peerUid to metrics) }
             }
         }
     }
@@ -1175,8 +1327,8 @@ class LanIntercomEngine(
         policyWatchJob = null
         receivingSweepJob?.cancel()
         receivingSweepJob = null
-        metricsJob?.cancel()
-        metricsJob = null
+        metricsWatchJobs.values.forEach { it.cancel() }
+        metricsWatchJobs.clear()
         lifecycleJobs.forEach { it.cancel() }
         lifecycleJobs.clear()
 
@@ -1202,7 +1354,11 @@ class LanIntercomEngine(
     companion object {
         private const val TAG = "LanIntercomEngine"
         private const val RECEIVING_IDLE_MS = 500L
+        /** Grace before treating a BT routing mismatch as pipeline failure (SCO warm-up). */
+        private const val ROUTING_SETTLE_MS = 1_500L
         private const val MAX_PENDING_INCOMING_EVENTS = 250
+        /** ~2 s of 20 ms Opus frames buffered across the Telecom teardown gap. */
+        private const val MAX_PENDING_MEDIA_FRAMES = 100
         private const val PREFS_NAME = "voxcrew_lanlink"
         private const val KEY_ACTIVE_RECIPIENTS = "active_recipient_uids"
         private const val KEY_VOX_ENABLED = "vox_enabled"

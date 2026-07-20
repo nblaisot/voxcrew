@@ -152,6 +152,36 @@ class MediaDemandStateTest {
     }
 
     @Test
+    fun `rapid foreground bounce converges on the final state`() {
+        // FG -> BG -> FG faster than reconciliation can run: because reconciliation
+        // re-reads demand at each step, the outcome must depend only on the final state.
+        val state = readySession()
+        state.setAppForeground(true)
+        state.setAppForeground(false)
+        state.setAppForeground(true)
+        assertTrue(state.isDemanded())
+        assertEquals(
+            TelecomDemandAction.ACTIVATE,
+            telecomDemandAction(demanded = state.isDemanded(), isActive = false, hasCall = false),
+        )
+
+        // A stale disconnect (from the intermediate BG) is followed by re-activation.
+        assertEquals(
+            TelecomDemandAction.ACTIVATE,
+            telecomDemandAction(demanded = state.isDemanded(), isActive = false, hasCall = true),
+        )
+
+        state.setAppForeground(false)
+        state.setAppForeground(true)
+        state.setAppForeground(false)
+        assertFalse(state.isDemanded())
+        assertEquals(
+            TelecomDemandAction.DISCONNECT,
+            telecomDemandAction(demanded = state.isDemanded(), isActive = true, hasCall = true),
+        )
+    }
+
+    @Test
     fun `idle media demand fully disconnects instead of holding a call`() {
         assertEquals(
             TelecomDemandAction.DISCONNECT,
