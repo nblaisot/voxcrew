@@ -6,6 +6,14 @@ plugins {
     alias(libs.plugins.aboutlibraries.plugin.android)
 }
 
+import java.util.Properties
+
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties()
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }
+}
+
 android {
     namespace = "com.nblaisot.voxcrew"
     compileSdk = 36
@@ -16,6 +24,25 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+    }
+
+    signingConfigs {
+        create("release") {
+            val storePath = keystoreProperties["storeFile"] as? String
+            if (storePath != null) {
+                storeFile = rootProject.file(storePath)
+                storePassword = keystoreProperties["storePassword"] as String
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["keyPassword"] as String
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
+        }
     }
 
     buildFeatures {

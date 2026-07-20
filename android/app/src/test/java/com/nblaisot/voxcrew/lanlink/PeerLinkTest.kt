@@ -193,22 +193,33 @@ class PeerLinkTest {
     }
 
     @Test
-    fun `evaluateLiveness fails when pong is overdue`() {
+    fun `evaluateLiveness ignores overdue pong when frame activity is fresh`() {
         val peerLink = newPeerLink()
         peerLink.resetFor("peer-b")
         val transport = FakeTransport("A")
         peerLink.onHandshakeComplete(transport, "peer-b", -1)
 
         val now = System.currentTimeMillis()
-        peerLink.markPingSentForTest(now)
+        peerLink.markPingSentForTest(now - 10_000L)
 
-        assertTrue(peerLink.evaluateLiveness(now + 2_000))
-        assertFalse(peerLink.evaluateLiveness(now + 4_000))
+        assertTrue(peerLink.evaluateLiveness(now + 1_000L))
         peerLink.clear()
     }
 
     @Test
-    fun `evaluateLiveness passes after pong is received`() {
+    fun `evaluateLiveness fails when frame activity exceeds peer timeout`() {
+        val peerLink = newPeerLink()
+        peerLink.resetFor("peer-b")
+        val transport = FakeTransport("A")
+        peerLink.onHandshakeComplete(transport, "peer-b", -1)
+
+        val now = System.currentTimeMillis()
+        assertFalse(peerLink.evaluateLiveness(now + 7_000L))
+        peerLink.clear()
+    }
+
+    @Test
+    fun `evaluateLiveness passes after recent ack activity`() {
         val peerLink = newPeerLink()
         peerLink.resetFor("peer-b")
         val transport = FakeTransport("A")
@@ -216,9 +227,9 @@ class PeerLinkTest {
 
         val now = System.currentTimeMillis()
         peerLink.markPingSentForTest(now)
-        peerLink.onFrameReceived(transport, LanFrame.Pong(now))
+        peerLink.onFrameReceived(transport, LanFrame.Ack(0))
 
-        assertTrue(peerLink.evaluateLiveness(now + 4_000))
+        assertTrue(peerLink.evaluateLiveness(now + 4_000L))
         peerLink.clear()
     }
 

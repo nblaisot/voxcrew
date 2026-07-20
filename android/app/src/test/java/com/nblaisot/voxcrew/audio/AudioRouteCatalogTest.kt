@@ -9,8 +9,18 @@ import org.junit.Test
 
 class AudioRouteCatalogTest {
     private val speaker = endpoint("speaker", "Phone", CallEndpointCompat.TYPE_SPEAKER)
-    private val watch = endpoint("watch", "Galaxy Watch5", CallEndpointCompat.TYPE_BLUETOOTH)
-    private val buds = endpoint("buds", "Galaxy Buds", CallEndpointCompat.TYPE_BLUETOOTH)
+    private val watch = endpoint(
+        "watch-uuid",
+        "Galaxy Watch5",
+        CallEndpointCompat.TYPE_BLUETOOTH,
+        bluetoothAddress = "AA:BB:CC:DD:EE:01",
+    )
+    private val buds = endpoint(
+        "buds-uuid",
+        "Galaxy Buds",
+        CallEndpointCompat.TYPE_BLUETOOTH,
+        bluetoothAddress = "AA:BB:CC:DD:EE:02",
+    )
     private val usb = endpoint("usb", "USB Audio", CallEndpointCompat.TYPE_WIRED_HEADSET)
 
     @Test
@@ -32,7 +42,55 @@ class AudioRouteCatalogTest {
         assertEquals(listOf("Galaxy Buds", "Galaxy Watch5"), bluetooth.map { it.name })
         assertTrue(bluetooth.all { it.target == AudioRouteTarget.BLUETOOTH })
         assertNotEquals(bluetooth[0].key, bluetooth[1].key)
-        assertEquals(setOf("buds", "watch"), bluetooth.map { it.endpointIdentifier }.toSet())
+        assertEquals(
+            setOf(bluetoothAudioRouteKey("AA:BB:CC:DD:EE:02"), bluetoothAudioRouteKey("AA:BB:CC:DD:EE:01")),
+            bluetooth.map { it.key }.toSet(),
+        )
+        assertEquals(setOf("buds-uuid", "watch-uuid"), bluetooth.map { it.endpointIdentifier }.toSet())
+    }
+
+    @Test
+    fun sameMacTwoNamesCollapsesToOnePreferredRow() {
+        val oldName = endpoint(
+            "uuid-old",
+            "Buds (old)",
+            CallEndpointCompat.TYPE_BLUETOOTH,
+            bluetoothAddress = "AA:BB:CC:DD:EE:02",
+        )
+        val newName = endpoint(
+            "uuid-new",
+            "Nicolas' Buds",
+            CallEndpointCompat.TYPE_BLUETOOTH,
+            bluetoothAddress = "AA:BB:CC:DD:EE:02",
+        )
+        val choices = buildAudioRouteChoices(
+            endpoints = listOf(speaker, oldName, newName),
+            preferredBluetoothNames = setOf("nicolas' buds"),
+        )
+        val bluetooth = choices.filter { it.inputKind == CaptureInputKind.BLUETOOTH }
+
+        assertEquals(1, bluetooth.size)
+        assertEquals("Nicolas' Buds", bluetooth.single().name)
+        assertEquals(bluetoothAudioRouteKey("AA:BB:CC:DD:EE:02"), bluetooth.single().key)
+        assertEquals("uuid-new", bluetooth.single().endpointIdentifier)
+    }
+
+    @Test
+    fun renameRemapsSelectionByMac() {
+        val oldChoice = buildAudioRouteChoices(listOf(speaker, buds))
+            .single { it.bluetoothAddress == "AA:BB:CC:DD:EE:02" }
+        val renamed = endpoint(
+            "buds-renamed-uuid",
+            "New Buds Name",
+            CallEndpointCompat.TYPE_BLUETOOTH,
+            bluetoothAddress = "AA:BB:CC:DD:EE:02",
+        )
+        val afterRename = buildAudioRouteChoices(listOf(speaker, renamed))
+        val rematched = selectedAudioRouteChoice(afterRename, oldChoice)
+
+        assertEquals(bluetoothAudioRouteKey("AA:BB:CC:DD:EE:02"), rematched.key)
+        assertEquals("New Buds Name", rematched.name)
+        assertEquals("buds-renamed-uuid", rematched.endpointIdentifier)
     }
 
     @Test
@@ -74,7 +132,7 @@ class AudioRouteCatalogTest {
         val choicesAfterRemoval = buildAudioRouteChoices(listOf(speaker, watch))
 
         assertEquals(
-            "endpoint:${buds.identifier}",
+            bluetoothAudioRouteKey("AA:BB:CC:DD:EE:02"),
             selectedAudioRouteChoice(choicesAfterRemoval, selectedBuds).key,
         )
     }
@@ -91,5 +149,10 @@ class AudioRouteCatalogTest {
         assertTrue(bluetooth.all { DemoFixtures.isDemoAudioRouteKey(it.key) })
     }
 
-    private fun endpoint(id: String, name: String, type: Int) = TelecomEndpoint(id, name, type)
+    private fun endpoint(
+        id: String,
+        name: String,
+        type: Int,
+        bluetoothAddress: String? = null,
+    ) = TelecomEndpoint(id, name, type, bluetoothAddress = bluetoothAddress)
 }

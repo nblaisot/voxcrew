@@ -41,6 +41,18 @@ Aucun serveur applicatif : découverte et audio restent entre les appareils (LAN
 
 Un seul espace de séquence `PeerLink` survit au changement de chemin (make-before-break vers le LAN quand il revient).
 
+## Présence et transport (trois plans)
+
+| Plan | Rôle |
+|------|------|
+| Sighting LAN | Broadcast UDP reçu hors Tailscale — « peer nearby on Wi‑Fi » |
+| Registre overlay | Adresse `100.x` annoncée / vue — book d’adresses, pas un heartbeat |
+| Session TCP | Lien audio ; santé = activité de frames (ACK/média). Ping = RTT seulement |
+
+Les sightings LAN et overlay ne s’écrasent pas. Une session overlay saine **n’est pas** coupée parce que le beacon LAN a disparu. Le label de chemin (`Local` / `VPN`) vient de l’adresse du socket au Hello, pas de l’intention de dial seule.
+
+La cadence beacon (~3 s) sert au join/roster ; le basculement de chemin est piloté par la présence LAN vs registre overlay + santé TCP, pas par un heartbeat UDP agressif.
+
 ## Cycle de vie intercom
 
 ```mermaid

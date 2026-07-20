@@ -1,10 +1,53 @@
 package com.nblaisot.voxcrew.lanlink
 
 /**
- * Pure timing policy for LAN → Tailscale failover.
- * Detection uses [LanBeacon] intervals; this decides when to warm standby vs promote.
+ * Pure path preference for LAN ↔ Tailscale. Discovery feeds sightings; TCP session
+ * health owns whether an active link stays up.
  */
 object OverlayFailoverPolicy {
+    enum class PathAction {
+        /** Prefer / keep LAN as the active dial target; optionally warm overlay standby. */
+        USE_LAN,
+        /** No live LAN sighting — use overlay endpoint (promote or dial). */
+        USE_OVERLAY,
+        /** Discovery quiet but TCP is healthy — leave the active session alone. */
+        KEEP_SESSION,
+        /** No discovery path and no healthy session — clear dial target. */
+        CLEAR,
+    }
+
+    data class Decision(
+        val action: PathAction,
+        val warmStandby: Boolean = false,
+    )
+
+    fun decide(
+        lanSighting: LanPeer?,
+        hasOverlayEndpoint: Boolean,
+        nowMs: Long,
+        activeVia: String?,
+        sessionHealthy: Boolean,
+    ): Decision {
+        val lan = lanSighting?.takeUnless { it.viaOverlay }
+        if (lan != null) {
+            val warm = shouldWarmStandby(
+                lanLastSeenMs = lan.lastSeenMs,
+                nowMs = nowMs,
+                hasOverlayEndpoint = hasOverlayEndpoint,
+                lanStillListed = true,
+            )
+            return Decision(PathAction.USE_LAN, warmStandby = warm)
+        }
+        if (hasOverlayEndpoint) {
+            return Decision(PathAction.USE_OVERLAY)
+        }
+        // Healthy TCP must not be torn down solely because discovery went quiet.
+        if (sessionHealthy && activeVia != null) {
+            return Decision(PathAction.KEEP_SESSION)
+        }
+        return Decision(PathAction.CLEAR)
+    }
+
     fun shouldWarmStandby(
         lanLastSeenMs: Long?,
         nowMs: Long,

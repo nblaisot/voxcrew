@@ -8,7 +8,7 @@ import org.junit.Test
 class OverlayFailoverPolicyTest {
 
     @Test
-    fun `warms standby after one missed beacon while still listed`() {
+    fun `warms standby after one missed announce while still listed`() {
         val now = 10_000L
         assertTrue(
             OverlayFailoverPolicy.shouldWarmStandby(
@@ -49,9 +49,58 @@ class OverlayFailoverPolicyTest {
     }
 
     @Test
-    fun `beacon stale window is under five seconds`() {
-        assertTrue(LanBeacon.STALE_MS <= 2_500L)
-        assertTrue(LanBeacon.BROADCAST_INTERVAL_MS <= 1_000L)
-        assertTrue(LanBeacon.STALE_MS + LanBeacon.PRUNE_INTERVAL_MS < 5_000L)
+    fun `decide prefers LAN when lan sighting is live`() {
+        val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = lan,
+            hasOverlayEndpoint = true,
+            nowMs = 10_000L,
+            activeVia = PathLabels.VPN,
+            sessionHealthy = true,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_LAN, decision.action)
+    }
+
+    @Test
+    fun `decide uses overlay when LAN absent and endpoint known`() {
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = null,
+            hasOverlayEndpoint = true,
+            nowMs = 10_000L,
+            activeVia = null,
+            sessionHealthy = false,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_OVERLAY, decision.action)
+    }
+
+    @Test
+    fun `decide keeps healthy session when discovery is quiet`() {
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = null,
+            hasOverlayEndpoint = false,
+            nowMs = 10_000L,
+            activeVia = PathLabels.VPN,
+            sessionHealthy = true,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.KEEP_SESSION, decision.action)
+    }
+
+    @Test
+    fun `decide clears only when discovery and session are both gone`() {
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = null,
+            hasOverlayEndpoint = false,
+            nowMs = 10_000L,
+            activeVia = null,
+            sessionHealthy = false,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.CLEAR, decision.action)
+    }
+
+    @Test
+    fun `discovery cadence is for join not failover heartbeat`() {
+        assertTrue(LanBeacon.BROADCAST_INTERVAL_MS >= 3_000L)
+        assertTrue(LanBeacon.STALE_MS >= LanBeacon.BROADCAST_INTERVAL_MS * 2)
+        assertEquals(LanBeacon.BROADCAST_INTERVAL_MS, LanBeacon.MISSED_BEACON_MS)
     }
 }

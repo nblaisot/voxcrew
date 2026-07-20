@@ -17,7 +17,7 @@ Galaxy A <== UDP beacon (découverte) + TCP audio Opus (LAN / hotspot / Tailscal
 
 Détail dans [android/app/src/main/java/com/nblaisot/voxcrew/lanlink/](android/app/src/main/java/com/nblaisot/voxcrew/lanlink/) :
 
-- **Découverte** : `LanBeacon` diffuse `uid`, nom et port TCP en broadcast UDP (port `47100`) toutes les 2 s.
+- **Découverte** : `LanBeacon` diffuse `uid`, nom et port TCP en broadcast UDP (port `47100`) toutes les 3 s (join/roster). Les sightings LAN et overlay sont séparés ; la santé du lien TCP ne dépend pas du beacon.
 - **Protocole** : `PeerLink` (séquences, `SendBuffer`, RTT, backlog) au-dessus de `LanTcpClient` / `LanTcpServer`.
 - **Reprise** : à la reconnexion, rejeu du gap de séquences — pas de perte, seulement du retard.
 - **Audio** : Opus 20 ms, Telecom pour le duplex, PTT / VOX (Silero VAD).

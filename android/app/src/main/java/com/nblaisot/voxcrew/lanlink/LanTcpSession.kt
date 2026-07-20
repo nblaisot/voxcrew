@@ -26,7 +26,7 @@ internal class LanTcpSession(
     private val input: DataInputStream,
     private val peerLink: PeerLink,
     private val transport: FrameTransport,
-    private val onClosed: (String) -> Unit,
+    private val onClosed: (LanTcpSession) -> Unit,
 ) {
     private var readerJob: Job? = null
     private val writer = SerializedFrameWriter(
@@ -75,7 +75,7 @@ internal class LanTcpSession(
         writer.stop()
         readerJob?.cancel()
         runCatching { socket.close() }
-        onClosed(peerUid)
+        onClosed(this)
     }
 
     companion object {

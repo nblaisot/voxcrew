@@ -52,8 +52,13 @@
     <string name="included_in_group">Included in group</string>
     <string name="muted_not_included">Muted (not included)</string>
     <string name="availability_offline">Offline</string>
+    <string name="availability_nearby">Nearby</string>
     <string name="ptt_hold_to_talk">PTT — hold to talk</string>
     <string name="ptt_transmitting">Transmitting…</string>
+    <string name="ptt_audio_unavailable">Audio unavailable — tap Retry</string>
+    <string name="ptt_no_recipient">Include a crewmate to talk</string>
+    <string name="ptt_no_link">Waiting for audio link…</string>
+    <string name="ptt_background">Return to VoxCrew to talk</string>
     <string name="vox_listening">Vox on — listening</string>
     <string name="vox_transmitting">Vox — transmitting…</string>
     <string name="audio_connecting">Connecting audio — %1$s…</string>
@@ -99,4 +104,6 @@
         <item quantity="one">%d connected</item>
         <item quantity="other">%d connected</item>
     </plurals>
+    <string name="status_audio_unavailable">audio unavailable</string>
+    <string name="status_audio_pending">audio pending</string>
 </resources>

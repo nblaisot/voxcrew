@@ -3,6 +3,8 @@ package com.nblaisot.voxcrew.roster
 enum class MemberAvailability {
     ONLINE_LOCAL,
     ONLINE_OVERLAY,
+    /** Discovered nearby but no live audio link yet. */
+    NEARBY,
     OFFLINE,
 }
 

@@ -95,7 +95,7 @@ class DemoRosterPolicyTest {
     @Test
     fun preferredEarbudsRouteKeyIsStable() {
         assertEquals(
-            "endpoint:${DemoFixtures.EARBUDS_ID}",
+            "bt:${DemoFixtures.EARBUDS_ID.uppercase()}",
             DemoFixtures.audioRouteKey(DemoFixtures.EARBUDS_ID),
         )
         assertTrue(DemoFixtures.isDemoAudioRouteKey(DemoFixtures.audioRouteKey(DemoFixtures.EARBUDS_ID)))

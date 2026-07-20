@@ -5,9 +5,10 @@ import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.roster.MemberAvailability
 
 /**
- * Roster [MemberAvailability] reflects presence/beacon hints and can stay OFFLINE for a
- * peer that is already reachable over an established audio link.
- * When [linkState] is connected, derive the icon from the live path label instead.
+ * Roster icon combines discovery hints with live audio-link state.
+ * - Connected audio → show the live path (Local / VPN).
+ * - Discovery without Connected → [MemberAvailability.NEARBY], not a path glyph.
+ * - Offline discovery → [MemberAvailability.OFFLINE].
  */
 internal fun displayAvailability(
     rosterAvailability: MemberAvailability,
@@ -19,9 +20,16 @@ internal fun displayAvailability(
             PathLabels.VPN -> MemberAvailability.ONLINE_OVERLAY
             else -> MemberAvailability.ONLINE_LOCAL
         }
-        is PeerLink.LinkState.Disconnected -> return MemberAvailability.OFFLINE
-        is PeerLink.LinkState.Connecting -> return MemberAvailability.OFFLINE
-        else -> Unit
+        is PeerLink.LinkState.Disconnected,
+        is PeerLink.LinkState.Connecting,
+        PeerLink.LinkState.Idle,
+        null,
+        -> return when (rosterAvailability) {
+            MemberAvailability.ONLINE_LOCAL,
+            MemberAvailability.ONLINE_OVERLAY,
+            MemberAvailability.NEARBY,
+            -> MemberAvailability.NEARBY
+            MemberAvailability.OFFLINE -> MemberAvailability.OFFLINE
+        }
     }
-    return rosterAvailability
 }

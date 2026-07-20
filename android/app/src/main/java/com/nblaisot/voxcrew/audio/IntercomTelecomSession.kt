@@ -1,11 +1,13 @@
 package com.nblaisot.voxcrew.audio
 
 import android.Manifest
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
 import android.telecom.DisconnectCause
 import android.util.Log
 import androidx.core.content.ContextCompat
@@ -378,6 +380,11 @@ class IntercomTelecomSession(
         false
     }
 
+    suspend fun disconnectForDivergedRoute() {
+        routeActivationGate.onRouteFailure()
+        disconnect()
+    }
+
     suspend fun disconnect() {
         stop()
         currentStopJob()?.join()
@@ -534,6 +541,7 @@ class IntercomTelecomSession(
         val choices = buildAudioRouteChoices(
             endpoints = withDemo,
             usbProductNames = connectedUsbProductNames(),
+            preferredBluetoothNames = connectedBluetoothDeviceNames(),
             deviceRouteName = appContext.getString(com.nblaisot.voxcrew.R.string.audio_route_this_device),
         )
         val previous = _routeSelection.value
@@ -564,6 +572,12 @@ class IntercomTelecomSession(
             endpoints.firstOrNull { it.type == CallEndpointCompat.TYPE_SPEAKER }
         } else {
             endpoints.firstOrNull { it.identifier.toString() == choice.endpointIdentifier }
+                ?: choice.bluetoothAddress?.let { mac ->
+                    endpoints.firstOrNull {
+                        it.type == CallEndpointCompat.TYPE_BLUETOOTH &&
+                            resolveBluetoothAddress(it) == mac
+                    }
+                }
         }
     }
 
@@ -578,6 +592,53 @@ class IntercomTelecomSession(
         .map { it.productName.toString().normalizeAudioDeviceName() }
         .filter { it.isNotEmpty() }
         .toSet()
+
+    private fun connectedBluetoothDeviceNames(): Set<String> {
+        if (!hasBluetoothConnectPermission()) return emptySet()
+        val adapter = appContext.getSystemService(BluetoothManager::class.java)?.adapter
+            ?: return emptySet()
+        return runCatching {
+            adapter.bondedDevices.orEmpty()
+                .mapNotNull { device ->
+                    device.name?.takeIf { it.isNotBlank() }?.normalizeAudioDeviceName()
+                }
+                .toSet()
+        }.getOrDefault(emptySet())
+    }
+
+    private fun hasBluetoothConnectPermission(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            ContextCompat.checkSelfPermission(appContext, Manifest.permission.BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun resolveBluetoothAddress(endpoint: CallEndpointCompat): String? {
+        if (endpoint.type != CallEndpointCompat.TYPE_BLUETOOTH) return null
+        readJetpackBluetoothAddress(endpoint)?.let { return it }
+        return matchBluetoothAddressByName(endpoint.name.toString())
+    }
+
+    private fun matchBluetoothAddressByName(endpointName: String): String? {
+        if (!hasBluetoothConnectPermission()) return null
+        val adapter = appContext.getSystemService(BluetoothManager::class.java)?.adapter
+            ?: return null
+        val normalized = endpointName.normalizeAudioDeviceName()
+        if (normalized.isEmpty()) return null
+        return runCatching {
+            adapter.bondedDevices.orEmpty()
+                .firstOrNull { device ->
+                    device.name?.normalizeAudioDeviceName() == normalized
+                }
+                ?.address
+                ?.normalizeBluetoothAddress()
+        }.getOrNull()
+    }
+
+    private fun CallEndpointCompat.toTelecomEndpoint(): TelecomEndpoint = TelecomEndpoint(
+        identifier = identifier.toString(),
+        name = name.toString(),
+        type = type,
+        bluetoothAddress = resolveBluetoothAddress(this),
+    )
 
     private fun publish(state: TelecomCallState, reason: String) {
         if (_callState.value == state) return
@@ -673,41 +734,86 @@ internal class TelecomSessionGenerationArbiter {
 internal fun buildAudioRouteChoices(
     endpoints: List<TelecomEndpoint>,
     usbProductNames: Set<String> = emptySet(),
+    preferredBluetoothNames: Set<String> = emptySet(),
     deviceRouteName: String = "This device",
 ): List<AudioRouteChoice> {
     val speaker = endpoints.firstOrNull { it.type == CallEndpointCompat.TYPE_SPEAKER }
     val wiredEndpoints = endpoints.filter { it.type == CallEndpointCompat.TYPE_WIRED_HEADSET }
-    val accessories = endpoints.mapNotNull { endpoint ->
-        val kind = when (endpoint.type) {
-            CallEndpointCompat.TYPE_BLUETOOTH -> CaptureInputKind.BLUETOOTH
-            CallEndpointCompat.TYPE_WIRED_HEADSET -> {
-                val normalizedName = endpoint.name.normalizeAudioDeviceName()
-                val isUsb = normalizedName in usbProductNames ||
-                    (wiredEndpoints.size == 1 && usbProductNames.isNotEmpty())
-                if (isUsb) CaptureInputKind.USB else CaptureInputKind.WIRED
-            }
-            else -> return@mapNotNull null
-        }
+    val bluetoothChoices = collapseBluetoothEndpoints(endpoints, preferredBluetoothNames)
+    val wiredChoices = wiredEndpoints.map { endpoint ->
+        val normalizedName = endpoint.name.normalizeAudioDeviceName()
+        val isUsb = normalizedName in usbProductNames ||
+            (wiredEndpoints.size == 1 && usbProductNames.isNotEmpty())
         AudioRouteChoice(
             key = "endpoint:${endpoint.identifier}",
             name = endpoint.name,
-            inputKind = kind,
-            target = if (endpoint.type == CallEndpointCompat.TYPE_BLUETOOTH) {
-                AudioRouteTarget.BLUETOOTH
-            } else {
-                AudioRouteTarget.WIRED_USB
-            },
+            inputKind = if (isUsb) CaptureInputKind.USB else CaptureInputKind.WIRED,
+            target = AudioRouteTarget.WIRED_USB,
             endpointIdentifier = endpoint.identifier,
             endpointType = endpoint.type,
         )
-    }.sortedWith(compareBy<AudioRouteChoice>({ it.inputKind.routeOrder() }, { it.name.lowercase() }))
+    }
+    val accessories = (bluetoothChoices + wiredChoices)
+        .sortedWith(compareBy({ it.inputKind.routeOrder() }, { it.name.lowercase() }))
     return listOf(deviceAudioRouteChoice(speaker?.identifier, deviceRouteName)) + accessories
+}
+
+/**
+ * One menu row per Bluetooth MAC. Endpoints without a resolvable MAC keep
+ * `endpoint:` keys and are not collapsed (cannot safely merge unknowns).
+ */
+internal fun collapseBluetoothEndpoints(
+    endpoints: List<TelecomEndpoint>,
+    preferredBluetoothNames: Set<String> = emptySet(),
+): List<AudioRouteChoice> {
+    val bluetooth = endpoints.filter { it.type == CallEndpointCompat.TYPE_BLUETOOTH }
+    val withMac = bluetooth.filter { !it.bluetoothAddress.isNullOrBlank() }
+    val withoutMac = bluetooth.filter { it.bluetoothAddress.isNullOrBlank() }
+    val preferredNormalized = preferredBluetoothNames.map { it.normalizeAudioDeviceName() }.toSet()
+
+    val collapsed = withMac
+        .groupBy { it.bluetoothAddress!!.normalizeBluetoothAddress() }
+        .map { (mac, group) ->
+            val preferred = group.firstOrNull { endpoint ->
+                endpoint.name.normalizeAudioDeviceName() in preferredNormalized
+            } ?: group.maxByOrNull { it.name.length } ?: group.first()
+            AudioRouteChoice(
+                key = bluetoothAudioRouteKey(mac),
+                name = preferred.name,
+                inputKind = CaptureInputKind.BLUETOOTH,
+                target = AudioRouteTarget.BLUETOOTH,
+                endpointIdentifier = preferred.identifier,
+                endpointType = CallEndpointCompat.TYPE_BLUETOOTH,
+                bluetoothAddress = mac,
+            )
+        }
+
+    val unresolved = withoutMac.map { endpoint ->
+        AudioRouteChoice(
+            key = "endpoint:${endpoint.identifier}",
+            name = endpoint.name,
+            inputKind = CaptureInputKind.BLUETOOTH,
+            target = AudioRouteTarget.BLUETOOTH,
+            endpointIdentifier = endpoint.identifier,
+            endpointType = CallEndpointCompat.TYPE_BLUETOOTH,
+        )
+    }
+    return collapsed + unresolved
 }
 
 internal fun selectedAudioRouteChoice(
     availableChoices: List<AudioRouteChoice>,
     previous: AudioRouteChoice,
-): AudioRouteChoice = availableChoices.firstOrNull { it.key == previous.key } ?: previous
+): AudioRouteChoice {
+    availableChoices.firstOrNull { it.key == previous.key }?.let { return it }
+    previous.bluetoothAddress?.let { mac ->
+        availableChoices.firstOrNull { it.bluetoothAddress == mac }?.let { return it }
+    }
+    previous.endpointIdentifier?.let { id ->
+        availableChoices.firstOrNull { it.endpointIdentifier == id }?.let { return it }
+    }
+    return previous
+}
 
 private fun CaptureInputKind.routeOrder(): Int = when (this) {
     CaptureInputKind.BLUETOOTH -> 0
@@ -717,6 +823,28 @@ private fun CaptureInputKind.routeOrder(): Int = when (this) {
 }
 
 private fun String.normalizeAudioDeviceName(): String = trim().lowercase()
+
+internal fun String.normalizeBluetoothAddress(): String = trim().uppercase()
+
+/**
+ * Jetpack Telecom stores the BT MAC on an internal field (`mMackAddress`). Prefer that;
+ * [CallEndpointCompat.UNKNOWN_MAC_ADDRESS] ("-1") means unset.
+ */
+internal fun readJetpackBluetoothAddress(endpoint: CallEndpointCompat): String? {
+    val raw = runCatching {
+        endpoint.javaClass.methods
+            .firstOrNull { it.name == "getMMackAddress\$core_telecom" && it.parameterCount == 0 }
+            ?.invoke(endpoint) as? String
+            ?: endpoint.javaClass.getDeclaredField("mMackAddress").apply { isAccessible = true }
+                .get(endpoint) as? String
+    }.getOrNull()
+    val normalized = raw?.normalizeBluetoothAddress()
+    return normalized?.takeIf {
+        it.isNotEmpty() && it != UNKNOWN_BLUETOOTH_MAC
+    }
+}
+
+private const val UNKNOWN_BLUETOOTH_MAC = "-1"
 
 internal data class EndpointRequestResult(
     val success: Boolean = false,
@@ -772,7 +900,11 @@ internal class TelecomRouteCoordinator(
             if (desired.type == CallEndpointCompat.TYPE_SPEAKER) {
                 endpoints.firstOrNull { it.type == CallEndpointCompat.TYPE_SPEAKER } ?: desired
             } else {
-                endpoints.firstOrNull { it.identifier == desired.identifier } ?: desired
+                endpoints.firstOrNull { it.identifier == desired.identifier }
+                    ?: desired.bluetoothAddress?.let { mac ->
+                        endpoints.firstOrNull { it.bluetoothAddress == mac }
+                    }
+                    ?: desired
             }
         }
         val desiredAvailable = selected?.let(::findAvailableEndpoint) != null
@@ -865,6 +997,9 @@ internal class TelecomRouteCoordinator(
             available.firstOrNull { it.type == CallEndpointCompat.TYPE_SPEAKER }
         } else {
             available.firstOrNull { it.identifier == choice.endpointIdentifier }
+                ?: choice.bluetoothAddress?.let { mac ->
+                    available.firstOrNull { it.bluetoothAddress == mac }
+                }
         }
 
     private fun findAvailableEndpoint(endpoint: TelecomEndpoint): TelecomEndpoint? =
@@ -872,12 +1007,16 @@ internal class TelecomRouteCoordinator(
             available.firstOrNull { it.type == CallEndpointCompat.TYPE_SPEAKER }
         } else {
             available.firstOrNull { it.identifier == endpoint.identifier }
+                ?: endpoint.bluetoothAddress?.let { mac ->
+                    available.firstOrNull { it.bluetoothAddress == mac }
+                }
         }
 
     private fun AudioRouteChoice.toTelecomEndpointPlaceholder(): TelecomEndpoint = TelecomEndpoint(
         identifier = endpointIdentifier ?: DEVICE_AUDIO_ROUTE_KEY,
         name = name,
         type = endpointType,
+        bluetoothAddress = bluetoothAddress,
     )
 
     private fun publishRouteState() {
@@ -901,12 +1040,6 @@ internal class TelecomRouteCoordinator(
         publishRouteState()
     }
 }
-
-private fun CallEndpointCompat.toTelecomEndpoint(): TelecomEndpoint = TelecomEndpoint(
-    identifier = identifier.toString(),
-    name = name.toString(),
-    type = type,
-)
 
 private interface TelecomCallController {
     suspend fun activate(): Boolean

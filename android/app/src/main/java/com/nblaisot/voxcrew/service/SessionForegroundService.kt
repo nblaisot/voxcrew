@@ -56,7 +56,6 @@ class SessionForegroundService : Service() {
             else -> {
                 lastStatusLabel = intent?.getStringExtra(EXTRA_TRANSPORT) ?: lastStatusLabel
                 promoteForeground(buildNotification(lastStatusLabel, lastVoxEnabled))
-                acquireWifiLock()
                 observeEngine()
             }
         }
@@ -98,18 +97,26 @@ class SessionForegroundService : Service() {
         if (observeJob?.isActive == true) return
         val engine = (application as? VoxCrewApp)?.container?.lanIntercomEngine ?: return
         observeJob = serviceScope.launch {
-            combine(engine.statusText, engine.voxEnabled) { status, vox -> status to vox }
-                .collect { (status, vox) ->
-                    lastStatusLabel = status
-                    lastVoxEnabled = vox
-                    val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                    manager.notify(NOTIFICATION_ID, buildNotification(status, vox))
+            launch {
+                combine(engine.statusText, engine.voxEnabled) { status, vox -> status to vox }
+                    .collect { (status, vox) ->
+                        lastStatusLabel = status
+                        lastVoxEnabled = vox
+                        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                        manager.notify(NOTIFICATION_ID, buildNotification(status, vox))
+                    }
+            }
+            launch {
+                engine.mediaDemanded.collect { demanded ->
+                    if (demanded) acquireLowLatencyWifiLock() else releaseWifiLock()
                 }
+            }
         }
     }
 
-    private fun acquireWifiLock() {
-        if (wifiLock != null) return
+    private fun acquireLowLatencyWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        releaseWifiLock()
         runCatching {
             val wifi = getSystemService(Context.WIFI_SERVICE) as? WifiManager
             wifiLock = wifi?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "voxcrew-lan-link")?.apply {

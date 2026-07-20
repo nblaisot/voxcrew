@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Headset
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.VpnLock
 import androidx.compose.material.icons.filled.Wifi
@@ -397,11 +398,12 @@ fun MainScreen(
 
             val pttPreparing = !state.voxEnabled && !state.pttEnabled
             val pttColor = when {
-                state.isTransmitting -> VoxPttActive
+                state.isTransmitting && state.pttBlockReason == PttBlockReason.Ready -> VoxPttActive
+                state.pttBlockReason == PttBlockReason.NoLink -> VoxPttActive
                 pttPreparing -> MaterialTheme.colorScheme.surfaceVariant
                 else -> VoxPttIdle
             }
-            val pttContentColor = if (pttPreparing) {
+            val pttContentColor = if (pttPreparing && state.pttBlockReason != PttBlockReason.NoLink) {
                 MaterialTheme.colorScheme.onSurfaceVariant
             } else {
                 MaterialTheme.colorScheme.onPrimary
@@ -446,22 +448,7 @@ fun MainScreen(
                             .padding(end = 8.dp),
                     )
                     Text(
-                        when {
-                            state.audioRoutePending ->
-                                stringResource(
-                                    R.string.audio_connecting,
-                                    state.selectedAudioRoute.name,
-                                )
-                            state.audioRouteStatus == ManualRouteStatus.DIVERGED ||
-                                state.audioRouteStatus == ManualRouteStatus.UNAVAILABLE ||
-                                state.audioRouteStatus == ManualRouteStatus.FAILED ->
-                                stringResource(R.string.audio_choose_output)
-                            state.voxEnabled && state.isTransmitting ->
-                                stringResource(R.string.vox_transmitting)
-                            state.voxEnabled -> stringResource(R.string.vox_listening)
-                            state.isTransmitting -> stringResource(R.string.ptt_transmitting)
-                            else -> stringResource(R.string.ptt_hold_to_talk)
-                        },
+                        pttLabel(state),
                         color = pttContentColor,
                         fontWeight = FontWeight.SemiBold,
                     )
@@ -477,6 +464,30 @@ private fun audioRouteIcon(kind: CaptureInputKind): ImageVector = when (kind) {
     CaptureInputKind.BLUETOOTH -> Icons.Filled.Bluetooth
     CaptureInputKind.USB -> Icons.Filled.Usb
     CaptureInputKind.WIRED -> Icons.Filled.Headset
+}
+
+@Composable
+private fun pttLabel(state: MainUiState): String = when (state.pttBlockReason) {
+    PttBlockReason.VoxMode -> if (state.isTransmitting) {
+        stringResource(R.string.vox_transmitting)
+    } else {
+        stringResource(R.string.vox_listening)
+    }
+    PttBlockReason.Failed -> stringResource(R.string.ptt_audio_unavailable)
+    PttBlockReason.Pending -> stringResource(
+        R.string.audio_connecting,
+        state.selectedAudioRoute.name,
+    )
+    PttBlockReason.Diverged -> stringResource(R.string.audio_choose_output)
+    PttBlockReason.NoMic -> stringResource(R.string.ptt_audio_unavailable)
+    PttBlockReason.Background -> stringResource(R.string.ptt_background)
+    PttBlockReason.NoRecipient -> stringResource(R.string.ptt_no_recipient)
+    PttBlockReason.NoLink -> stringResource(R.string.ptt_no_link)
+    PttBlockReason.Ready -> if (state.isTransmitting) {
+        stringResource(R.string.ptt_transmitting)
+    } else {
+        stringResource(R.string.ptt_hold_to_talk)
+    }
 }
 
 /**
@@ -602,7 +613,7 @@ private fun CrewMemberRow(
                             overflow = TextOverflow.Ellipsis,
                             color = MaterialTheme.colorScheme.onSurface.copy(alpha = inactiveAlpha),
                         )
-                        if (pathLabel != null) {
+                        if (linkState is PeerLink.LinkState.Connected && pathLabel != null) {
                             Text(
                                 text = localizedPathLabel(pathLabel),
                                 style = MaterialTheme.typography.labelSmall,
@@ -690,6 +701,11 @@ private fun AvailabilityIcon(
             Icons.Filled.VpnLock,
             MaterialTheme.colorScheme.secondary,
             stringResource(R.string.path_vpn),
+        )
+        MemberAvailability.NEARBY -> Triple(
+            Icons.Filled.Sensors,
+            MaterialTheme.colorScheme.tertiary,
+            stringResource(R.string.availability_nearby),
         )
         MemberAvailability.OFFLINE -> Triple(
             Icons.Filled.CloudOff,

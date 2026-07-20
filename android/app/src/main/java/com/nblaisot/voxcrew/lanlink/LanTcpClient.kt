@@ -21,8 +21,7 @@ import java.net.Socket
  * Per-peer LAN/overlay [FrameTransport]: outbound dial (when client role) and one TCP session
  * bound to a single [PeerLink]. Inbound accepts are handed off by [LanTcpServer].
  *
- * Host switches (LAN ↔ Tailscale) close the current session and interrupt any in-flight
- * [Socket.connect] so failover is not blocked by a stale 3s LAN dial.
+ * [label] reflects the **live socket** path after Hello/adopt, not dial intent alone.
  */
 class LanTcpClient(
     private val scope: CoroutineScope,
@@ -30,14 +29,13 @@ class LanTcpClient(
     private val peerLink: PeerLink,
     private val server: LanTcpServer,
 ) : FrameTransport {
+    @Volatile private var sessionPathLabel: String = PathLabels.LOCAL
+
     override val label: String
-        get() {
-            val peer = targetPeer
-            return when {
-                peer?.viaOverlay == true -> PathLabels.VPN
-                peer != null && TailscaleInterface.isTailscaleAddress(peer.host) -> PathLabels.VPN
-                else -> PathLabels.LOCAL
-            }
+        get() = if (session?.closed == false) {
+            sessionPathLabel
+        } else {
+            intentPathLabel(targetPeer)
         }
 
     private val peerUid: String get() = peerLink.selectedPeerUid.orEmpty()
@@ -52,9 +50,17 @@ class LanTcpClient(
 
     fun lastContiguousInSeq(): Long = peerLink.lastContiguousInSeq()
 
+    fun hasOpenSession(): Boolean {
+        val s = session
+        return s != null && !s.closed
+    }
+
+    fun activePathLabel(): String? =
+        session?.takeIf { !it.closed }?.let { sessionPathLabel }
+
     fun hasHealthyLocalSession(): Boolean {
         val s = session
-        return s != null && !s.closed && label == PathLabels.LOCAL
+        return s != null && !s.closed && sessionPathLabel == PathLabels.LOCAL
     }
 
     fun hasStandbyReady(): Boolean =
@@ -124,7 +130,10 @@ class LanTcpClient(
         standbyInbound = null
     }
 
-    /** Promote a parked standby session into the active PeerLink path, if available. */
+    /**
+     * Promote a parked standby session into the active PeerLink path, if still open.
+     * Caller should [setTarget] overlay with preserveSession first so [label] intent matches.
+     */
     @Synchronized
     fun promoteStandby(): Boolean {
         val parked = standbyOutbound?.takeIf { it.isOpen() }
@@ -204,6 +213,21 @@ class LanTcpClient(
         connectingSocket = null
     }
 
+    private fun intentPathLabel(peer: LanPeer?): String = when {
+        peer?.viaOverlay == true -> PathLabels.VPN
+        peer != null && TailscaleInterface.isTailscaleAddress(peer.host) -> PathLabels.VPN
+        else -> PathLabels.LOCAL
+    }
+
+    private fun pathLabelForSocket(socket: Socket): String {
+        val host = socket.inetAddress?.hostAddress
+        return if (host != null && TailscaleInterface.isTailscaleAddress(host)) {
+            PathLabels.VPN
+        } else {
+            PathLabels.LOCAL
+        }
+    }
+
     private fun connectTimeoutMs(peer: LanPeer): Int =
         if (peer.viaOverlay || TailscaleInterface.isTailscaleAddress(peer.host)) {
             OVERLAY_CONNECT_TIMEOUT_MS
@@ -271,7 +295,6 @@ class LanTcpClient(
                 runCatching { socket.close() }
                 return
             }
-            // Remote may reject/park while its LAN is healthy; only keep if still open.
             if (socket.isClosed) return
             standbyOutbound?.close()
             standbyOutbound = ParkedSession(
@@ -311,7 +334,6 @@ class LanTcpClient(
         } catch (_: IOException) {
             connectingSocket = null
             runCatching { socket.close() }
-            // Fall back to normal reconnect loop.
             if (targetPeer?.uid == lanPeer.uid && isClientRoleFor(lanPeer.uid)) {
                 if (session?.closed != false) {
                     connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
@@ -335,7 +357,8 @@ class LanTcpClient(
     }
 
     private fun adoptParkedSession(parked: ParkedSession) {
-        session?.close()
+        val previous = session
+        sessionPathLabel = pathLabelForSocket(parked.socket)
         val newSession = LanTcpSession(
             scope = scope,
             peerUid = parked.peerUid,
@@ -347,6 +370,7 @@ class LanTcpClient(
             onClosed = ::onSessionClosed,
         )
         session = newSession
+        previous?.close()
         newSession.start()
         peerLink.onHandshakeComplete(this, parked.peerUid, parked.peerAnnouncedLastContiguousSeq)
     }
@@ -359,7 +383,8 @@ class LanTcpClient(
         peerAnnouncedLastContiguousSeq: Long,
     ) {
         clearStandby()
-        session?.close()
+        val previous = session
+        sessionPathLabel = pathLabelForSocket(socket)
         val newSession = LanTcpSession(
             scope = scope,
             peerUid = peerUid,
@@ -371,16 +396,17 @@ class LanTcpClient(
             onClosed = ::onSessionClosed,
         )
         session = newSession
+        previous?.close()
         newSession.start()
         peerLink.onHandshakeComplete(this, peerUid, peerAnnouncedLastContiguousSeq)
     }
 
-    private fun onSessionClosed(closedPeerUid: String) {
-        if (session?.peerUid != closedPeerUid) return
+    private fun onSessionClosed(closedSession: LanTcpSession) {
+        if (session !== closedSession) return
         session = null
-        peerLink.onDisconnected(this, closedPeerUid)
+        peerLink.onDisconnected(this, closedSession.peerUid)
         val target = targetPeer
-        if (target != null && target.uid == closedPeerUid && isClientRoleFor(closedPeerUid)) {
+        if (target != null && target.uid == closedSession.peerUid && isClientRoleFor(closedSession.peerUid)) {
             if (connectJob?.isActive != true) {
                 connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
             }

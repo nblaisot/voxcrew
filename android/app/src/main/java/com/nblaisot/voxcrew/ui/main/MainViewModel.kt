@@ -26,6 +26,7 @@ import com.nblaisot.voxcrew.demo.DemoFixtures
 import com.nblaisot.voxcrew.demo.DemoModeStore
 import com.nblaisot.voxcrew.demo.DemoRosterPolicy
 import com.nblaisot.voxcrew.lanlink.LanIntercomEngine
+import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.lanlink.PeerMetrics
 import com.nblaisot.voxcrew.roster.CrewMember
 import com.nblaisot.voxcrew.roster.CrewRosterRepository
@@ -50,6 +51,7 @@ data class MainUiState(
     val voxSensitivity: Int = VoxSensitivity.DEFAULT.level,
     val isTransmitting: Boolean = false,
     val pttEnabled: Boolean = false,
+    val pttBlockReason: PttBlockReason = PttBlockReason.Pending,
     val appForeground: Boolean = false,
     val micPermissionGranted: Boolean = false,
     val bluetoothConnectGranted: Boolean = true,
@@ -153,7 +155,7 @@ class MainViewModel(
         viewModelScope.launch {
             lanEngine.isTransmitting.collect { tx ->
                 Log.d(TAG, "shouldTransmit=$tx")
-                _uiState.update { it.copy(isTransmitting = tx) }
+                _uiState.update { it.copy(isTransmitting = tx).withPttEnabled() }
             }
         }
         viewModelScope.launch {
@@ -167,12 +169,12 @@ class MainViewModel(
         viewModelScope.launch {
             lanEngine.activeRecipientUids.collect { uids ->
                 rosterRepository.setActiveRecipients(uids)
-                _uiState.update { it.copy(activeRecipientUids = uids) }
+                _uiState.update { it.copy(activeRecipientUids = uids).withPttEnabled() }
             }
         }
         viewModelScope.launch {
             lanEngine.peerMetrics.collect { metrics ->
-                _uiState.update { it.copy(peerMetrics = metrics) }
+                _uiState.update { it.copy(peerMetrics = metrics).withPttEnabled() }
             }
         }
         viewModelScope.launch {
@@ -207,6 +209,7 @@ class MainViewModel(
                 val demoRoute = DemoFixtures.isDemoAudioRouteKey(selection.selectedChoice.key)
                 val ready = isConfirmedDuplexReady(route, pipeline) || (demoEnabled && demoRoute)
                 val pipelineFailure = pipeline as? AudioPipelineState.Failed
+                val pipelineOpening = pipeline is AudioPipelineState.Opening
                 val startAllowed = route.sessionIssue == null && pipelineFailure == null
                 val manualStatus = when {
                     demoEnabled && demoRoute -> ManualRouteStatus.CONFIRMED
@@ -216,7 +219,11 @@ class MainViewModel(
                     if (choice.key == DEVICE_AUDIO_ROUTE_KEY) {
                         route.currentEndpoint?.type == CallEndpointCompat.TYPE_SPEAKER
                     } else {
-                        choice.endpointIdentifier == route.currentEndpoint?.identifier
+                        choice.endpointIdentifier == route.currentEndpoint?.identifier ||
+                            (
+                                choice.bluetoothAddress != null &&
+                                    choice.bluetoothAddress == route.currentEndpoint?.bluetoothAddress
+                                )
                     }
                 }
                 val displayedInput = when {
@@ -235,17 +242,21 @@ class MainViewModel(
                         errorCode = selection.errorCode,
                     )
                 _uiState.update {
+                    val awaitingDuplex = appForeground &&
+                        !it.voxEnabled &&
+                        it.micPermissionGranted &&
+                        startAllowed &&
+                        !ready &&
+                        (manualStatus == ManualRouteStatus.STARTING ||
+                            manualStatus == ManualRouteStatus.REQUESTING ||
+                            pipelineOpening ||
+                            pipeline is AudioPipelineState.Closed)
                     it.copy(
                         audioRouteChoices = selection.availableChoices,
                         selectedAudioRoute = selection.selectedChoice,
                         audioRouteStatus = manualStatus,
                         appForeground = appForeground,
-                        audioRoutePending = appForeground &&
-                            !it.voxEnabled &&
-                            it.micPermissionGranted &&
-                            startAllowed &&
-                            (manualStatus == ManualRouteStatus.STARTING ||
-                                manualStatus == ManualRouteStatus.REQUESTING),
+                        audioRoutePending = awaitingDuplex,
                         pttMicIconKind = displayedInput,
                         audioRouteReady = ready,
                         audioStartAllowed = startAllowed,
@@ -289,16 +300,29 @@ class MainViewModel(
     private fun hasPermission(permission: String): Boolean =
         ContextCompat.checkSelfPermission(appContext, permission) == PackageManager.PERMISSION_GRANTED
 
-    private fun MainUiState.withPttEnabled(): MainUiState =
-        copy(
-            pttEnabled = computePttEnabled(
-                voxEnabled = voxEnabled,
-                appForeground = appForeground,
-                micPermissionGranted = micPermissionGranted,
-                audioRouteReady = audioRouteReady,
-                audioStartAllowed = audioStartAllowed,
-            ),
+    private fun MainUiState.withPttEnabled(): MainUiState {
+        val hasActiveRecipient = activeRecipientUids.isNotEmpty()
+        val hasConnectedRecipient = activeRecipientUids.any { uid ->
+            peerMetrics[uid]?.linkState is PeerLink.LinkState.Connected
+        }
+        val reason = resolvePttBlockReason(
+            voxEnabled = voxEnabled,
+            appForeground = appForeground,
+            micPermissionGranted = micPermissionGranted,
+            audioRouteReady = audioRouteReady,
+            audioStartAllowed = audioStartAllowed,
+            audioRoutePending = audioRoutePending,
+            audioRouteStatus = audioRouteStatus,
+            showAudioRetry = showAudioRetry,
+            hasActiveRecipient = hasActiveRecipient,
+            hasConnectedRecipient = hasConnectedRecipient,
+            isTransmitting = isTransmitting,
         )
+        return copy(
+            pttBlockReason = reason,
+            pttEnabled = pttEnabledForReason(reason),
+        )
+    }
 
     private fun startIntercom() {
         if (intercomStarted) return
@@ -473,8 +497,24 @@ internal fun computePttEnabled(
     micPermissionGranted: Boolean,
     audioRouteReady: Boolean,
     audioStartAllowed: Boolean,
-): Boolean = !voxEnabled &&
-    appForeground &&
-    micPermissionGranted &&
-    audioRouteReady &&
-    audioStartAllowed
+    audioRoutePending: Boolean = false,
+    audioRouteStatus: ManualRouteStatus = ManualRouteStatus.CONFIRMED,
+    showAudioRetry: Boolean = false,
+    hasActiveRecipient: Boolean = true,
+    hasConnectedRecipient: Boolean = true,
+    isTransmitting: Boolean = false,
+): Boolean = pttEnabledForReason(
+    resolvePttBlockReason(
+        voxEnabled = voxEnabled,
+        appForeground = appForeground,
+        micPermissionGranted = micPermissionGranted,
+        audioRouteReady = audioRouteReady,
+        audioStartAllowed = audioStartAllowed,
+        audioRoutePending = audioRoutePending,
+        audioRouteStatus = audioRouteStatus,
+        showAudioRetry = showAudioRetry,
+        hasActiveRecipient = hasActiveRecipient,
+        hasConnectedRecipient = hasConnectedRecipient,
+        isTransmitting = isTransmitting,
+    ),
+)

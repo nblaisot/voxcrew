@@ -22,12 +22,11 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Peer discovery via periodic UDP broadcast — deliberately not mDNS/NSD (the flaky
- * part of the previous implementation). Every instance broadcasts its identity on a
- * fixed port to the subnet-directed broadcast address of every active interface, and
- * listens for the same. This works identically whether both devices are plain WiFi
- * clients on the same AP, or one device is the mobile hotspot and the other connects
- * to it — both cases put the two devices on the same broadcast domain.
+ * Peer discovery via periodic UDP broadcast. LAN and overlay (Tailscale) sightings
+ * are stored in **separate** maps so an overlay unicast probe never erases a live
+ * LAN sighting (and vice versa).
+ *
+ * Discovery is for join/roster only — it does not keep the TCP mesh alive.
  *
  * Beacon payload (v1): `1<SOH>uid<SOH>displayName<SOH>tcpPort`
  * Extended (overlay): `1<SOH>uid<SOH>displayName<SOH>tcpPort<SOH>overlayHost`
@@ -36,10 +35,20 @@ class LanBeacon(
     private val context: Context,
     private val scope: CoroutineScope,
 ) {
+    data class PresenceSnapshot(
+        val lanSightings: Map<String, LanPeer> = emptyMap(),
+        val overlaySightings: Map<String, LanPeer> = emptyMap(),
+    )
+
+    private val _presence = MutableStateFlow(PresenceSnapshot())
+    val presence: StateFlow<PresenceSnapshot> = _presence.asStateFlow()
+
+    /** Merged roster view: LAN sighting preferred when both planes have the UID. */
     private val _peers = MutableStateFlow<List<LanPeer>>(emptyList())
     val peers: StateFlow<List<LanPeer>> = _peers.asStateFlow()
 
-    private val peerMap = ConcurrentHashMap<String, LanPeer>()
+    private val lanSightings = ConcurrentHashMap<String, LanPeer>()
+    private val overlaySightings = ConcurrentHashMap<String, LanPeer>()
     private var socket: DatagramSocket? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var broadcastJob: Job? = null
@@ -55,12 +64,48 @@ class LanBeacon(
 
     @Synchronized
     fun start(uid: String, displayName: String, tcpPort: Int, overlayHost: String? = null) {
-        stop()
+        stop(clearPresence = true)
         selfUid = uid
         selfName = displayName
         this.tcpPort = tcpPort
         selfOverlayHost = overlayHost?.takeIf { it.isNotBlank() }
+        openSocketAndLoops()
+    }
 
+    /**
+     * Rebind the UDP socket and refresh [selfOverlayHost] without wiping LAN/overlay
+     * sightings (network-change safe).
+     */
+    @Synchronized
+    fun rebind(overlayHost: String? = null) {
+        if (selfUid.isBlank()) return
+        selfOverlayHost = overlayHost?.takeIf { it.isNotBlank() }
+        closeSocketAndLoops()
+        openSocketAndLoops()
+        publish()
+    }
+
+    fun setOverlayProbeTargets(targets: Map<String, String>) {
+        overlayProbeTargets.clear()
+        targets.forEach { (uid, host) ->
+            if (uid.isNotBlank() && host.isNotBlank() && uid != selfUid) {
+                overlayProbeTargets[uid] = host
+            }
+        }
+    }
+
+    @Synchronized
+    fun stop(clearPresence: Boolean = true) {
+        closeSocketAndLoops()
+        overlayProbeTargets.clear()
+        if (clearPresence) {
+            lanSightings.clear()
+            overlaySightings.clear()
+            publish()
+        }
+    }
+
+    private fun openSocketAndLoops() {
         runCatching {
             val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             multicastLock = wifi?.createMulticastLock("voxcrew-lan-beacon")?.apply {
@@ -84,17 +129,7 @@ class LanBeacon(
         overlayProbeJob = scope.launch(Dispatchers.IO) { overlayProbeLoop() }
     }
 
-    fun setOverlayProbeTargets(targets: Map<String, String>) {
-        overlayProbeTargets.clear()
-        targets.forEach { (uid, host) ->
-            if (uid.isNotBlank() && host.isNotBlank() && uid != selfUid) {
-                overlayProbeTargets[uid] = host
-            }
-        }
-    }
-
-    @Synchronized
-    fun stop() {
+    private fun closeSocketAndLoops() {
         runCatching { socket?.close() }
         socket = null
         broadcastJob?.cancel()
@@ -107,9 +142,6 @@ class LanBeacon(
         overlayProbeJob = null
         runCatching { multicastLock?.release() }
         multicastLock = null
-        overlayProbeTargets.clear()
-        peerMap.clear()
-        _peers.value = emptyList()
     }
 
     private suspend fun broadcastLoop() {
@@ -164,16 +196,21 @@ class LanBeacon(
             if (decoded.uid.isBlank() || decoded.uid == selfUid) continue
             val host = packet.address?.hostAddress ?: continue
             val viaOverlay = TailscaleInterface.isTailscaleAddress(host)
-            peerMap[decoded.uid] = LanPeer(
+            val peer = LanPeer(
                 uid = decoded.uid,
                 displayName = decoded.displayName,
-                host = if (viaOverlay) host else host,
+                host = host,
                 port = decoded.port,
                 lastSeenMs = System.currentTimeMillis(),
                 overlayHost = decoded.overlayHost ?: if (viaOverlay) host else null,
                 viaOverlay = viaOverlay,
             )
-            _peers.value = peerMap.values.toList()
+            if (viaOverlay) {
+                overlaySightings[decoded.uid] = peer
+            } else {
+                lanSightings[decoded.uid] = peer
+            }
+            publish()
         }
     }
 
@@ -181,11 +218,26 @@ class LanBeacon(
         while (scope.isActive) {
             delay(PRUNE_INTERVAL_MS)
             val now = System.currentTimeMillis()
-            val stale = peerMap.filterValues { now - it.lastSeenMs > STALE_MS }.keys
-            if (stale.isNotEmpty()) {
-                stale.forEach { peerMap.remove(it) }
-                _peers.value = peerMap.values.toList()
+            var changed = false
+            lanSightings.filterValues { now - it.lastSeenMs > STALE_MS }.keys.forEach {
+                lanSightings.remove(it)
+                changed = true
             }
+            overlaySightings.filterValues { now - it.lastSeenMs > STALE_MS }.keys.forEach {
+                overlaySightings.remove(it)
+                changed = true
+            }
+            if (changed) publish()
+        }
+    }
+
+    private fun publish() {
+        val lan = lanSightings.toMap()
+        val overlay = overlaySightings.toMap()
+        _presence.value = PresenceSnapshot(lanSightings = lan, overlaySightings = overlay)
+        val uids = lan.keys + overlay.keys
+        _peers.value = uids.map { uid ->
+            lan[uid] ?: overlay.getValue(uid)
         }
     }
 
@@ -224,12 +276,13 @@ class LanBeacon(
     companion object {
         private const val TAG = "LanBeacon"
         const val BEACON_PORT = 47100
-        /** Faster cadence so LAN loss is noticed within ~1.5–2.5s. */
-        const val BROADCAST_INTERVAL_MS = 1_000L
-        const val STALE_MS = 2_500L
-        const val PRUNE_INTERVAL_MS = 250L
-        /** After one missed beacon, warm Tailscale standby while LAN may still recover. */
-        const val MISSED_BEACON_MS = 1_000L
+        /** Calm join/roster cadence — path failover is owned by TCP health, not beacons. */
+        const val BROADCAST_INTERVAL_MS = 3_000L
+        /** Drop a sighting after roughly three missed announces. */
+        const val STALE_MS = 9_000L
+        const val PRUNE_INTERVAL_MS = 1_000L
+        /** Warm Tailscale standby after one missed announce interval while LAN still listed. */
+        const val MISSED_BEACON_MS = BROADCAST_INTERVAL_MS
         private const val PROTOCOL_VERSION = 1
         private const val DELIMITER = '\u0001'
 

@@ -174,7 +174,8 @@ class TelecomRouteCoordinatorTest {
     private fun deviceChoice() = deviceAudioRouteChoice(speaker.identifier)
 
     private fun choice(endpoint: TelecomEndpoint) = AudioRouteChoice(
-        key = "endpoint:${endpoint.identifier}",
+        key = endpoint.bluetoothAddress?.let { bluetoothAudioRouteKey(it) }
+            ?: "endpoint:${endpoint.identifier}",
         name = endpoint.name,
         inputKind = if (endpoint.type == CallEndpointCompat.TYPE_BLUETOOTH) {
             CaptureInputKind.BLUETOOTH
@@ -188,6 +189,7 @@ class TelecomRouteCoordinatorTest {
         },
         endpointIdentifier = endpoint.identifier,
         endpointType = endpoint.type,
+        bluetoothAddress = endpoint.bluetoothAddress,
     )
 
     private class Harness(

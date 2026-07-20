@@ -6,7 +6,6 @@ internal class MediaDemandState {
     private var appForeground = false
     private var voxEnabled = false
     private var microphonePermissionGranted = false
-    private var pipelineUsable = true
     private var outbound = false
     private val remotePeers = mutableSetOf<String>()
 
@@ -39,13 +38,6 @@ internal class MediaDemandState {
     }
 
     @Synchronized
-    fun setPipelineUsable(usable: Boolean): Boolean {
-        if (pipelineUsable == usable) return false
-        pipelineUsable = usable
-        return true
-    }
-
-    @Synchronized
     fun setOutbound(active: Boolean): Boolean {
         if (outbound == active) return false
         outbound = active
@@ -56,10 +48,13 @@ internal class MediaDemandState {
     fun setRemote(peerUid: String, active: Boolean): Boolean =
         if (active) remotePeers.add(peerUid) else remotePeers.remove(peerUid)
 
+    /**
+     * Telecom media demand is session intent only. Pipeline [AudioPipelineState.Failed]
+     * is observed separately and must not cancel this demand.
+     */
     @Synchronized
     fun isDemanded(): Boolean = sessionActive &&
         microphonePermissionGranted &&
-        pipelineUsable &&
         (voxEnabled || appForeground)
 
     @Synchronized
@@ -73,11 +68,17 @@ internal class MediaDemandState {
     fun hasRemoteDemand(): Boolean = remotePeers.isNotEmpty()
 
     @Synchronized
+    fun clearRemoteDemand(): Boolean {
+        if (remotePeers.isEmpty()) return false
+        remotePeers.clear()
+        return true
+    }
+
+    @Synchronized
     fun endSession() {
         sessionActive = false
         outbound = false
         remotePeers.clear()
-        pipelineUsable = true
     }
 }
 

@@ -35,6 +35,8 @@ data class AudioRouteChoice(
     val target: AudioRouteTarget,
     val endpointIdentifier: String?,
     val endpointType: Int,
+    /** Stable Bluetooth MAC when known; used for menu identity across rename/UUID churn. */
+    val bluetoothAddress: String? = null,
 )
 
 data class AudioRouteSelectionState(
@@ -88,11 +90,16 @@ data class TelecomEndpoint(
     val identifier: String,
     val name: String,
     val type: Int,
+    /** Bluetooth MAC when resolved; null for non-BT or unresolved endpoints. */
+    val bluetoothAddress: String? = null,
 ) {
     val isAccessory: Boolean
         get() = type == CallEndpointCompat.TYPE_BLUETOOTH ||
             type == CallEndpointCompat.TYPE_WIRED_HEADSET
 }
+
+/** Stable menu key for a Bluetooth accessory identified by MAC. */
+fun bluetoothAudioRouteKey(address: String): String = "bt:$address"
 
 /**
  * Telecom owns routing. The current endpoint is the only statement about where call media

@@ -226,8 +226,9 @@ class PeerLink(private val scope: CoroutineScope) {
     /** Testable liveness check used by the health loop. Returns true if the link should stay up. */
     internal fun evaluateLiveness(nowMs: Long): Boolean {
         if (activeTransport == null) return true
-        awaitingPongSinceMs?.let { pingSent ->
-            if (nowMs - pingSent > PONG_TIMEOUT_MS) return false
+        // Frame activity (ACK/media/hello) is proof of life. Ping/Pong is RTT-only.
+        if (awaitingPongSinceMs != null && nowMs - (awaitingPongSinceMs ?: 0L) > PONG_TIMEOUT_MS) {
+            awaitingPongSinceMs = null
         }
         if (nowMs - lastActivityMs > PEER_TIMEOUT_MS) return false
         return true

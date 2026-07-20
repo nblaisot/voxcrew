@@ -52,8 +52,13 @@
     <string name="included_in_group">Inclus dans le groupe</string>
     <string name="muted_not_included">Muet (non inclus)</string>
     <string name="availability_offline">Hors ligne</string>
+    <string name="availability_nearby">À proximité</string>
     <string name="ptt_hold_to_talk">PTT — maintenir pour parler</string>
     <string name="ptt_transmitting">Transmission…</string>
+    <string name="ptt_audio_unavailable">Audio indisponible — touchez Réessayer</string>
+    <string name="ptt_no_recipient">Incluez un coéquipier pour parler</string>
+    <string name="ptt_no_link">En attente de la liaison audio…</string>
+    <string name="ptt_background">Revenez dans VoxCrew pour parler</string>
     <string name="vox_listening">Vox actif — en écoute</string>
     <string name="vox_transmitting">Vox — transmission…</string>
     <string name="audio_connecting">Connexion audio — %1$s…</string>
@@ -99,4 +104,6 @@
         <item quantity="one">%d connecté</item>
         <item quantity="other">%d connectés</item>
     </plurals>
+    <string name="status_audio_unavailable">audio indisponible</string>
+    <string name="status_audio_pending">audio en cours</string>
 </resources>

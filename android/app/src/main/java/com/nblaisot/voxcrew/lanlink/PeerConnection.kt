@@ -45,8 +45,8 @@ class PeerConnection(
     }
 
     /**
-     * Apply discovery result for this peer: prefer LAN when visible, warm Tailscale standby
-     * after a missed beacon, and promote overlay when LAN is gone.
+     * Apply discovery result for this peer using [OverlayFailoverPolicy].
+     * A healthy TCP session is never torn down solely because UDP presence went quiet.
      */
     fun applyPathTargets(
         lanPeer: LanPeer?,
@@ -55,62 +55,61 @@ class PeerConnection(
     ) {
         if (!started) return
         val lan = lanPeer?.takeUnless { it.viaOverlay }
-        when {
-            lan != null -> {
-                val warm = OverlayFailoverPolicy.shouldWarmStandby(
-                    lanLastSeenMs = lan.lastSeenMs,
-                    nowMs = nowMs,
-                    hasOverlayEndpoint = overlayPeer != null,
-                    lanStillListed = true,
-                )
-                if (warm && overlayPeer != null) {
+        val connected = peerLink.state.value as? PeerLink.LinkState.Connected
+        val sessionHealthy = connected != null && lanTcpClient.hasOpenSession()
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = lan,
+            hasOverlayEndpoint = overlayPeer != null,
+            nowMs = nowMs,
+            activeVia = connected?.via,
+            sessionHealthy = sessionHealthy,
+        )
+        when (decision.action) {
+            OverlayFailoverPolicy.PathAction.USE_LAN -> {
+                if (lan == null) return
+                if (decision.warmStandby && overlayPeer != null) {
                     lanTcpClient.warmStandby(overlayPeer)
                 } else {
                     lanTcpClient.clearStandby()
                 }
-                val via = (peerLink.state.value as? PeerLink.LinkState.Connected)?.via
-                if (via == PathLabels.VPN) {
+                if (connected?.via == PathLabels.VPN) {
                     lanTcpClient.switchToLanMakeBeforeBreak(lan)
                 } else {
                     lanTcpClient.setTarget(lan)
                 }
             }
-            overlayPeer != null -> {
+            OverlayFailoverPolicy.PathAction.USE_OVERLAY -> {
+                if (overlayPeer == null) return
+                if (connected?.via == PathLabels.VPN && lanTcpClient.hasOpenSession()) {
+                    lanTcpClient.setTarget(overlayPeer, preserveSession = true)
+                    return
+                }
                 promoteToOverlay(overlayPeer)
             }
-            else -> {
+            OverlayFailoverPolicy.PathAction.KEEP_SESSION -> Unit
+            OverlayFailoverPolicy.PathAction.CLEAR -> {
                 lanTcpClient.setTarget(null)
-                onPeerPresenceLost()
+                if (connected != null) {
+                    peerLink.markUnreachable()
+                }
             }
         }
     }
 
     fun promoteToOverlay(overlayPeer: LanPeer) {
         if (!started) return
-        if (lanTcpClient.promoteStandby()) {
-            lanTcpClient.setTarget(overlayPeer, preserveSession = true)
-            return
+        // Intent first so handshake label / policy see VPN, then adopt standby if live.
+        lanTcpClient.setTarget(overlayPeer, preserveSession = true)
+        if (lanTcpClient.promoteStandby()) return
+        if (!lanTcpClient.hasOpenSession() || lanTcpClient.activePathLabel() != PathLabels.VPN) {
+            lanTcpClient.setTarget(overlayPeer, forceRestart = true)
         }
-        lanTcpClient.setTarget(overlayPeer, forceRestart = true)
     }
 
-    /** LAN beacon for this peer expired — switch to overlay if available, else tear down. */
+    /** LAN sighting expired — switch to overlay if available; never kill healthy overlay TCP. */
     fun onLanPeerAbsent(overlayPeer: LanPeer? = null) {
         if (!started) return
-        if (overlayPeer != null) {
-            promoteToOverlay(overlayPeer)
-            return
-        }
-        lanTcpClient.setTarget(null)
-        onPeerPresenceLost()
-    }
-
-    /** Peer no longer discoverable — tear down any active audio link. */
-    fun onPeerPresenceLost() {
-        if (!started) return
-        if ((peerLink.state.value as? PeerLink.LinkState.Connected)?.via == lanTcpClient.label) {
-            peerLink.markUnreachable()
-        }
+        applyPathTargets(lanPeer = null, overlayPeer = overlayPeer)
     }
 
     fun send(payload: ByteArray) {
@@ -124,7 +123,7 @@ class PeerConnection(
     }
 
     fun onNetworkChanged() {
-        // LAN/overlay targets are refreshed by the engine's beacon restart.
+        // Path targets refresh from presence; beacon rebinds without wiping registries.
     }
 
     @Suppress("UNUSED")

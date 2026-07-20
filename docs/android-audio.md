@@ -175,8 +175,18 @@ Une demande média **Telecom** existe si au moins une condition est vraie :
 La réception distante en arrière-plan avec VOX désactivé **ne** réactive **pas** Telecom :
 les frames Opus sont jouées via un `MediaInboundPlayer` (`USAGE_MEDIA` +
 `AUDIOFOCUS_GAIN_TRANSIENT`) sur la route multimédia courante (haut-parleur / casque BT
-média). Le focus transitoire met en pause la musique d'une autre app pendant la parole,
-puis l'abandonne après ~700 ms d'inactivité pour qu'elle puisse reprendre.
+média). Deux autorités de focus coexistent donc :
+
+- **Telecom** (duplex `STREAM_VOICE_CALL`) tant que la demande FG/VOX est vraie — préchauffé
+  avant toute pression PTT (un provisionnement à la pression dépassait 2 s en pratique) ;
+- **MEDIA transitoire** uniquement pour l'inbound arrière-plan + VOX off.
+
+Le focus MEDIA n'est demandé qu'après initialisation réussie de l'`AudioTrack`, abandonné
+sur échec, perte de focus (`AUDIOFOCUS_LOSS*`) ou idle ~700 ms. Le passage FG→BG sérialise
+la coupure Telecom **avant** que MEDIA puisse jouer (`!telecomSession.hasCall`).
+
+Un pipeline `Failed` déconnecte l'appel Telecom (la demande FG/VOX peut rester pour Retry)
+afin de ne pas retenir la musique sur un chemin mort ; Retry réactive et re-prépare.
 
 La première demande Telecom ajoute/active l'appel. Lorsque la dernière demande disparaît,
 VoxCrew libère le duplex puis termine complètement l'appel avec `disconnect(LOCAL)`.
@@ -219,8 +229,10 @@ en arrière-plan, seule la parole entrante prend un focus média transitoire.
 `getAvailableStartingCallEndpoints()` est collecté même sans appel actif afin d'alimenter
 le sélecteur audio du coin supérieur droit. Cette observation ne prend ni focus ni route.
 « Cet appareil » (micro intégré + haut-parleur) est toujours sélectionné au lancement.
-Chaque endpoint Bluetooth est présenté séparément par son nom et son identifiant Telecom :
-une Galaxy Watch et des Galaxy Buds ne sont donc jamais confondus. Les endpoints USB/filaire
+Les endpoints Bluetooth sont dédupliqués par **adresse MAC** (clé stable `bt:$mac`) : un
+renommage ou un dédoublement HEADSET/LE_AUDIO du même accessoire n'affiche qu'une ligne,
+avec le nom courant préféré. Watch et Buds restent distincts via des MAC différentes.
+Les endpoints USB/filaire
 sont ajoutés et retirés dynamiquement. La connexion d'un accessoire ne le sélectionne jamais
 automatiquement. Sa déconnexion conserve le choix devenu indisponible, ferme le duplex et
 attend un nouveau choix manuel ; elle ne sélectionne aucun remplacement.
@@ -236,8 +248,9 @@ Une fois l'appel actif :
   aucun premier paquet ne peut partir via l'écouteur ou la montre par erreur ;
 - seul un clic dans le menu peut demander un changement pendant un appel, exactement une
   fois et vers l'identifiant choisi ; les autres clics sont refusés pendant cette requête ;
-- si Samsung change spontanément de route, l'état devient `DIVERGED`, le graphe est fermé
-  et aucune correction automatique n'est tentée ;
+- si Samsung change spontanément de route, l'état devient `DIVERGED`, l'appel Telecom est
+  déconnecté jusqu'à un nouveau choix utilisateur, et aucune correction automatique n'est
+  tentée ;
 - un refus devient `FAILED`, déconnecte la génération Telecom potentiellement bloquée et
   interdit sa recréation automatique. Le prochain choix explicite crée une session propre ;
 - un endpoint disparu devient `UNAVAILABLE` et ne déclenche aucun repli ;

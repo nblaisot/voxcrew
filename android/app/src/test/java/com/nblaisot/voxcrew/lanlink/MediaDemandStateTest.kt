@@ -65,7 +65,7 @@ class MediaDemandStateTest {
     }
 
     @Test
-    fun `permission and fatal pipeline state block every demand source`() {
+    fun `microphone permission blocks every demand source`() {
         val state = readySession()
         state.setAppForeground(true)
         assertTrue(state.isDemanded())
@@ -74,10 +74,56 @@ class MediaDemandStateTest {
         assertFalse(state.isDemanded())
         state.setMicrophonePermissionGranted(true)
         assertTrue(state.isDemanded())
-        state.setPipelineUsable(false)
-        assertFalse(state.isDemanded())
-        state.setPipelineUsable(true)
+    }
+
+    @Test
+    fun `clearRemoteDemand drops stale remote peers`() {
+        val state = readySession()
+        state.setRemote("peer-a", true)
+        assertTrue(state.hasRemoteDemand())
+        assertTrue(state.clearRemoteDemand())
+        assertFalse(state.hasRemoteDemand())
+        assertFalse(state.clearRemoteDemand())
+    }
+
+    @Test
+    fun `pipeline failure is not a demand input`() {
+        val state = readySession()
+        state.setAppForeground(true)
         assertTrue(state.isDemanded())
+        // Demand stays while duplex is Failed — that is pipeline observation only.
+        assertEquals(
+            TelecomDemandAction.NONE,
+            telecomDemandAction(demanded = state.isDemanded(), isActive = true, hasCall = true),
+        )
+        assertEquals(
+            TelecomDemandAction.ACTIVATE,
+            telecomDemandAction(demanded = state.isDemanded(), isActive = false, hasCall = false),
+        )
+    }
+
+    @Test
+    fun `failed prepare does not disconnect while foreground PTT still demands media`() {
+        val state = readySession()
+        state.setAppForeground(true)
+        assertTrue(state.isDemanded())
+
+        assertEquals(
+            TelecomDemandAction.NONE,
+            telecomDemandAction(
+                demanded = state.isDemanded(),
+                isActive = true,
+                hasCall = true,
+            ),
+        )
+        assertEquals(
+            TelecomDemandAction.ACTIVATE,
+            telecomDemandAction(
+                demanded = state.isDemanded(),
+                isActive = false,
+                hasCall = true,
+            ),
+        )
     }
 
     @Test

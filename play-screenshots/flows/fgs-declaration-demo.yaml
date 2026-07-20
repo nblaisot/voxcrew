@@ -1,0 +1,75 @@
+appId: com.nblaisot.voxcrew
+---
+# Demo for Play Console FGS declaration (microphone + connectedDevice).
+# Ends on main with VOX on; shell expands the FGS notification after this flow.
+- launchApp:
+    clearState: true
+    arguments:
+      locale: "en-US"
+- extendedWaitUntil:
+    visible: "Choose a name visible to nearby crewmates."
+    timeout: 20000
+- tapOn:
+    id: "profile_name_field"
+- eraseText
+- inputText: "Nicolas"
+# Pixel_9: hideKeyboard can send Back and leave the app — dismiss via brand tap instead.
+- tapOn: "VoxCrew"
+- tapOn: "Continue"
+- extendedWaitUntil:
+    visible: "Participants"
+    timeout: 20000
+- runFlow:
+    when:
+      visible: "Allow"
+    commands:
+      - tapOn: "Allow"
+
+- launchApp:
+    clearState: false
+    stopApp: true
+    arguments:
+      enable_demo: "true"
+      locale: "en-US"
+- extendedWaitUntil:
+    visible: "Marc"
+    timeout: 20000
+- extendedWaitUntil:
+    visible: "Anne"
+    timeout: 5000
+- extendedWaitUntil:
+    visible: "Quentin"
+    timeout: 5000
+- extendedWaitUntil:
+    visible:
+      id: "main_vox_switch"
+    timeout: 15000
+
+# Show Bluetooth connected-device route (earbuds).
+- tapOn:
+    id: "main_audio_route"
+- extendedWaitUntil:
+    visible: "Nicolas' earbuds"
+    timeout: 5000
+- waitForAnimationToEnd
+- back
+- extendedWaitUntil:
+    visible:
+      id: "main_vox_switch"
+    timeout: 10000
+
+# Explicit user action: turn VOX off then on (microphone FGS use case).
+- tapOn:
+    id: "main_vox_switch"
+- waitForAnimationToEnd
+- tapOn:
+    id: "main_vox_switch"
+- extendedWaitUntil:
+    visible: "Vox on — listening"
+    timeout: 10000
+- scrollUntilVisible:
+    element:
+      id: "main_ptt"
+    direction: DOWN
+    timeout: 5000
+- waitForAnimationToEnd

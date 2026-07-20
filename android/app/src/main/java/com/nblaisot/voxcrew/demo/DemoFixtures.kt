@@ -23,7 +23,7 @@ object DemoFixtures {
     fun isDemoAudioRouteKey(key: String): Boolean =
         key == audioRouteKey(EARBUDS_ID) || key == audioRouteKey(WATCH_ID)
 
-    fun audioRouteKey(endpointId: String): String = "endpoint:$endpointId"
+    fun audioRouteKey(endpointId: String): String = "bt:${endpointId.uppercase()}"
 
     fun seededMembers(nowMs: Long = System.currentTimeMillis()): List<CrewMember> = listOf(
         CrewMember(
@@ -50,8 +50,18 @@ object DemoFixtures {
     )
 
     fun bluetoothEndpoints(): List<TelecomEndpoint> = listOf(
-        TelecomEndpoint(EARBUDS_ID, EARBUDS_NAME, CallEndpointCompat.TYPE_BLUETOOTH),
-        TelecomEndpoint(WATCH_ID, WATCH_NAME, CallEndpointCompat.TYPE_BLUETOOTH),
+        TelecomEndpoint(
+            EARBUDS_ID,
+            EARBUDS_NAME,
+            CallEndpointCompat.TYPE_BLUETOOTH,
+            bluetoothAddress = EARBUDS_ID,
+        ),
+        TelecomEndpoint(
+            WATCH_ID,
+            WATCH_NAME,
+            CallEndpointCompat.TYPE_BLUETOOTH,
+            bluetoothAddress = WATCH_ID,
+        ),
     )
 }
 
