@@ -21,6 +21,14 @@ sealed class LanFrame {
     data class Ack(val lastContiguousSeq: Long) : LanFrame()
     data class Ping(val timestampMs: Long) : LanFrame()
     data class Pong(val timestampMs: Long) : LanFrame()
+
+    /**
+     * Sender-declared sequence gap: frames up to and including [untilSeq] no longer
+     * exist (expired from the [SendBuffer] or evicted by its byte cap). The receiver
+     * fast-forwards its contiguity cursor instead of waiting forever — audio is
+     * delayed up to the buffer age cap, then dropped cleanly, never wedged.
+     */
+    data class Skip(val untilSeq: Long) : LanFrame()
 }
 
 object LanProtocol {
@@ -30,6 +38,7 @@ object LanProtocol {
     private const val TYPE_PING = 4
     private const val TYPE_PONG = 5
     private const val TYPE_MEDIA_ACTIVITY = 6
+    private const val TYPE_SKIP = 7
 
     /** Guards against a corrupt/malicious length prefix causing an OOM allocation. */
     const val MAX_PAYLOAD_BYTES = 64 * 1024
@@ -83,6 +92,7 @@ object LanProtocol {
         is LanFrame.Ping -> TYPE_PING
         is LanFrame.Pong -> TYPE_PONG
         is LanFrame.MediaActivity -> TYPE_MEDIA_ACTIVITY
+        is LanFrame.Skip -> TYPE_SKIP
     }
 
     private fun encodePayload(frame: LanFrame): ByteArray {
@@ -104,6 +114,7 @@ object LanProtocol {
                 data.writeLong(frame.seq)
                 data.writeBoolean(frame.active)
             }
+            is LanFrame.Skip -> data.writeLong(frame.untilSeq)
         }
         data.flush()
         return buffer.toByteArray()
@@ -123,6 +134,7 @@ object LanProtocol {
             TYPE_PING -> LanFrame.Ping(data.readLong())
             TYPE_PONG -> LanFrame.Pong(data.readLong())
             TYPE_MEDIA_ACTIVITY -> LanFrame.MediaActivity(data.readLong(), data.readBoolean())
+            TYPE_SKIP -> LanFrame.Skip(data.readLong())
             else -> throw IOException("Unknown LAN frame type: $type")
         }
     }

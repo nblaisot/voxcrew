@@ -5,7 +5,6 @@ import com.nblaisot.voxcrew.R
 import com.nblaisot.voxcrew.audio.AudioPipelineState
 import com.nblaisot.voxcrew.audio.CaptureInputKind
 import com.nblaisot.voxcrew.audio.IntercomTelecomSession
-import com.nblaisot.voxcrew.audio.ManualRouteStatus
 import com.nblaisot.voxcrew.audio.ObservedAudioDeviceKind
 import com.nblaisot.voxcrew.audio.OutputKind
 import com.nblaisot.voxcrew.audio.isConfirmedDuplexReady
@@ -27,7 +26,6 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -182,17 +180,22 @@ class LanIntercomEngine(
     }
 
     private var routingMismatchJob: Job? = null
+    /** Platform routed the live pipeline off the confirmed BT endpoint (SCO never started). */
+    private val _observedRouteMismatch = MutableStateFlow(false)
+    val observedRouteMismatch: StateFlow<Boolean> = _observedRouteMismatch.asStateFlow()
 
     /**
      * Telecom believes the call is on Bluetooth but the platform routed the live
      * recorder/track elsewhere (typically SCO never started). One settle re-check,
-     * then fail the pipeline through the existing path (disconnect + Retry banner).
+     * then surface a diverged-style banner — audio keeps flowing on whatever device
+     * the platform picked; the user gets a one-tap "This device" fix.
      */
     private fun onObservedRoutingChanged(source: String, kind: ObservedAudioDeviceKind) {
         if (kind == ObservedAudioDeviceKind.UNKNOWN) return
         if (!bluetoothRouteMismatch(kind)) {
             routingMismatchJob?.cancel()
             routingMismatchJob = null
+            _observedRouteMismatch.value = false
             return
         }
         if (routingMismatchJob?.isActive == true) return
@@ -204,11 +207,13 @@ class LanIntercomEngine(
                 (inputKind != null && bluetoothRouteMismatch(inputKind)) ||
                     (outputKind != null && bluetoothRouteMismatch(outputKind))
             if (stillMismatched) {
-                onAudioPipelineFailure(
+                Log.w(
+                    TAG,
                     "$source routed to $kind while Bluetooth endpoint is confirmed " +
                         "(input=$inputKind output=$outputKind)",
                 )
             }
+            _observedRouteMismatch.value = stillMismatched
         }
     }
 
@@ -292,7 +297,6 @@ class LanIntercomEngine(
 
         loadPersistedActiveRecipients()
         ensureAudioRoutingMonitor()
-        watchDivergedRoutes()
         scheduleMediaDemandReconciliation()
     }
 
@@ -465,6 +469,7 @@ class LanIntercomEngine(
     fun selectAudioRoute(key: String) {
         scope.launch(Dispatchers.IO) {
             telecomBlockedUntilRetry = false
+            _observedRouteMismatch.value = false
             telecomSession.selectAudioRoute(key)
             reconcileMediaDemand()
         }
@@ -558,6 +563,9 @@ class LanIntercomEngine(
         stopVoxCapture()
         playback.stop()
         audioPrepared = false
+        routingMismatchJob?.cancel()
+        routingMismatchJob = null
+        _observedRouteMismatch.value = false
         _audioPipelineState.value = state
         if (cancelTransmission) {
             setOutboundMediaActive(false)
@@ -649,13 +657,11 @@ class LanIntercomEngine(
     private suspend fun reconcileMediaDemandUnlocked() {
         while (true) {
             val demanded = mediaDemanded()
-            if (demanded && telecomSession.isRouteSelectionBlocked) return
             if (demanded && telecomBlockedUntilRetry) return
             when (telecomDemandAction(demanded, telecomSession.isActive, telecomSession.hasCall)) {
                 TelecomDemandAction.NONE -> return
                 TelecomDemandAction.ACTIVATE -> {
                     if (!telecomSession.activate()) {
-                        if (telecomSession.isRouteSelectionBlocked) return
                         // Keep demand; leave Failed visible. Retry or a later demand
                         // transition re-enters activate via reconcile — no stop()/poison.
                         audioInitMutex.withLock {
@@ -737,20 +743,6 @@ class LanIntercomEngine(
                     Log.e(TAG, "audio endpoint transition failed: ${error.message}", error)
                 }
             }
-        }
-    }
-
-    private fun watchDivergedRoutes() {
-        lifecycleJobs += scope.launch(Dispatchers.IO) {
-            audioRouteSelection
-                .map { it.status }
-                .distinctUntilChanged()
-                .collect { status ->
-                    if (status == ManualRouteStatus.DIVERGED && telecomSession.hasCall) {
-                        Log.i(TAG, "Telecom route diverged; disconnect until user picks an output")
-                        telecomSession.disconnectForDivergedRoute()
-                    }
-                }
         }
     }
 

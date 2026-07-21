@@ -16,7 +16,10 @@ class TelecomRouteCoordinatorTest {
     private val buds = endpoint("buds", CallEndpointCompat.TYPE_BLUETOOTH)
 
     @Test
-    fun platformEventsNeverRequestARoute() = runTest {
+    fun freshCallReassertsTheSelectionExactlyOnce() = runTest {
+        // A new call can come up on the wrong endpoint; the coordinator executes the
+        // user's standing selection once, then a persisting mismatch is DIVERGED —
+        // banner-only, audio keeps flowing.
         val harness = Harness(selected = buds)
 
         harness.coordinator.onAvailableEndpoints(listOf(speaker, watch, buds))
@@ -28,9 +31,28 @@ class TelecomRouteCoordinatorTest {
             harness.coordinator.onActive()
         }
 
-        assertTrue(harness.requests.isEmpty())
+        assertEquals(listOf(buds), harness.requests)
         assertEquals(ManualRouteStatus.DIVERGED, harness.status)
-        assertFalse(harness.state.mediaActive)
+        assertTrue(harness.state.mediaActive)
+    }
+
+    @Test
+    fun earpieceTransientOnFreshCallConvergesToConfirmed() = runTest {
+        // FG return: new call briefly on the earpiece while "This device" means speaker.
+        val harness = Harness(selected = speaker)
+
+        harness.coordinator.onAvailableEndpoints(listOf(earpiece, speaker, buds))
+        harness.coordinator.onCurrentEndpoint(earpiece)
+        harness.coordinator.onActivationResult(true)
+
+        assertEquals(listOf(speaker), harness.requests)
+        assertEquals(ManualRouteStatus.REQUESTING, harness.status)
+        assertTrue(harness.state.mediaActive)
+
+        harness.coordinator.onCurrentEndpoint(speaker)
+
+        assertEquals(ManualRouteStatus.CONFIRMED, harness.status)
+        assertTrue(harness.state.mediaActive)
     }
 
     @Test
@@ -42,7 +64,8 @@ class TelecomRouteCoordinatorTest {
         assertEquals(ManualRouteCommandResult.Accepted, result)
         assertEquals(listOf(buds), harness.requests)
         assertEquals(ManualRouteStatus.REQUESTING, harness.status)
-        assertFalse(harness.state.mediaActive)
+        // Audio keeps flowing on the previous route while the request settles.
+        assertTrue(harness.state.mediaActive)
 
         harness.coordinator.onCurrentEndpoint(buds)
         assertEquals(ManualRouteStatus.CONFIRMED, harness.status)
@@ -113,24 +136,52 @@ class TelecomRouteCoordinatorTest {
         assertEquals(ManualRouteCommandResult.Failed, result)
         assertEquals(ManualRouteStatus.FAILED, harness.status)
         assertEquals(1, harness.errorCode)
-        assertFalse(harness.state.mediaActive)
+        // The call itself is still ACTIVE; the session layer rebuilds it around the
+        // new selection, and audio flows until it does.
+        assertTrue(harness.state.mediaActive)
     }
 
     @Test
-    fun removedAccessoryBecomesUnavailableWithoutFallbackOrRequest() = runTest {
+    fun removedAccessoryKeepsAudioAndRestoresOnReturn() = runTest {
         val harness = Harness(selected = buds)
         harness.coordinator.onAvailableEndpoints(listOf(speaker, buds))
         harness.coordinator.onCurrentEndpoint(buds)
         harness.coordinator.onActivationResult(true)
         assertTrue(harness.state.mediaActive)
 
+        // Accessory disappears; platform re-routes. Selection is remembered, banner
+        // shows UNAVAILABLE, audio keeps flowing on the fallback.
         harness.coordinator.onAvailableEndpoints(listOf(speaker))
         harness.coordinator.onCurrentEndpoint(speaker)
 
         assertEquals(ManualRouteStatus.UNAVAILABLE, harness.status)
         assertEquals(buds, harness.state.selectedEndpoint)
         assertTrue(harness.requests.isEmpty())
-        assertFalse(harness.state.mediaActive)
+        assertTrue(harness.state.mediaActive)
+
+        // Accessory returns: one automatic restore request brings it back.
+        harness.coordinator.onAvailableEndpoints(listOf(speaker, buds))
+
+        assertEquals(listOf(buds), harness.requests)
+        harness.coordinator.onCurrentEndpoint(buds)
+        assertEquals(ManualRouteStatus.CONFIRMED, harness.status)
+    }
+
+    @Test
+    fun removedAccessoryWithEarpieceCurrentFallsBackToSpeaker() = runTest {
+        val harness = Harness(selected = buds)
+        harness.coordinator.onAvailableEndpoints(listOf(earpiece, speaker, buds))
+        harness.coordinator.onCurrentEndpoint(buds)
+        harness.coordinator.onActivationResult(true)
+
+        // Accessory gone and the platform landed on the earpiece: request the speaker
+        // once so "This device" audio is actually audible.
+        harness.coordinator.onAvailableEndpoints(listOf(earpiece, speaker))
+        harness.coordinator.onCurrentEndpoint(earpiece)
+
+        assertEquals(listOf(speaker), harness.requests)
+        assertEquals(ManualRouteStatus.UNAVAILABLE, harness.status)
+        assertTrue(harness.state.mediaActive)
     }
 
     @Test
@@ -165,7 +216,10 @@ class TelecomRouteCoordinatorTest {
         harness.coordinator.onCurrentEndpoint(watchB)
 
         assertEquals(ManualRouteStatus.DIVERGED, harness.status)
-        assertFalse(harness.state.mediaActive)
+        // Diverged is banner-only: audio keeps flowing on the platform's route.
+        assertTrue(harness.state.mediaActive)
+        // No automatic re-fight after a platform-initiated divergence.
+        assertTrue(harness.requests.isEmpty())
     }
 
     @Test
@@ -177,11 +231,15 @@ class TelecomRouteCoordinatorTest {
         harness.coordinator.onCurrentEndpoint(budsLe)
         harness.coordinator.onActivationResult(true)
 
+        // Activation on buds while speaker is selected triggers the one auto re-assert.
+        assertEquals(listOf(speaker), harness.requests)
+
         // Menu choice was built from the SCO enumeration; platform now reports the LE one.
         val result = harness.coordinator.onUserSelected(choice(budsSco))
 
         assertEquals(ManualRouteCommandResult.Accepted, result)
-        assertTrue(harness.requests.isEmpty())
+        // Selecting the (MAC-identical) current endpoint needs no further request.
+        assertEquals(listOf(speaker), harness.requests)
         assertEquals(ManualRouteStatus.CONFIRMED, harness.status)
     }
 

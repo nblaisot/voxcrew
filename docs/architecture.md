@@ -41,6 +41,14 @@ Aucun serveur applicatif : découverte et audio restent entre les appareils (LAN
 
 Un seul espace de séquence `PeerLink` survit au changement de chemin (make-before-break vers le LAN quand il revient).
 
+**Récupération de trou de séquence (`Skip`)** : le récepteur ne livre que des séquences
+contiguës, et l'émetteur expire les frames non accusées de plus de 30 s (`SendBuffer`, plus
+l'éviction par plafond d'octets). Quand cette expiration crée un trou — à la reconnexion
+(replay Hello) comme en cours de session — l'émetteur déclare `Skip(untilSeq)` et le
+récepteur avance son curseur de contiguïté avant de drainer les frames en attente.
+Invariant : l'audio est retardé jusqu'à 30 s, puis abandonné **proprement** — un lien
+« Connected » ne peut jamais rester coincé à attendre une séquence qui n'existe plus.
+
 ## Présence et transport (trois plans)
 
 | Plan | Rôle |
@@ -55,7 +63,15 @@ La cadence beacon (~3 s) sert au join/roster ; la staleness (`STALE_MS` = 5 inte
 
 Dial sortant : `TCP_NODELAY` partout, backoff exponentiel plafonné à 30 s, remis à zéro par un sighting frais ou une action utilisateur (PTT, toggle destinataire). Un changement d’hôte overlay re-dial make-before-break au lieu d’attendre le timeout d’activité.
 
-Cold start overlay : les hôtes `100.x` persistés dans le roster (`CrewRosterRepository`) sont réinjectés comme cibles de probe UDP au démarrage — deux pairs qui ne se croisent que sur Tailscale se retrouvent après redémarrage (le port TCP périmé n’a pas d’importance, le probe vise le port beacon fixe). `NetworkMonitor` surveille aussi `TRANSPORT_VPN` et les changements d’adresses (`onLinkPropertiesChanged`) pour rebinder le beacon quand Tailscale monte après le lancement.
+Apprentissage d'adresse overlay sans dépendance au timing de démarrage : le beacon
+ré-résout l'adresse Tailscale locale **à chaque tick** de broadcast/probe (3 s) au lieu de
+la figer au bind — un overlay qui monte après le lancement est annoncé dans l'intervalle
+suivant. Le cache roster ne régresse jamais : un sighting LAN sans hôte overlay n'écrase
+pas un hôte `100.x` appris précédemment (les adresses Tailscale sont stables par nœud).
+Le timeout de connexion TCP overlay est de 5 s (un premier dial relayé DERP sur cellulaire
+dépasse régulièrement 1 s).
+
+Cold start overlay : les hôtes `100.x` persistés dans le roster (`CrewRosterRepository`) sont réinjectés comme cibles de probe UDP au démarrage — deux pairs qui ne se croisent que sur Tailscale se retrouvent après redémarrage (le port TCP périmé n’a pas d’importance, le probe vise le port beacon fixe). `NetworkMonitor` surveille aussi `TRANSPORT_VPN` et les changements d’adresses (`onLinkPropertiesChanged`, y compris le **premier** événement d'un réseau — c'est celui où les adresses apparaissent) pour rebinder le beacon quand Tailscale monte après le lancement.
 
 Sorties de session : « Quitter la session » (notification) et la déconnexion (`signOut`) passent par `engine.shutdown()` — beacon, serveur TCP et boucles de dial s’arrêtent réellement. Boucles économes : la boucle ACK/ping de `PeerLink` ne tourne que transport attaché ; métriques et indicateur « receiving » sont pilotés par événements (pas de polling permanent).
 

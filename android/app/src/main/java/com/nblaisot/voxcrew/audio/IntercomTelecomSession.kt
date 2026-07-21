@@ -71,7 +71,8 @@ class IntercomTelecomSession(
     private var activeCoordinator: TelecomRouteCoordinator? = null
     private var activeCoordinatorGeneration: Long? = null
     private var activeCallDisconnect: (suspend () -> Unit)? = null
-    private val routeActivationGate = ManualRouteActivationGate()
+    private val routePrefs =
+        appContext.getSharedPreferences(ROUTE_PREFS_NAME, Context.MODE_PRIVATE)
     @Volatile private var latestStartingEndpoints: List<CallEndpointCompat> = emptyList()
     private var onMediaInactive: suspend () -> Unit = { }
     private var onMediaActive: suspend () -> Unit = { }
@@ -89,7 +90,6 @@ class IntercomTelecomSession(
 
     val currentState: TelecomCallState get() = _callState.value
     val isActive: Boolean get() = currentState.phase == TelecomCallPhase.ACTIVE
-    val isRouteSelectionBlocked: Boolean get() = routeActivationGate.isBlocked
     val hasCall: Boolean
         get() = synchronized(lifecycleLock) {
             sessionJob?.isActive == true || stopJob?.isActive == true
@@ -106,6 +106,7 @@ class IntercomTelecomSession(
                     "Telecom registration failed: ${error.message}",
                 )
             }
+        restorePersistedSelection()
         refreshEndpointCatalog()
         if (demoModeStore != null) {
             scope.launch {
@@ -151,7 +152,7 @@ class IntercomTelecomSession(
             )
             return
         }
-        routeActivationGate.onUserSelection()
+        persistSelection(choice)
         _routeSelection.value = _routeSelection.value.copy(
             selectedChoice = choice,
             status = ManualRouteStatus.STARTING,
@@ -161,11 +162,10 @@ class IntercomTelecomSession(
         val coordinator = currentCoordinator()
         if (coordinator == null) return
         when (coordinator.onUserSelected(choice)) {
-            ManualRouteCommandResult.Failed -> {
-                routeActivationGate.onRouteFailure()
-                disconnect()
-            }
-            ManualRouteCommandResult.Unavailable -> routeActivationGate.onRouteFailure()
+            // Platform rejected the request outright: rebuild the call around the new
+            // preferred endpoint (demand reconciliation reactivates it immediately).
+            ManualRouteCommandResult.Failed -> disconnect()
+            ManualRouteCommandResult.Unavailable,
             ManualRouteCommandResult.Busy,
             ManualRouteCommandResult.Accepted -> Unit
         }
@@ -177,7 +177,6 @@ class IntercomTelecomSession(
 
     private fun startIfAllowed(): CompletableDeferred<TelecomCallController?>? =
         synchronized(lifecycleLock) {
-            if (routeActivationGate.isBlocked) return@synchronized null
             if (stopJob?.isActive == true) return@synchronized null
             if (sessionGenerations.hasActiveGeneration() && sessionJob?.isActive == true) {
                 return@synchronized controllerReady
@@ -210,19 +209,28 @@ class IntercomTelecomSession(
                 val startingEndpoints = latestStartingEndpoints.takeIf { it.isNotEmpty() }
                     ?: callsManager.getAvailableStartingCallEndpoints().first()
                 updateStartingEndpoints(startingEndpoints)
-                val preferred = resolveSelectedFrameworkEndpoint(startingEndpoints)
+                val resolved = resolveSelectedFrameworkEndpoint(startingEndpoints)
+                // Always start on a working device: fall back to the speaker (then any
+                // endpoint) when the selected accessory is absent. The coordinator keeps
+                // the user's selection so it is re-requested when the accessory returns.
+                val preferred = resolved
+                    ?: startingEndpoints.firstOrNull { it.type == CallEndpointCompat.TYPE_SPEAKER }
+                    ?: startingEndpoints.firstOrNull()
                 if (preferred == null) {
-                    routeActivationGate.onRouteFailure()
                     updateRouteSelectionStatus(ManualRouteStatus.UNAVAILABLE)
                     publishCurrent(
                         generation,
                         TelecomCallState(phase = TelecomCallPhase.STOPPED),
-                        "Selected Telecom endpoint is unavailable",
+                        "No Telecom endpoints available to start a call",
                     )
                     ready.complete(null)
                     return@launch
                 }
-                val selected = preferred.toTelecomEndpoint()
+                val selected = if (resolved != null) {
+                    resolved.toTelecomEndpoint()
+                } else {
+                    _routeSelection.value.selectedChoice.toSelectedTelecomEndpoint()
+                }
                 publishCurrent(
                     generation,
                     currentState.copy(
@@ -230,7 +238,7 @@ class IntercomTelecomSession(
                         selectedEndpoint = selected,
                         availableEndpoints = startingEndpoints.map { it.toTelecomEndpoint() },
                     ),
-                    "starting endpoint=${preferred.name}",
+                    "starting endpoint=${preferred.name} selected=${selected.name}",
                 )
                 val attributes = CallAttributesCompat(
                     displayName = DISPLAY_NAME,
@@ -292,11 +300,6 @@ class IntercomTelecomSession(
                         },
                         publishRouteStatus = { status, errorCode ->
                             if (isCurrentGeneration(generation)) {
-                                if (status == ManualRouteStatus.FAILED ||
-                                    status == ManualRouteStatus.UNAVAILABLE
-                                ) {
-                                    routeActivationGate.onRouteFailure()
-                                }
                                 updateRouteSelectionStatus(status, errorCode)
                             } else {
                                 Log.i(
@@ -387,11 +390,6 @@ class IntercomTelecomSession(
         false
     }
 
-    suspend fun disconnectForDivergedRoute() {
-        routeActivationGate.onRouteFailure()
-        disconnect()
-    }
-
     suspend fun disconnect() {
         stop()
         currentStopJob()?.join()
@@ -408,9 +406,7 @@ class IntercomTelecomSession(
             activeCoordinatorGeneration = null
             activeCallDisconnect = null
             controllerReady = completedNullController()
-            if (!routeActivationGate.isBlocked) {
-                updateRouteSelectionStatus(ManualRouteStatus.STARTING)
-            }
+            updateRouteSelectionStatus(ManualRouteStatus.STARTING)
             publish(TelecomCallState(phase = TelecomCallPhase.STOPPED), "Telecom session stopped")
             scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
                 onMediaDisconnected(true)
@@ -523,21 +519,9 @@ class IntercomTelecomSession(
         }
     }
 
-    private suspend fun updateStartingEndpoints(endpoints: List<CallEndpointCompat>) {
+    private fun updateStartingEndpoints(endpoints: List<CallEndpointCompat>) {
         latestStartingEndpoints = endpoints
         rebuildChoicesFromLatestEndpoints()
-        val demoRouteSelected = DemoFixtures.isDemoAudioRouteKey(
-            _routeSelection.value.selectedChoice.key,
-        )
-        // Demo Bluetooth endpoints are UI fixtures — never mark them unavailable.
-        if (demoRouteSelected) return
-        if (endpoints.isNotEmpty() &&
-            currentCoordinator() == null &&
-            resolveSelectedFrameworkEndpoint(endpoints) == null
-        ) {
-            routeActivationGate.onRouteFailure()
-            updateRouteSelectionStatus(ManualRouteStatus.UNAVAILABLE)
-        }
     }
 
     private fun rebuildChoicesFromLatestEndpoints() {
@@ -587,6 +571,12 @@ class IntercomTelecomSession(
                         it.type == CallEndpointCompat.TYPE_BLUETOOTH &&
                             resolveBluetoothAddress(it) == mac
                     }
+                }
+                // Restored wired/USB selections have per-boot identifiers: match type+name.
+                ?: endpoints.firstOrNull {
+                    it.type == choice.endpointType &&
+                        it.name.toString().normalizeAudioDeviceName() ==
+                        choice.name.normalizeAudioDeviceName()
                 }
         }
     }
@@ -651,6 +641,52 @@ class IntercomTelecomSession(
         bluetoothAddress = resolveBluetoothAddress(this),
     )
 
+    /** Placeholder for a selected-but-absent choice, so the coordinator can restore it. */
+    private fun AudioRouteChoice.toSelectedTelecomEndpoint(): TelecomEndpoint = TelecomEndpoint(
+        identifier = endpointIdentifier ?: key,
+        name = name,
+        type = endpointType,
+        bluetoothAddress = bluetoothAddress,
+    )
+
+    private fun persistSelection(choice: AudioRouteChoice) {
+        routePrefs.edit()
+            .putString(KEY_ROUTE_KEY, choice.key)
+            .putString(KEY_ROUTE_NAME, choice.name)
+            .putInt(KEY_ROUTE_TYPE, choice.endpointType)
+            .putString(KEY_ROUTE_MAC, choice.bluetoothAddress)
+            .putString(KEY_ROUTE_INPUT_KIND, choice.inputKind.name)
+            .putString(KEY_ROUTE_TARGET, choice.target.name)
+            .apply()
+    }
+
+    /**
+     * Restores the last explicit selection across process death. Telecom identifiers are
+     * per-call, so only stable identity (key/type/MAC/name) is stored; the catalog rebuild
+     * re-maps it onto fresh endpoints ([selectedAudioRouteChoice]).
+     */
+    private fun restorePersistedSelection() {
+        val key = routePrefs.getString(KEY_ROUTE_KEY, null) ?: return
+        if (key == DEVICE_AUDIO_ROUTE_KEY || DemoFixtures.isDemoAudioRouteKey(key)) return
+        val name = routePrefs.getString(KEY_ROUTE_NAME, null) ?: return
+        val inputKind = runCatching {
+            CaptureInputKind.valueOf(routePrefs.getString(KEY_ROUTE_INPUT_KIND, null).orEmpty())
+        }.getOrNull() ?: return
+        val target = runCatching {
+            AudioRouteTarget.valueOf(routePrefs.getString(KEY_ROUTE_TARGET, null).orEmpty())
+        }.getOrNull() ?: return
+        val restored = AudioRouteChoice(
+            key = key,
+            name = name,
+            inputKind = inputKind,
+            target = target,
+            endpointIdentifier = null,
+            endpointType = routePrefs.getInt(KEY_ROUTE_TYPE, CallEndpointCompat.TYPE_SPEAKER),
+            bluetoothAddress = routePrefs.getString(KEY_ROUTE_MAC, null),
+        )
+        _routeSelection.value = _routeSelection.value.copy(selectedChoice = restored)
+    }
+
     private fun publish(state: TelecomCallState, reason: String) {
         if (_callState.value == state) return
         _callState.value = state
@@ -682,27 +718,18 @@ class IntercomTelecomSession(
         private const val DISPLAY_NAME = "VoxCrew"
         private const val SCHEME = "sip"
         private const val HOST = "intercom@voxcrew"
+        private const val ROUTE_PREFS_NAME = "voxcrew_audio_route"
+        private const val KEY_ROUTE_KEY = "route_key"
+        private const val KEY_ROUTE_NAME = "route_name"
+        private const val KEY_ROUTE_TYPE = "route_type"
+        private const val KEY_ROUTE_MAC = "route_mac"
+        private const val KEY_ROUTE_INPUT_KIND = "route_input_kind"
+        private const val KEY_ROUTE_TARGET = "route_target"
     }
 }
 
 private fun completedNullController() =
     CompletableDeferred<TelecomCallController?>().also { it.complete(null) }
-
-/** Prevents media demand from recreating a failed route before another explicit menu choice. */
-internal class ManualRouteActivationGate {
-    @Volatile
-    private var blocked = false
-
-    val isBlocked: Boolean get() = blocked
-
-    fun onRouteFailure() {
-        blocked = true
-    }
-
-    fun onUserSelection() {
-        blocked = false
-    }
-}
 
 /**
  * Atomic ownership token for a Telecom call. Every callback carries its generation, so
@@ -823,6 +850,11 @@ internal fun selectedAudioRouteChoice(
     previous.endpointIdentifier?.let { id ->
         availableChoices.firstOrNull { it.endpointIdentifier == id }?.let { return it }
     }
+    // Wired/USB endpoints have per-call identifiers and no MAC: re-map by type + name.
+    availableChoices.firstOrNull {
+        it.endpointType == previous.endpointType &&
+            it.name.normalizeAudioDeviceName() == previous.name.normalizeAudioDeviceName()
+    }?.let { return it }
     return previous
 }
 
@@ -869,7 +901,15 @@ internal enum class ManualRouteCommandResult {
     Failed,
 }
 
-/** Pure, timer-free policy where only an explicit user command can request a route. */
+/**
+ * Route policy for one Telecom call generation. Sound always flows: status never gates
+ * audio. The coordinator re-asserts the user's standing selection **once** per call
+ * generation (the platform can start a fresh call on the earpiece before honoring the
+ * preferred endpoint); after that assert, a mismatch is genuine DIVERGED — banner only.
+ * A selected accessory that disappears triggers a one-shot fallback request to the
+ * speaker so there is always an audible device, while the selection is remembered and
+ * re-requested when the accessory returns.
+ */
 internal class TelecomRouteCoordinator(
     private val requestEndpoint: suspend (TelecomEndpoint) -> EndpointRequestResult,
     private val publishState: (TelecomCallState, String) -> Unit,
@@ -883,13 +923,20 @@ internal class TelecomRouteCoordinator(
     private var available: List<TelecomEndpoint> = emptyList()
     private var status = ManualRouteStatus.STARTING
     private var errorCode: Int? = null
-    private var requiresExplicitSelection = false
+
+    /** One automatic request of the selection per generation (or per accessory return). */
+    private var reassertAllowed = true
+    private var requestInFlight = false
+    /** Request accepted; waiting for the platform's endpoint-change callback. */
+    private var awaitingEndpointChange = false
+    /** One speaker-fallback request per accessory disappearance. */
+    private var fallbackRequested = false
+    private var lastSelectedAvailable: Boolean? = null
 
     suspend fun onActivationResult(success: Boolean) = stateMutex.withLock {
         phase = if (success) TelecomCallPhase.ACTIVE else TelecomCallPhase.FAILED
         if (success) {
-            updateStatusFromPlatform()
-            publish(reason = "Telecom call active")
+            reconcileRouteLocked("Telecom call active")
         } else {
             status = ManualRouteStatus.FAILED
             publish(
@@ -918,25 +965,22 @@ internal class TelecomRouteCoordinator(
                     ?: desired
             }
         }
-        val desiredAvailable = selected?.let(::findAvailableEndpoint) != null
-        if (endpoints.isNotEmpty() && !desiredAvailable) {
-            requiresExplicitSelection = true
-            status = ManualRouteStatus.UNAVAILABLE
-            errorCode = null
-        } else if (!requiresExplicitSelection) {
-            updateStatusFromPlatform()
-        }
-        publish(reason = "Telecom endpoints changed")
+        reconcileRouteLocked("Telecom endpoints changed")
     }
 
     suspend fun onUserSelected(choice: AudioRouteChoice): ManualRouteCommandResult {
         if (!stateMutex.tryLock()) return ManualRouteCommandResult.Busy
         try {
-            if (phase != TelecomCallPhase.ACTIVE) return ManualRouteCommandResult.Busy
+            if (phase != TelecomCallPhase.ACTIVE) {
+                // Call still warming up: adopt the new target; the post-activation
+                // reconcile asserts it against the platform.
+                selected = resolveChoice(choice) ?: choice.toTelecomEndpointPlaceholder()
+                reassertAllowed = true
+                return ManualRouteCommandResult.Busy
+            }
             val target = resolveChoice(choice)
             if (target == null) {
                 selected = choice.toTelecomEndpointPlaceholder()
-                requiresExplicitSelection = true
                 status = ManualRouteStatus.UNAVAILABLE
                 errorCode = null
                 publish(reason = "User-selected endpoint is unavailable")
@@ -944,7 +988,8 @@ internal class TelecomRouteCoordinator(
             }
 
             selected = target
-            requiresExplicitSelection = false
+            // The user's tap is the assert for this generation; no auto re-fight after it.
+            reassertAllowed = false
             errorCode = null
             if (sameTelecomEndpoint(current, target)) {
                 status = ManualRouteStatus.CONFIRMED
@@ -956,11 +1001,11 @@ internal class TelecomRouteCoordinator(
             publish(reason = "User requested audio endpoint")
             val result = requestEndpoint(target)
             if (result.success) {
+                awaitingEndpointChange = true
                 publish(reason = "User endpoint request accepted; waiting for confirmation")
                 return ManualRouteCommandResult.Accepted
             }
 
-            requiresExplicitSelection = true
             status = ManualRouteStatus.FAILED
             errorCode = result.errorCode
             publish(reason = "User endpoint request failed; Telecom session must be rebuilt")
@@ -972,8 +1017,8 @@ internal class TelecomRouteCoordinator(
 
     suspend fun onCurrentEndpoint(endpoint: TelecomEndpoint) = stateMutex.withLock {
         current = endpoint
-        if (!requiresExplicitSelection) updateStatusFromPlatform()
-        publish(reason = "Telecom current endpoint confirmed")
+        awaitingEndpointChange = false
+        reconcileRouteLocked("Telecom current endpoint confirmed")
     }
 
     suspend fun onInactive() = stateMutex.withLock {
@@ -983,24 +1028,83 @@ internal class TelecomRouteCoordinator(
 
     suspend fun onActive() = stateMutex.withLock {
         phase = TelecomCallPhase.ACTIVE
-        if (!requiresExplicitSelection) updateStatusFromPlatform()
-        publish(reason = "Telecom call active")
+        reconcileRouteLocked("Telecom call active")
     }
 
     suspend fun onDisconnected() = stateMutex.withLock {
         phase = TelecomCallPhase.STOPPED
-        if (!requiresExplicitSelection) status = ManualRouteStatus.STARTING
+        status = ManualRouteStatus.STARTING
         publish(reason = "Telecom call disconnected")
     }
 
-    private fun updateStatusFromPlatform() {
+    /**
+     * Single decision point run after every platform event. Recomputes availability and
+     * status, then performs at most one route request: re-assert the selection when it
+     * is available but not current, or fall back to the speaker when it disappeared.
+     */
+    private suspend fun reconcileRouteLocked(reason: String) {
+        val selectedAvailable = selected?.let(::findAvailableEndpoint) != null
+        if (available.isNotEmpty()) {
+            if (lastSelectedAvailable == false && selectedAvailable) {
+                // Accessory came back: one automatic restore request is allowed again.
+                reassertAllowed = true
+            }
+            if (selectedAvailable) fallbackRequested = false
+            lastSelectedAvailable = selectedAvailable
+        }
+        recomputeStatusLocked()
+        publish(reason = reason)
+
+        if (phase != TelecomCallPhase.ACTIVE || current == null || requestInFlight) return
+        if (sameTelecomEndpoint(current, selected)) {
+            // Selection honored: a later platform-initiated divergence is reported
+            // (DIVERGED banner), never fought automatically.
+            reassertAllowed = false
+            return
+        }
+
+        val target = selected?.let(::findAvailableEndpoint)
+        if (target != null && reassertAllowed) {
+            reassertAllowed = false
+            requestInFlight = true
+            status = ManualRouteStatus.REQUESTING
+            publish(reason = "Re-asserting selected audio endpoint")
+            val result = requestEndpoint(target)
+            requestInFlight = false
+            if (result.success) {
+                awaitingEndpointChange = true
+            } else {
+                errorCode = result.errorCode
+            }
+            recomputeStatusLocked()
+            publish(reason = "Selected endpoint re-assert result success=${result.success}")
+        } else if (target == null && available.isNotEmpty() && !fallbackRequested) {
+            fallbackRequested = true
+            val speaker = available.firstOrNull { it.type == CallEndpointCompat.TYPE_SPEAKER }
+            if (speaker != null && !sameTelecomEndpoint(current, speaker)) {
+                // Best effort: keep the UNAVAILABLE banner, but make sure audio is audible.
+                requestInFlight = true
+                requestEndpoint(speaker)
+                requestInFlight = false
+                recomputeStatusLocked()
+                publish(reason = "Selected endpoint gone; speaker fallback requested")
+            }
+        }
+    }
+
+    private fun recomputeStatusLocked() {
         status = when {
             phase != TelecomCallPhase.ACTIVE -> ManualRouteStatus.STARTING
             current == null -> ManualRouteStatus.STARTING
             sameTelecomEndpoint(current, selected) -> ManualRouteStatus.CONFIRMED
+            requestInFlight || awaitingEndpointChange -> ManualRouteStatus.REQUESTING
+            available.isNotEmpty() && selected?.let(::findAvailableEndpoint) == null ->
+                ManualRouteStatus.UNAVAILABLE
             else -> ManualRouteStatus.DIVERGED
         }
-        errorCode = null
+        if (status != ManualRouteStatus.DIVERGED && status != ManualRouteStatus.UNAVAILABLE) {
+            errorCode = null
+        }
     }
 
     private fun resolveChoice(choice: AudioRouteChoice): TelecomEndpoint? =

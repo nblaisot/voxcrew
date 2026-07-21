@@ -98,7 +98,12 @@ class CrewRosterRepository(
 
         lanPeers.filter { it.uid != localUid }.forEach { peer ->
             if (SoftForgetPolicy.shouldPersistToCache(peer.uid, skipCacheUids)) {
-                cache[peer.uid] = CachedMember(peer.uid, peer.displayName, peer.lastSeenMs, peer.overlayHost)
+                // A LAN sighting without an overlay host must not erase a previously
+                // learned one — Tailscale addresses are node-stable and the cached
+                // value is the cold-start probe seed.
+                val overlayHost = peer.overlayHost?.takeIf { it.isNotBlank() }
+                    ?: cache[peer.uid]?.overlayHost
+                cache[peer.uid] = CachedMember(peer.uid, peer.displayName, peer.lastSeenMs, overlayHost)
             }
             byUid[peer.uid] = CrewMember(
                 uid = peer.uid,

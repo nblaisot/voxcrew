@@ -194,12 +194,16 @@ class MainViewModel(
                 lanEngine.audioRoute,
                 lanEngine.audioPipelineState,
                 lanEngine.captureInputKind,
-                combine(lanEngine.appForeground, demoModeStore.enabled) { foreground, demo ->
-                    foreground to demo
+                combine(
+                    lanEngine.appForeground,
+                    demoModeStore.enabled,
+                    lanEngine.observedRouteMismatch,
+                ) { foreground, demo, mismatch ->
+                    Triple(foreground, demo, mismatch)
                 },
-            ) { selection, route, pipeline, input, foregroundAndDemo ->
-                val (appForeground, demoEnabled) = foregroundAndDemo
-                AudioUiSnapshot(selection, route, pipeline, input, appForeground, demoEnabled)
+            ) { selection, route, pipeline, input, extras ->
+                val (appForeground, demoEnabled, routeMismatch) = extras
+                AudioUiSnapshot(selection, route, pipeline, input, appForeground, demoEnabled, routeMismatch)
             }.collect { snapshot ->
                 val selection = snapshot.selection
                 val route = snapshot.route
@@ -242,6 +246,12 @@ class MainViewModel(
                         currentName = route.currentEndpoint?.name,
                         errorCode = selection.errorCode,
                     )
+                    ?: snapshot.routeMismatch.takeIf { it }?.let {
+                        appContext.getString(
+                            R.string.audio_route_diverged,
+                            appContext.getString(R.string.another_output),
+                        )
+                    }
                 _uiState.update {
                     val awaitingDuplex = appForeground &&
                         !it.voxEnabled &&
@@ -271,7 +281,8 @@ class MainViewModel(
                             (
                                 manualStatus == ManualRouteStatus.UNAVAILABLE ||
                                     manualStatus == ManualRouteStatus.DIVERGED ||
-                                    manualStatus == ManualRouteStatus.FAILED
+                                    manualStatus == ManualRouteStatus.FAILED ||
+                                    snapshot.routeMismatch
                                 ),
                     ).withPttEnabled()
                 }
@@ -323,7 +334,6 @@ class MainViewModel(
             audioRouteReady = audioRouteReady,
             audioStartAllowed = audioStartAllowed,
             audioRoutePending = audioRoutePending,
-            audioRouteStatus = audioRouteStatus,
             showAudioRetry = showAudioRetry,
             hasActiveRecipient = hasActiveRecipient,
             hasConnectedRecipient = hasConnectedRecipient,
@@ -514,6 +524,7 @@ private data class AudioUiSnapshot(
     val input: CaptureInputKind,
     val appForeground: Boolean,
     val demoEnabled: Boolean = false,
+    val routeMismatch: Boolean = false,
 )
 
 internal fun computePttEnabled(
@@ -523,7 +534,6 @@ internal fun computePttEnabled(
     audioRouteReady: Boolean,
     audioStartAllowed: Boolean,
     audioRoutePending: Boolean = false,
-    audioRouteStatus: ManualRouteStatus = ManualRouteStatus.CONFIRMED,
     showAudioRetry: Boolean = false,
     hasActiveRecipient: Boolean = true,
     hasConnectedRecipient: Boolean = true,
@@ -536,7 +546,6 @@ internal fun computePttEnabled(
         audioRouteReady = audioRouteReady,
         audioStartAllowed = audioStartAllowed,
         audioRoutePending = audioRoutePending,
-        audioRouteStatus = audioRouteStatus,
         showAudioRetry = showAudioRetry,
         hasActiveRecipient = hasActiveRecipient,
         hasConnectedRecipient = hasConnectedRecipient,

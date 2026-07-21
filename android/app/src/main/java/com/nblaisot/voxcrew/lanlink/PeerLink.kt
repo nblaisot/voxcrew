@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.TreeMap
+import kotlin.coroutines.CoroutineContext
 
 sealed interface IncomingMediaEvent {
     data class Audio(val payload: ByteArray) : IncomingMediaEvent
@@ -36,7 +37,10 @@ sealed interface IncomingMediaEvent {
  * From then on [PeerLink] deduplicates/orders inbound audio, drives
  * ACK/PING on a shared timer, and exposes [rttMs] / [backlogMs] for the UI.
  */
-class PeerLink(private val scope: CoroutineScope) {
+class PeerLink(
+    private val scope: CoroutineScope,
+    private val healthDispatcher: CoroutineContext = Dispatchers.IO,
+) {
     sealed class LinkState {
         data object Idle : LinkState()
         data class Connecting(val peerUid: String) : LinkState()
@@ -69,6 +73,8 @@ class PeerLink(private val scope: CoroutineScope) {
     private val sendBuffer = SendBuffer()
     @Volatile private var outSeq = 0L
     @Volatile private var lastContiguousInSeq = -1L
+    /** Highest sequence the peer has confirmed (Hello resume or Ack). Drives [maybeSendSkip]. */
+    @Volatile private var peerAckedSeq = -1L
     private val pendingInbound = TreeMap<Long, LanFrame>()
     @Volatile private var lastActivityMs = System.currentTimeMillis()
     @Volatile private var lastPingSentMs = 0L
@@ -101,6 +107,7 @@ class PeerLink(private val scope: CoroutineScope) {
         sendBuffer.clear()
         outSeq = 0
         lastContiguousInSeq = -1
+        peerAckedSeq = -1
         pendingInbound.clear()
         lastActivityMs = System.currentTimeMillis()
         awaitingPongSinceMs = null
@@ -118,6 +125,7 @@ class PeerLink(private val scope: CoroutineScope) {
         sendBuffer.clear()
         outSeq = 0
         lastContiguousInSeq = -1
+        peerAckedSeq = -1
         pendingInbound.clear()
         awaitingPongSinceMs = null
         lastPingSentMs = 0L
@@ -139,7 +147,10 @@ class PeerLink(private val scope: CoroutineScope) {
         val seq = outSeq++
         sendBuffer.add(seq, payload)
         updateBacklog()
-        activeTransport?.sendFrame(LanFrame.Audio(seq, payload))
+        activeTransport?.let { transport ->
+            maybeSendSkip(transport)
+            transport.sendFrame(LanFrame.Audio(seq, payload))
+        }
     }
 
     @Synchronized
@@ -148,10 +159,14 @@ class PeerLink(private val scope: CoroutineScope) {
         val seq = outSeq++
         val kind = if (active) SendBuffer.Kind.MEDIA_ACTIVE else SendBuffer.Kind.MEDIA_INACTIVE
         sendBuffer.add(seq, ByteArray(0), kind = kind)
-        activeTransport?.sendFrame(LanFrame.MediaActivity(seq, active))
+        activeTransport?.let { transport ->
+            maybeSendSkip(transport)
+            transport.sendFrame(LanFrame.MediaActivity(seq, active))
+        }
     }
 
     /** Called by a transport once its own Hello/resume exchange with [peerUid] has succeeded. */
+    @Synchronized
     fun onHandshakeComplete(transport: FrameTransport, peerUid: String, peerAnnouncedLastContiguousSeq: Long) {
         if (currentPeerUid != peerUid) return
         if (activeTransport !== transport) {
@@ -161,10 +176,14 @@ class PeerLink(private val scope: CoroutineScope) {
         lastActivityMs = System.currentTimeMillis()
         awaitingPongSinceMs = null
         lastPingSentMs = 0L
+        peerAckedSeq = peerAnnouncedLastContiguousSeq
         sendBuffer.trimTo(peerAnnouncedLastContiguousSeq)
         expireStaleFrames()
         updateBacklog()
         _state.value = LinkState.Connected(peerUid, transport.label)
+        // Expiry/eviction while apart may have created a hole after the peer's cursor:
+        // declare it before replaying so the receiver's contiguity can advance.
+        maybeSendSkip(transport)
         sendBuffer.replayFrom(peerAnnouncedLastContiguousSeq).forEach {
             transport.sendFrame(it.toFrame())
         }
@@ -178,7 +197,9 @@ class PeerLink(private val scope: CoroutineScope) {
         when (frame) {
             is LanFrame.Audio -> acceptSequenced(frame.seq, frame)
             is LanFrame.MediaActivity -> acceptSequenced(frame.seq, frame)
+            is LanFrame.Skip -> acceptSkip(frame.untilSeq)
             is LanFrame.Ack -> {
+                if (frame.lastContiguousSeq > peerAckedSeq) peerAckedSeq = frame.lastContiguousSeq
                 sendBuffer.trimTo(frame.lastContiguousSeq)
                 updateBacklog()
             }
@@ -243,34 +264,64 @@ class PeerLink(private val scope: CoroutineScope) {
         awaitingPongSinceMs = nowMs
     }
 
+    @Synchronized
+    internal fun expireStaleFramesForTest(nowMs: Long) {
+        val dropped = sendBuffer.expireOlderThan(SendBuffer.DEFAULT_MAX_AGE_MS, nowMs)
+        if (dropped > 0) {
+            updateBacklog()
+            _bufferExpired.tryEmit(dropped)
+        }
+    }
+
     /**
      * ACK/ping loop runs only while a transport is attached (started on handshake,
      * stopped on detach). Buffer expiry happens at event points ([send],
      * [onHandshakeComplete]) so nothing polls per peer while disconnected.
      */
+    @Synchronized
     private fun ensureHealthLoop() {
         if (healthLoopJob?.isActive == true) return
-        healthLoopJob = scope.launch(Dispatchers.IO) {
-            while (currentCoroutineContext().isActive) {
-                delay(ACK_INTERVAL_MS)
-                val transport = activeTransport ?: break
-                synchronized(this@PeerLink) { expireStaleFrames() }
-                transport.sendFrame(LanFrame.Ack(lastContiguousInSeq))
-                val now = System.currentTimeMillis()
-                if (now - lastPingSentMs > PING_INTERVAL_MS) {
-                    lastPingSentMs = now
-                    awaitingPongSinceMs = now
-                    transport.sendFrame(LanFrame.Ping(now))
+        healthLoopJob = scope.launch(healthDispatcher) { runHealthLoop() }
+    }
+
+    private suspend fun runHealthLoop() {
+        while (currentCoroutineContext().isActive) {
+            delay(ACK_INTERVAL_MS)
+            val transport = activeTransport
+            if (transport == null) {
+                // Exit only after re-checking under the monitor: a handshake racing this
+                // window either sees an inactive job (and restarts one) or is seen here.
+                val shouldExit = synchronized(this@PeerLink) {
+                    if (activeTransport == null) {
+                        healthLoopJob = null
+                        true
+                    } else {
+                        false
+                    }
                 }
-                if (!evaluateLiveness(now)) {
-                    lastActivityMs = now
-                    awaitingPongSinceMs = null
-                    markUnreachable()
-                }
+                if (shouldExit) return
+                continue
+            }
+            synchronized(this@PeerLink) {
+                expireStaleFrames()
+                maybeSendSkip(transport)
+            }
+            transport.sendFrame(LanFrame.Ack(lastContiguousInSeq))
+            val now = System.currentTimeMillis()
+            if (now - lastPingSentMs > PING_INTERVAL_MS) {
+                lastPingSentMs = now
+                awaitingPongSinceMs = now
+                transport.sendFrame(LanFrame.Ping(now))
+            }
+            if (!evaluateLiveness(now)) {
+                lastActivityMs = now
+                awaitingPongSinceMs = null
+                markUnreachable()
             }
         }
     }
 
+    @Synchronized
     private fun stopHealthLoop() {
         healthLoopJob?.cancel()
         healthLoopJob = null
@@ -294,6 +345,34 @@ class PeerLink(private val scope: CoroutineScope) {
         if (seq <= lastContiguousInSeq || pendingInbound.containsKey(seq)) return
         if (pendingInbound.size >= MAX_PENDING_INBOUND_FRAMES) return
         pendingInbound[seq] = frame
+        drainContiguousLocked()
+    }
+
+    /**
+     * Sender declared that everything up to [untilSeq] no longer exists: fast-forward
+     * the contiguity cursor and deliver whatever buffered frames become contiguous.
+     */
+    @Synchronized
+    private fun acceptSkip(untilSeq: Long) {
+        if (untilSeq <= lastContiguousInSeq) return
+        lastContiguousInSeq = untilSeq
+        pendingInbound.headMap(untilSeq, true).clear()
+        drainContiguousLocked()
+    }
+
+    /**
+     * Declares a sequence hole to the peer when expiry/eviction removed frames the
+     * peer has not acknowledged. No-op while the buffered frames are contiguous with
+     * the peer's cursor. Caller must hold the [PeerLink] monitor.
+     */
+    private fun maybeSendSkip(transport: FrameTransport) {
+        val nextAvailableSeq = sendBuffer.firstSeq() ?: outSeq
+        if (nextAvailableSeq > peerAckedSeq + 1) {
+            transport.sendFrame(LanFrame.Skip(nextAvailableSeq - 1))
+        }
+    }
+
+    private fun drainContiguousLocked() {
         while (true) {
             val nextSeq = lastContiguousInSeq + 1
             val next = pendingInbound.remove(nextSeq) ?: break

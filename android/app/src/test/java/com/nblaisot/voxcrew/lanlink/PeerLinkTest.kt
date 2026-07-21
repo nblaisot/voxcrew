@@ -234,6 +234,108 @@ class PeerLinkTest {
     }
 
     @Test
+    fun `expired frames while apart are declared with skip so replay resumes cleanly`() {
+        val peerLink = newPeerLink()
+        peerLink.resetFor("peer-b")
+        val transportA = FakeTransport("A")
+        peerLink.onHandshakeComplete(transportA, "peer-b", -1)
+
+        peerLink.send(byteArrayOf(1)) // seq 0
+        peerLink.send(byteArrayOf(2)) // seq 1
+        peerLink.onDisconnected(transportA, "peer-b")
+
+        // While disconnected, the unacked frames age out of the send buffer.
+        peerLink.expireStaleFramesForTest(nowMs = System.currentTimeMillis() + 60_000)
+        peerLink.send(byteArrayOf(3)) // seq 2, freshly enqueued
+
+        // Reconnect: the peer announces it never got anything (-1). Seq 0..1 are gone,
+        // so the sender must declare the hole before replaying seq 2.
+        val transportB = FakeTransport("B")
+        peerLink.onHandshakeComplete(transportB, "peer-b", -1)
+
+        val skips = transportB.sent.filterIsInstance<LanFrame.Skip>()
+        assertEquals(listOf(1L), skips.map { it.untilSeq })
+        assertEquals(listOf(2L), transportB.sentAudio().map { it.seq })
+        // Skip precedes the replayed audio on the wire.
+        assertTrue(transportB.sent.indexOfFirst { it is LanFrame.Skip } <
+            transportB.sent.indexOfFirst { it is LanFrame.Audio })
+        peerLink.clear()
+    }
+
+    @Test
+    fun `receiver fast-forwards over a declared hole and delivers buffered frames`() {
+        val peerLink = newPeerLink()
+        peerLink.resetFor("peer-b")
+        val transport = FakeTransport("A")
+        peerLink.onHandshakeComplete(transport, "peer-b", -1)
+
+        // Frames 0..2 never arrive; 3 and 4 are parked out of order.
+        peerLink.onFrameReceived(transport, LanFrame.Audio(3, byteArrayOf(13)))
+        peerLink.onFrameReceived(transport, LanFrame.Audio(4, byteArrayOf(14)))
+        assertEquals(-1L, peerLink.lastContiguousInSeq())
+
+        peerLink.onFrameReceived(transport, LanFrame.Skip(2))
+
+        // Contiguity jumped over the hole and drained the parked frames.
+        assertEquals(4L, peerLink.lastContiguousInSeq())
+        peerLink.clear()
+    }
+
+    @Test
+    fun `stale skip never rewinds contiguity`() {
+        val peerLink = newPeerLink()
+        peerLink.resetFor("peer-b")
+        val transport = FakeTransport("A")
+        peerLink.onHandshakeComplete(transport, "peer-b", -1)
+
+        peerLink.onFrameReceived(transport, LanFrame.Audio(0, byteArrayOf(1)))
+        peerLink.onFrameReceived(transport, LanFrame.Audio(1, byteArrayOf(2)))
+        peerLink.onFrameReceived(transport, LanFrame.Skip(0))
+
+        assertEquals(1L, peerLink.lastContiguousInSeq())
+        peerLink.clear()
+    }
+
+    @Test
+    fun `live expiry declares the hole on the next send`() {
+        val peerLink = newPeerLink()
+        peerLink.resetFor("peer-b")
+        val transportA = FakeTransport("A")
+        peerLink.onHandshakeComplete(transportA, "peer-b", -1)
+
+        peerLink.send(byteArrayOf(1)) // seq 0, never acked
+        // Frame ages out while the transport stays attached (receiver stalled).
+        peerLink.expireStaleFramesForTest(nowMs = System.currentTimeMillis() + 60_000)
+        peerLink.send(byteArrayOf(2)) // seq 1
+
+        val skips = transportA.sent.filterIsInstance<LanFrame.Skip>()
+        assertEquals(listOf(0L), skips.map { it.untilSeq })
+        peerLink.clear()
+    }
+
+    @Test
+    fun `health loop restarts after a disconnect and reconnect`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val peerLink = PeerLink(this, healthDispatcher = dispatcher)
+        peerLink.resetFor("peer-b")
+
+        val transportA = FakeTransport("A")
+        peerLink.onHandshakeComplete(transportA, "peer-b", -1)
+        testScheduler.advanceTimeBy(300)
+        testScheduler.runCurrent()
+        assertTrue(transportA.sent.any { it is LanFrame.Ack })
+
+        peerLink.onDisconnected(transportA, "peer-b")
+        val transportB = FakeTransport("B")
+        peerLink.onHandshakeComplete(transportB, "peer-b", -1)
+        testScheduler.advanceTimeBy(300)
+        testScheduler.runCurrent()
+
+        assertTrue(transportB.sent.any { it is LanFrame.Ack })
+        peerLink.clear()
+    }
+
+    @Test
     fun `stale pong does not update rtt`() {
         val peerLink = newPeerLink()
         peerLink.resetFor("peer-b")

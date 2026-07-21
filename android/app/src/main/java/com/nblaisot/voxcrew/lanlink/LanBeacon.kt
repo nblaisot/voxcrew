@@ -34,6 +34,7 @@ import java.util.concurrent.ConcurrentHashMap
 class LanBeacon(
     private val context: Context,
     private val scope: CoroutineScope,
+    private val overlayHostResolver: () -> String? = { TailscaleInterface.localOverlayIpv4() },
 ) {
     data class PresenceSnapshot(
         val lanSightings: Map<String, LanPeer> = emptyMap(),
@@ -153,9 +154,25 @@ class LanBeacon(
         multicastLock = null
     }
 
+    /**
+     * Re-resolves the local Tailscale address on every tick, so an overlay that comes
+     * up (or changes address) after the socket was bound is announced within one
+     * broadcast interval — no rebind choreography needed. When resolution returns
+     * null (VPN momentarily down or enumeration failed) the last known host is still
+     * announced: Tailscale node addresses are stable, and peers only ever dial it as
+     * plan B, so a briefly-stale announce beats "nothing to promote to".
+     */
+    private fun currentOverlayHost(): String? {
+        val live = overlayHostResolver()
+        if (live != null) selfOverlayHost = live
+        return live ?: selfOverlayHost
+    }
+
+    internal fun announcedOverlayHostForTest(): String? = currentOverlayHost()
+
     private suspend fun broadcastLoop() {
         while (scope.isActive && socket?.isClosed == false) {
-            val payload = encode(selfUid, selfName, tcpPort, selfOverlayHost)
+            val payload = encode(selfUid, selfName, tcpPort, currentOverlayHost())
             broadcastToAllInterfaces(payload)
             delay(BROADCAST_INTERVAL_MS)
         }
@@ -163,7 +180,7 @@ class LanBeacon(
 
     private suspend fun overlayProbeLoop() {
         while (scope.isActive && socket?.isClosed == false) {
-            val payload = encode(selfUid, selfName, tcpPort, selfOverlayHost)
+            val payload = encode(selfUid, selfName, tcpPort, currentOverlayHost())
             overlayProbeTargets.values.distinct().forEach { host ->
                 runCatching {
                     val address = InetAddress.getByName(host)

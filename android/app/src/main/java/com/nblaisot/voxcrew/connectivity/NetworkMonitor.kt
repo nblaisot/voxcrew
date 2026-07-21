@@ -49,7 +49,9 @@ class NetworkMonitor(context: Context) {
                 .sorted()
                 .hashCode()
             val previous = linkAddressHashes.put(network.networkHandle, hash)
-            if (previous != null && previous != hash) {
+            // The first event for a network is exactly when its addresses appear
+            // (e.g. Tailscale's 100.x coming up) — it must emit too.
+            if (previous != hash) {
                 _networkChanged.tryEmit(Unit)
             }
         }

@@ -1,6 +1,5 @@
 package com.nblaisot.voxcrew.ui.main
 
-import com.nblaisot.voxcrew.audio.ManualRouteStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -38,7 +37,6 @@ class PttBlockReasonTest {
         audioRouteReady: Boolean = true,
         audioStartAllowed: Boolean = true,
         audioRoutePending: Boolean = false,
-        audioRouteStatus: ManualRouteStatus = ManualRouteStatus.CONFIRMED,
         showAudioRetry: Boolean = false,
         hasActiveRecipient: Boolean = true,
         hasConnectedRecipient: Boolean = true,
@@ -50,7 +48,6 @@ class PttBlockReasonTest {
         audioRouteReady = audioRouteReady,
         audioStartAllowed = audioStartAllowed,
         audioRoutePending = audioRoutePending,
-        audioRouteStatus = audioRouteStatus,
         showAudioRetry = showAudioRetry,
         hasActiveRecipient = hasActiveRecipient,
         hasConnectedRecipient = hasConnectedRecipient,

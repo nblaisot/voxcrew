@@ -490,7 +490,6 @@ private fun pttLabel(state: MainUiState): String = when (state.pttBlockReason) {
         R.string.audio_connecting,
         state.selectedAudioRoute.name,
     )
-    PttBlockReason.Diverged -> stringResource(R.string.audio_choose_output)
     PttBlockReason.NoMic -> stringResource(R.string.ptt_audio_unavailable)
     PttBlockReason.Background -> stringResource(R.string.ptt_background)
     PttBlockReason.NoRecipient -> stringResource(R.string.ptt_no_recipient)

@@ -468,7 +468,8 @@ class LanTcpClient(
 
     companion object {
         private const val LAN_CONNECT_TIMEOUT_MS = 2_000
-        private const val OVERLAY_CONNECT_TIMEOUT_MS = 1_000
+        /** First dial through a DERP relay on cellular regularly exceeds 1 s. */
+        private const val OVERLAY_CONNECT_TIMEOUT_MS = 5_000
         private const val LAN_RETRY_DELAY_MS = 500L
         private const val OVERLAY_RETRY_DELAY_MS = 250L
         internal const val MAX_RETRY_DELAY_MS = 30_000L

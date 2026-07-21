@@ -161,13 +161,21 @@ VoxCrew au premier plan prépare Telecom et le pipeline avant toute pression. Le
 gris et désactivé jusqu'à `ACTIVE + READY`; une fois prêt, la pression ne fait que changer
 `TransmissionPolicy` et l'encodage peut commencer sur la prochaine frame de 20 ms.
 
+**Le son passe toujours** : `mediaActive` requiert seulement `ACTIVE` + endpoint courant
+connu + pas d'erreur de session. L'endpoint courant de la plateforme est par définition un
+périphérique qui fonctionne ; le statut de sélection (`CONFIRMED`/`DIVERGED`/`UNAVAILABLE`)
+est une information de bannière, jamais une porte sur l'audio ni sur PTT. Un seul blocage
+subsiste : après un vrai échec de pipeline (`AudioPipelineState.Failed`), la réactivation
+Telecom attend « Réessayer » ou un nouveau choix de sortie.
+
 `AudioRecord.routedDevice` et `AudioTrack.routedDevice` servent aux diagnostics, aux
 icônes Bluetooth/USB/filaire et à la **vérification événementielle de route** : un
 `addOnRoutingChangedListener` sur le recorder et la track détecte le cas où Telecom croit
 l'appel sur Bluetooth mais la plateforme route ailleurs (SCO jamais démarré). Après une
-unique re-vérification de 1,5 s (temps de démarrage SCO), le pipeline passe `Failed` par
-le chemin existant (déconnexion + bannière Réessayer). Aucun `AudioDeviceInfo` n'est
-conservé comme décision de routage.
+unique re-vérification de 1,5 s (temps de démarrage SCO), une bannière de type divergence
+s'affiche avec l'action « Cet appareil » — l'audio continue sur le périphérique réel
+(de l'audio sur le mauvais périphérique vaut mieux que pas d'audio). Aucun
+`AudioDeviceInfo` n'est conservé comme décision de routage.
 
 ## Cycle de demande média
 
@@ -245,31 +253,34 @@ sur le nom bonded **uniquement si unique** (deux appareils de même nom → non 
 de fusion hasardeuse).
 Les endpoints USB/filaire
 sont ajoutés et retirés dynamiquement. La connexion d'un accessoire ne le sélectionne jamais
-automatiquement. Sa déconnexion conserve le choix devenu indisponible, ferme le duplex et
-attend un nouveau choix manuel ; elle ne sélectionne aucun remplacement.
+automatiquement. La sélection explicite est **persistée** (clé, type, MAC, nom) dans les
+`SharedPreferences` (`voxcrew_audio_route`) et restaurée au démarrage du processus ; elle
+est re-mappée sur le catalogue de chaque génération d'appel (« Cet appareil » → haut-parleur
+par type, Bluetooth → par MAC, filaire/USB → par type + nom).
 
 Une fois l'appel actif :
 
-- `currentCallEndpoint` reste la vérité sur la route physique courante et ne provoque
-  jamais lui-même une demande de route ;
-- `availableEndpoints` actualise uniquement le menu et ne provoque jamais une demande ;
+- `currentCallEndpoint` reste la vérité sur la route physique courante ; le duplex s'ouvre
+  sur cet endpoint dès `ACTIVE`, que la sélection soit confirmée ou non ;
+- si l'appel démarre ailleurs que sur la sélection (transitoire écouteur d'un nouvel appel
+  au retour premier plan, par exemple), le coordinateur **ré-affirme la sélection une seule
+  fois par génération d'appel** (`requestEndpoint`) — c'est l'exécution du choix mémorisé
+  de l'utilisateur, pas de l'auto-routage. Si la plateforme atterrit encore ailleurs, l'état
+  devient `DIVERGED` : bannière + action « Cet appareil », l'audio continue ;
 - la cible sélectionnée est passée comme `preferredStartingCallEndpoint` lors de la
-  création de l'appel ;
-- le duplex reste fermé tant que l'endpoint courant ne correspond pas à la sélection :
-  aucun premier paquet ne peut partir via l'écouteur ou la montre par erreur ;
-- seul un clic dans le menu peut demander un changement pendant un appel, exactement une
-  fois et vers l'identifiant choisi ; les autres clics sont refusés pendant cette requête ;
-- si Samsung change spontanément de route, l'état devient `DIVERGED`, l'appel Telecom est
-  déconnecté jusqu'à un nouveau choix utilisateur, et aucune correction automatique n'est
-  tentée. La confirmation compare l'identifiant Telecom **ou** la MAC Bluetooth
-  (`sameTelecomEndpoint`) : un flip de profil SCO↔LE Audio du même accessoire ne déclenche
-  pas de fausse divergence ;
-- la perte de l'accessoire sélectionné (comme `DIVERGED`/`FAILED`) affiche une action
-  « Cet appareil » dans la bannière — récupération en un geste via le chemin
-  `selectAudioRoute` normal, jamais de bascule automatique ;
-- un refus devient `FAILED`, déconnecte la génération Telecom potentiellement bloquée et
-  interdit sa recréation automatique. Le prochain choix explicite crée une session propre ;
-- un endpoint disparu devient `UNAVAILABLE` et ne déclenche aucun repli ;
+  création de l'appel ; si elle est absente, l'appel démarre sur le haut-parleur (il existe
+  toujours un périphérique qui fonctionne) et la sélection est conservée pour restauration ;
+- seul un clic dans le menu peut demander un autre changement pendant un appel, exactement
+  une fois et vers l'identifiant choisi ; les autres clics sont refusés pendant cette requête ;
+- si Samsung change spontanément de route après confirmation, l'état devient `DIVERGED` —
+  bannière seulement, aucune déconnexion, aucune correction automatique. La confirmation
+  compare l'identifiant Telecom **ou** la MAC Bluetooth (`sameTelecomEndpoint`) : un flip de
+  profil SCO↔LE Audio du même accessoire ne déclenche pas de fausse divergence ;
+- la perte de l'accessoire sélectionné passe `UNAVAILABLE` (bannière + « Cet appareil »),
+  demande une fois le haut-parleur si la plateforme a rerouté vers l'écouteur, et **mémorise
+  la sélection** : au retour de l'accessoire, une unique requête automatique le restaure ;
+- un refus de requête devient `FAILED` et reconstruit la génération Telecom autour du choix ;
+  la réconciliation de demande média réactive l'appel immédiatement ;
 - `onSetInactive` est traité comme une demande de terminaison, et `onDisconnect` ferme
   immédiatement le duplex et annule PTT.
 
@@ -277,12 +288,14 @@ Le bouton PTT et l'action de barre supérieure affichent la sélection même à 
 pendant un appel, le bouton reflète la route confirmée. Une Watch et des Buds sont deux
 entrées indépendantes même si leur type est identique. « Cet appareil » résout strictement
 le `TYPE_SPEAKER` fourni par Telecom, jamais l'écouteur téléphonique. `AudioDeviceInfo` ne sert qu'à
-distinguer visuellement USB/filaire et aux diagnostics. Il n'existe aucun retry automatique,
-délai, debounce, timeout de confirmation, route SCO historique ou repli applicatif.
+distinguer visuellement USB/filaire et aux diagnostics. Il n'existe aucune boucle de retry,
+délai, debounce, timeout de confirmation ou route SCO historique : les seules requêtes
+automatiques sont bornées à une par événement (une ré-affirmation par génération d'appel,
+une restauration par retour d'accessoire, un repli haut-parleur par disparition).
 
 ## Pipeline duplex sérialisé
 
-Pour chaque nouvelle clé d'endpoint confirmée, sous un mutex unique :
+Pour chaque nouvelle clé d'endpoint courant, sous un mutex unique :
 
 1. annulation de la transmission pendant le remplacement du graphe ;
 2. arrêt/libération des deux anciens flux ;

@@ -50,7 +50,9 @@ class AudioPipelineStateTest {
     }
 
     @Test
-    fun currentEndpointIsObservedButNotReadyUntilItMatchesUserSelection() {
+    fun divergedSelectionStillCarriesMedia() {
+        // Sound always flows: the platform's current endpoint carries audio even while
+        // the user's selection is not honored yet (selection status is banner-only).
         val call = TelecomCallState(
             phase = TelecomCallPhase.ACTIVE,
             currentEndpoint = speaker,
@@ -63,7 +65,20 @@ class AudioPipelineStateTest {
             observedOutput = ObservedAudioDeviceKind.BUILTIN,
         )
 
+        assertFalse(call.selectionConfirmed)
+        assertTrue(call.mediaActive)
+        assertTrue(isConfirmedDuplexReady(call, pipeline))
+    }
+
+    @Test
+    fun noCurrentEndpointMeansNoMedia() {
+        val call = TelecomCallState(
+            phase = TelecomCallPhase.ACTIVE,
+            currentEndpoint = null,
+            selectedEndpoint = speaker,
+            availableEndpoints = listOf(speaker),
+        )
+
         assertFalse(call.mediaActive)
-        assertFalse(isConfirmedDuplexReady(call, pipeline))
     }
 }

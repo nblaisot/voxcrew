@@ -44,6 +44,10 @@ class SendBuffer(private val maxBytes: Int = DEFAULT_MAX_BYTES) {
     @Synchronized
     fun oldestEnqueuedAtMs(): Long? = frames.firstOrNull()?.enqueuedAtMs
 
+    /** Sequence of the oldest still-buffered frame, or null if the buffer is empty. */
+    @Synchronized
+    fun firstSeq(): Long? = frames.firstOrNull()?.seq
+
     /** Drops all frames the peer has confirmed receiving (seq <= ackedSeq). */
     @Synchronized
     fun trimTo(ackedSeq: Long) {

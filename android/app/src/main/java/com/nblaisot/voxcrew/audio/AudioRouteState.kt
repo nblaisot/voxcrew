@@ -127,8 +127,13 @@ data class TelecomCallState(
     val selectionConfirmed: Boolean
         get() = sameTelecomEndpoint(currentEndpoint, selectedEndpoint)
 
+    /**
+     * Sound always flows: an ACTIVE call with a known current endpoint carries media,
+     * whatever route the platform put it on. Selection status (CONFIRMED/DIVERGED/
+     * UNAVAILABLE) is UI information, never an audio gate.
+     */
     val mediaActive: Boolean
-        get() = phase == TelecomCallPhase.ACTIVE && selectionConfirmed && sessionIssue == null
+        get() = phase == TelecomCallPhase.ACTIVE && currentEndpoint != null && sessionIssue == null
 
     val endpointKey: String?
         get() = currentEndpoint?.let { "${it.type}:${it.identifier}" }
