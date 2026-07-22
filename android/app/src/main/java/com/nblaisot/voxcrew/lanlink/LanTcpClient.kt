@@ -1,5 +1,6 @@
 package com.nblaisot.voxcrew.lanlink
 
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -18,9 +19,10 @@ import java.net.InetSocketAddress
 import java.net.Socket
 
 /**
- * Per-peer LAN/overlay [FrameTransport]: outbound dial (when client role) and one TCP session
- * bound to a single [PeerLink]. Inbound accepts are handed off by [LanTcpServer].
+ * Per-peer LAN/overlay [FrameTransport]: outbound dial and one TCP session bound to a
+ * single [PeerLink]. Inbound accepts are handed off by [LanTcpServer].
  *
+ * Both peers dial when a target is set; the first successful Hello wins.
  * [label] reflects the **live socket** path after Hello/adopt, not dial intent alone.
  */
 class LanTcpClient(
@@ -48,7 +50,15 @@ class LanTcpClient(
     @Volatile private var standbyOutbound: ParkedSession? = null
     private var standbyDialJob: Job? = null
     @Volatile private var dialFailures = 0
-    @Volatile private var lastTargetSeenMs = 0L
+    @Volatile private var lastTargetIdentity: String? = null
+    /** Bumped on intentional cancel so in-flight dials do not count as failures. */
+    @Volatile private var cancelGeneration = 0
+
+    /** Fired after a *real* failed dial to a non-overlay (LAN) target (not intentional cancel). */
+    @Volatile var onLanDialFailed: (() -> Unit)? = null
+
+    /** Fired when an overlay endpoint looks dead (ECONNREFUSED or enough consecutive failures). */
+    @Volatile var onOverlayEndpointDead: ((peerUid: String) -> Unit)? = null
 
     fun lastContiguousInSeq(): Long = peerLink.lastContiguousInSeq()
 
@@ -68,6 +78,15 @@ class LanTcpClient(
     fun hasStandbyReady(): Boolean =
         standbyOutbound?.isOpen() == true || standbyInbound?.isOpen() == true
 
+    /** True while connectLoop / make-before-break is dialing this exact endpoint. */
+    fun isActivelyConnectingTo(peer: LanPeer): Boolean {
+        val target = targetPeer ?: return false
+        if (connectJob?.isActive != true) return false
+        return target.host == peer.host &&
+            target.port == peer.port &&
+            target.viaOverlay == peer.viaOverlay
+    }
+
     /** Sets (or clears) which peer this client dials. Host changes force a re-dial. */
     @Synchronized
     fun setTarget(
@@ -84,11 +103,14 @@ class LanTcpClient(
             clearStandby()
             session?.close()
             session = null
+            lastTargetIdentity = null
             return
         }
-        if (peer.lastSeenMs > lastTargetSeenMs) {
-            // A fresh sighting is evidence the peer is back — retry immediately.
-            lastTargetSeenMs = peer.lastSeenMs
+        val identity = targetIdentity(peer)
+        if (identity != lastTargetIdentity) {
+            // New host/port/path — start fresh. Same endpoint with a newer lastSeenMs
+            // must NOT clear dialFailures (that caused the ~1 Hz LAN dial storm).
+            lastTargetIdentity = identity
             dialFailures = 0
         }
         val hostChanged = previous != null && (
@@ -106,7 +128,7 @@ class LanTcpClient(
                 session = null
             }
         }
-        if (preserveSession && hostChanged && session?.closed == false && isClientRoleFor(peer.uid)) {
+        if (preserveSession && hostChanged && session?.closed == false) {
             // The peer moved (e.g. new Tailscale IP): dial the new host make-before-break
             // instead of waiting for the stale session's activity timeout.
             if (connectJob?.isActive != true) {
@@ -114,8 +136,7 @@ class LanTcpClient(
             }
             return
         }
-        if (isClientRoleFor(peer.uid) &&
-            session?.closed != false &&
+        if (session?.closed != false &&
             (connectJob == null || connectJob?.isActive == false)
         ) {
             connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
@@ -131,6 +152,32 @@ class LanTcpClient(
         dialFailures++
     }
 
+    internal fun cancelGenerationForTest(): Int = cancelGeneration
+
+    internal fun bumpCancelGenerationForTest() {
+        cancelGeneration++
+    }
+
+    internal fun isCancelledAttempt(generationAtStart: Int): Boolean =
+        generationAtStart != cancelGeneration
+
+    /**
+     * Connectivity change: drop sockets and dial state. Does not restart the dial loop —
+     * the engine re-applies path targets next so we do not briefly redial a stale LAN IP.
+     */
+    @Synchronized
+    fun resetForNetworkChange() {
+        cancelConnectInFlight()
+        connectJob?.cancel()
+        connectJob = null
+        clearStandby()
+        session?.close()
+        session = null
+        dialFailures = 0
+        lastTargetIdentity = null
+        targetPeer = null
+    }
+
     /**
      * Speculative Tailscale dial: completes Hello but does not become the active [PeerLink]
      * transport until [promoteStandby].
@@ -140,7 +187,6 @@ class LanTcpClient(
         if (!overlayPeer.viaOverlay && !TailscaleInterface.isTailscaleAddress(overlayPeer.host)) return
         if (hasStandbyReady()) return
         if (standbyDialJob?.isActive == true) return
-        if (!isClientRoleFor(overlayPeer.uid)) return
         standbyDialJob = scope.launch(Dispatchers.IO) { dialStandby(overlayPeer) }
     }
 
@@ -181,7 +227,7 @@ class LanTcpClient(
     @Synchronized
     fun switchToLanMakeBeforeBreak(lanPeer: LanPeer) {
         targetPeer = lanPeer
-        if (!isClientRoleFor(lanPeer.uid)) return
+        lastTargetIdentity = targetIdentity(lanPeer)
         if (connectJob?.isActive == true) return
         connectJob = scope.launch(Dispatchers.IO) {
             dialMakeBeforeBreak(lanPeer)
@@ -230,9 +276,11 @@ class LanTcpClient(
         adoptSession(peerUid, socket, out, input, peerAnnouncedLastContiguousSeq)
     }
 
-    private fun isClientRoleFor(peerUid: String): Boolean = localUid < peerUid
+    private fun targetIdentity(peer: LanPeer): String =
+        "${peer.host}|${peer.port}|${peer.viaOverlay}"
 
     private fun cancelConnectInFlight() {
+        cancelGeneration++
         runCatching { connectingSocket?.close() }
         connectingSocket = null
     }
@@ -267,19 +315,20 @@ class LanTcpClient(
         }
 
     /**
-     * Exponential backoff capped at [MAX_RETRY_DELAY_MS]. A fresh sighting or user action
-     * resets [dialFailures], so reconnect stays instant when the peer actually returns;
-     * the cap kills the endless fast-dial storm to offline crew.
+     * Exponential backoff capped at [MAX_RETRY_DELAY_MS]. Endpoint identity change or user
+     * action resets [dialFailures]; beacon heartbeats alone do not.
      */
     internal fun backoffDelayMs(peer: LanPeer): Long {
         val exponent = dialFailures.coerceIn(0, MAX_BACKOFF_EXPONENT)
         return (retryDelayMs(peer) shl exponent).coerceAtMost(MAX_RETRY_DELAY_MS)
     }
 
+    private fun isLanTarget(peer: LanPeer): Boolean =
+        !peer.viaOverlay && !TailscaleInterface.isTailscaleAddress(peer.host)
+
     private suspend fun connectLoop() {
         while (currentCoroutineContext().isActive) {
             val peer = targetPeer ?: return
-            if (!isClientRoleFor(peer.uid)) return
             if (session?.closed == false) {
                 delay(500)
                 continue
@@ -289,23 +338,51 @@ class LanTcpClient(
                 continue
             }
             peerLink.markConnecting(peer.uid)
+            val generation = cancelGeneration
             val socket = Socket()
             connectingSocket = socket
             try {
                 socket.connect(InetSocketAddress(peer.host, peer.port), connectTimeoutMs(peer))
                 socket.tcpNoDelay = true
-                if (connectingSocket !== socket) {
+                if (connectingSocket !== socket || isCancelledAttempt(generation)) {
                     runCatching { socket.close() }
                     continue
                 }
                 connectingSocket = null
-                performHandshakeAndAdopt(peer.uid, socket)
+                performHandshakeAndAdopt(peer.uid, socket, generation)
             } catch (e: IOException) {
                 connectingSocket = null
                 runCatching { socket.close() }
+                if (isCancelledAttempt(generation)) {
+                    // Intentional cancel (forceRestart / path switch) — do not failover.
+                    continue
+                }
                 dialFailures++
+                Log.i(
+                    TAG,
+                    "dial failed peer=${peer.uid} host=${peer.host}:${peer.port} " +
+                        "viaOverlay=${peer.viaOverlay} failures=$dialFailures: ${e.message}",
+                )
+                val failedLan = isLanTarget(peer)
+                if (failedLan) {
+                    onLanDialFailed?.invoke()
+                } else {
+                    maybeInvalidateOverlayEndpoint(peer, e)
+                }
+                // Target may have switched to overlay inside the callback.
+                if (failedLan && targetPeer?.let { !isLanTarget(it) } == true) {
+                    continue
+                }
                 delay(backoffDelayMs(peer))
             }
+        }
+    }
+
+    private fun maybeInvalidateOverlayEndpoint(peer: LanPeer, error: IOException) {
+        val msg = error.message.orEmpty()
+        val refused = msg.contains("ECONNREFUSED", ignoreCase = true)
+        if (refused || dialFailures >= OVERLAY_INVALIDATE_AFTER_FAILURES) {
+            onOverlayEndpointDead?.invoke(peer.uid)
         }
     }
 
@@ -372,7 +449,7 @@ class LanTcpClient(
         } catch (_: IOException) {
             connectingSocket = null
             runCatching { socket.close() }
-            if (targetPeer?.uid == lanPeer.uid && isClientRoleFor(lanPeer.uid)) {
+            if (targetPeer?.uid == lanPeer.uid) {
                 if (session?.closed != false) {
                     connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
                 }
@@ -380,7 +457,11 @@ class LanTcpClient(
         }
     }
 
-    private suspend fun performHandshakeAndAdopt(peerUid: String, socket: Socket) {
+    private suspend fun performHandshakeAndAdopt(
+        peerUid: String,
+        socket: Socket,
+        generation: Int,
+    ) {
         val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
         val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
         LanProtocol.writeFrame(out, LanFrame.Hello(localUid, peerLink.lastContiguousInSeq()))
@@ -389,6 +470,19 @@ class LanTcpClient(
         }
         if (reply !is LanFrame.Hello || reply.uid != peerUid) {
             runCatching { socket.close() }
+            if (isCancelledAttempt(generation)) return
+            // Treat a bad/missing Hello like a connect failure so overlay failover can run.
+            dialFailures++
+            val peer = targetPeer
+            if (peer != null && isLanTarget(peer)) {
+                Log.i(TAG, "handshake failed peer=$peerUid host=${peer.host}:${peer.port}")
+                onLanDialFailed?.invoke()
+            } else if (peer != null) {
+                maybeInvalidateOverlayEndpoint(peer, IOException("handshake failed"))
+            }
+            if (peer != null) {
+                delay(backoffDelayMs(peer))
+            }
             return
         }
         adoptSession(peerUid, socket, out, input, reply.lastContiguousSeq)
@@ -398,6 +492,8 @@ class LanTcpClient(
         dialFailures = 0
         val previous = session
         sessionPathLabel = pathLabelForSocket(parked.socket)
+        val remote = parked.socket.inetAddress?.hostAddress ?: "?"
+        val remotePort = parked.socket.port
         val newSession = LanTcpSession(
             scope = scope,
             peerUid = parked.peerUid,
@@ -412,6 +508,10 @@ class LanTcpClient(
         previous?.close()
         newSession.start()
         peerLink.onHandshakeComplete(this, parked.peerUid, parked.peerAnnouncedLastContiguousSeq)
+        Log.i(
+            TAG,
+            "adopted peer=${parked.peerUid} path=$sessionPathLabel remote=$remote:$remotePort (standby)",
+        )
     }
 
     private fun adoptSession(
@@ -425,6 +525,8 @@ class LanTcpClient(
         dialFailures = 0
         val previous = session
         sessionPathLabel = pathLabelForSocket(socket)
+        val remote = socket.inetAddress?.hostAddress ?: "?"
+        val remotePort = socket.port
         val newSession = LanTcpSession(
             scope = scope,
             peerUid = peerUid,
@@ -439,6 +541,7 @@ class LanTcpClient(
         previous?.close()
         newSession.start()
         peerLink.onHandshakeComplete(this, peerUid, peerAnnouncedLastContiguousSeq)
+        Log.i(TAG, "adopted peer=$peerUid path=$sessionPathLabel remote=$remote:$remotePort")
     }
 
     private fun onSessionClosed(closedSession: LanTcpSession) {
@@ -446,7 +549,7 @@ class LanTcpClient(
         session = null
         peerLink.onDisconnected(this, closedSession.peerUid)
         val target = targetPeer
-        if (target != null && target.uid == closedSession.peerUid && isClientRoleFor(closedSession.peerUid)) {
+        if (target != null && target.uid == closedSession.peerUid) {
             if (connectJob?.isActive != true) {
                 connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
             }
@@ -467,6 +570,7 @@ class LanTcpClient(
     }
 
     companion object {
+        private const val TAG = "LanTcpClient"
         private const val LAN_CONNECT_TIMEOUT_MS = 2_000
         /** First dial through a DERP relay on cellular regularly exceeds 1 s. */
         private const val OVERLAY_CONNECT_TIMEOUT_MS = 5_000
@@ -474,5 +578,7 @@ class LanTcpClient(
         private const val OVERLAY_RETRY_DELAY_MS = 250L
         internal const val MAX_RETRY_DELAY_MS = 30_000L
         private const val MAX_BACKOFF_EXPONENT = 7
+        /** Drop sticky overlay host:port after this many consecutive real dial failures. */
+        internal const val OVERLAY_INVALIDATE_AFTER_FAILURES = 5
     }
 }

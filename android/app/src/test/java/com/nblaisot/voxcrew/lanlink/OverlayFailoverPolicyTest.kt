@@ -1,44 +1,10 @@
 package com.nblaisot.voxcrew.lanlink
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class OverlayFailoverPolicyTest {
-
-    @Test
-    fun `warms standby after one missed announce while still listed`() {
-        val now = 10_000L
-        assertTrue(
-            OverlayFailoverPolicy.shouldWarmStandby(
-                lanLastSeenMs = now - LanBeacon.MISSED_BEACON_MS,
-                nowMs = now,
-                hasOverlayEndpoint = true,
-                lanStillListed = true,
-            ),
-        )
-    }
-
-    @Test
-    fun `does not warm standby while beacons are fresh`() {
-        val now = 10_000L
-        assertFalse(
-            OverlayFailoverPolicy.shouldWarmStandby(
-                lanLastSeenMs = now - 200L,
-                nowMs = now,
-                hasOverlayEndpoint = true,
-                lanStillListed = true,
-            ),
-        )
-    }
-
-    @Test
-    fun `promotes overlay only when LAN is gone and endpoint is known`() {
-        assertTrue(OverlayFailoverPolicy.shouldPromoteOverlay(lanStillListed = false, hasOverlayEndpoint = true))
-        assertFalse(OverlayFailoverPolicy.shouldPromoteOverlay(lanStillListed = true, hasOverlayEndpoint = true))
-        assertFalse(OverlayFailoverPolicy.shouldPromoteOverlay(lanStillListed = false, hasOverlayEndpoint = false))
-    }
 
     @Test
     fun `preferLan keeps non-overlay sighting over Tailscale`() {
@@ -49,14 +15,40 @@ class OverlayFailoverPolicyTest {
     }
 
     @Test
-    fun `decide prefers LAN when lan sighting is live`() {
+    fun `decide prefers LAN when lan sighting is live and dials have not failed`() {
         val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = lan,
             hasOverlayEndpoint = true,
-            nowMs = 10_000L,
             activeVia = PathLabels.VPN,
             sessionHealthy = true,
+            lanDialFailed = false,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_LAN, decision.action)
+    }
+
+    @Test
+    fun `decide uses overlay when LAN dial failed even if LAN beacon still present`() {
+        val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = lan,
+            hasOverlayEndpoint = true,
+            activeVia = null,
+            sessionHealthy = false,
+            lanDialFailed = true,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_OVERLAY, decision.action)
+    }
+
+    @Test
+    fun `decide keeps trying LAN when dial failed but no overlay is known`() {
+        val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = lan,
+            hasOverlayEndpoint = false,
+            activeVia = null,
+            sessionHealthy = false,
+            lanDialFailed = true,
         )
         assertEquals(OverlayFailoverPolicy.PathAction.USE_LAN, decision.action)
     }
@@ -66,7 +58,6 @@ class OverlayFailoverPolicyTest {
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = null,
             hasOverlayEndpoint = true,
-            nowMs = 10_000L,
             activeVia = null,
             sessionHealthy = false,
         )
@@ -78,25 +69,10 @@ class OverlayFailoverPolicyTest {
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = null,
             hasOverlayEndpoint = true,
-            nowMs = 10_000L,
             activeVia = PathLabels.LOCAL,
             sessionHealthy = true,
         )
         assertEquals(OverlayFailoverPolicy.PathAction.KEEP_SESSION, decision.action)
-        assertTrue(decision.warmStandby)
-    }
-
-    @Test
-    fun `decide keeps healthy LAN session without warming when no overlay endpoint`() {
-        val decision = OverlayFailoverPolicy.decide(
-            lanSighting = null,
-            hasOverlayEndpoint = false,
-            nowMs = 10_000L,
-            activeVia = PathLabels.LOCAL,
-            sessionHealthy = true,
-        )
-        assertEquals(OverlayFailoverPolicy.PathAction.KEEP_SESSION, decision.action)
-        assertFalse(decision.warmStandby)
     }
 
     @Test
@@ -104,7 +80,6 @@ class OverlayFailoverPolicyTest {
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = null,
             hasOverlayEndpoint = true,
-            nowMs = 10_000L,
             activeVia = PathLabels.LOCAL,
             sessionHealthy = false,
         )
@@ -112,11 +87,10 @@ class OverlayFailoverPolicyTest {
     }
 
     @Test
-    fun `decide keeps healthy session when discovery is quiet`() {
+    fun `decide keeps healthy overlay session when discovery is quiet`() {
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = null,
             hasOverlayEndpoint = false,
-            nowMs = 10_000L,
             activeVia = PathLabels.VPN,
             sessionHealthy = true,
         )
@@ -128,7 +102,6 @@ class OverlayFailoverPolicyTest {
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = null,
             hasOverlayEndpoint = false,
-            nowMs = 10_000L,
             activeVia = null,
             sessionHealthy = false,
         )

@@ -779,6 +779,11 @@ class LanIntercomEngine(
                         null
                     }
                 },
+                lanPeerProvider = {
+                    beacon.presence.value.lanSightings[peerUid]
+                        ?.takeUnless { it.viaOverlay }
+                },
+                onOverlayEndpointDead = { uid -> forgetOverlayEndpoint(uid) },
             )
             startAudioCollection(conn)
             startConnectionFeedback(conn)
@@ -1093,6 +1098,20 @@ class LanIntercomEngine(
         )
     }
 
+    /** Drop sticky overlay host:port so UDP probes can rediscover a fresh listen port. */
+    fun forgetOverlayEndpoint(uid: String) {
+        if (peerOverlayEndpoints.remove(uid) != null) {
+            Log.i(TAG, "forgot overlay endpoint for $uid")
+            // Clear TCP target that was dialing the dead endpoint; next presence tick re-probes.
+            connections[uid]?.updateLanTarget(null)
+            if (overlayFallbackEnabled) {
+                updateOverlayProbes(
+                    beacon.presence.value.lanSightings.keys.filter { it != localUid }.toSet(),
+                )
+            }
+        }
+    }
+
     /**
      * Known crew that only ever met this device on Tailscale would otherwise be
      * unreachable until the next LAN encounter. UDP probes go to the fixed beacon
@@ -1117,12 +1136,23 @@ class LanIntercomEngine(
     }
 
     private fun onNetworkChanged() {
-        if (started) {
-            val overlayHost = if (overlayFallbackEnabled) TailscaleInterface.localOverlayIpv4() else null
-            beacon.rebind(overlayHost)
-            updateLanTargets(beacon.presence.value)
+        if (!started) return
+        val overlayHost = if (overlayFallbackEnabled) TailscaleInterface.localOverlayIpv4() else null
+        if (overlayHost != null) {
+            Log.i(TAG, "network changed; announcing overlay=$overlayHost")
+        } else {
+            Log.i(TAG, "network changed; no local overlay IP")
         }
+        // 1) Forget previous-subnet LAN IPs and stale overlay sightings.
+        beacon.clearLanSightings()
+        beacon.clearOverlaySightings()
+        // Sticky TCP registry is invalid across network flips; keep UDP probe seeds.
+        peerOverlayEndpoints.clear()
+        // 2) Drop live sockets / dial targets so nothing keeps dialing those IPs.
         connections.values.forEach { it.onNetworkChanged() }
+        // 3) Rebind beacon (new overlay announce) and dial from the cleared snapshot.
+        beacon.rebind(overlayHost)
+        updateLanTargets(beacon.presence.value)
     }
 
     private fun startVoxCapture(): CaptureStartResult {
@@ -1335,6 +1365,9 @@ class LanIntercomEngine(
         lanServer.onUnknownInboundPeer = null
         lanServer.stop()
         networkMonitor.stop()
+
+        peerOverlayEndpoints.clear()
+        seededOverlayProbeHosts.clear()
 
         receivingUntilMs.clear()
         _receivingFromUids.value = emptySet()

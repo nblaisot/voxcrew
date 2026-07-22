@@ -8,15 +8,37 @@ import java.net.NetworkInterface
  * Used as an optional overlay endpoint in LAN beacons for plan-B connectivity.
  */
 object TailscaleInterface {
+    data class OverlayCandidate(val ifaceName: String, val address: String)
+
     fun localOverlayIpv4(): String? = runCatching {
         NetworkInterface.getNetworkInterfaces()?.toList()
             ?.asSequence()
             ?.filter { it.isUp && !it.isLoopback }
-            ?.flatMap { it.inetAddresses.toList().asSequence() }
-            ?.filterIsInstance<Inet4Address>()
-            ?.map { it.hostAddress }
-            ?.firstOrNull { it != null && isTailscaleAddress(it) }
+            ?.flatMap { ni ->
+                ni.inetAddresses.toList().asSequence()
+                    .filterIsInstance<Inet4Address>()
+                    .mapNotNull { addr ->
+                        addr.hostAddress?.let { OverlayCandidate(ni.name, it) }
+                    }
+            }
+            ?.toList()
+            ?.let { selectLocalOverlayIpv4(it) }
     }.getOrNull()
+
+    /**
+     * Prefer `tun*` (Tailscale) over other 100.x VPNs, then a stable iface/address order
+     * so dual-tun / Zscaler coexistence does not flip the announced overlay IP every call.
+     */
+    fun selectLocalOverlayIpv4(candidates: List<OverlayCandidate>): String? {
+        val ts = candidates.filter { isTailscaleAddress(it.address) }
+        if (ts.isEmpty()) return null
+        val tun = ts.filter { it.ifaceName.startsWith("tun", ignoreCase = true) }
+        val pool = tun.ifEmpty { ts }
+        return pool.minWithOrNull(
+            compareBy<OverlayCandidate> { it.ifaceName.lowercase() }
+                .thenBy { it.address },
+        )?.address
+    }
 
     fun isTailscaleAddress(host: String): Boolean {
         val parts = host.split('.')

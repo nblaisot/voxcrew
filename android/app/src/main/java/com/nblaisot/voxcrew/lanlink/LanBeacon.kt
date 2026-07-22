@@ -111,6 +111,31 @@ class LanBeacon(
         }
     }
 
+    /**
+     * Drops LAN sightings only (previous-subnet IPs). Used on connectivity change.
+     */
+    @Synchronized
+    fun clearLanSightings() {
+        if (lanSightings.isEmpty()) {
+            // Still refresh the snapshot so callers see overlay-only presence.
+            publish()
+            return
+        }
+        lanSightings.clear()
+        publish()
+    }
+
+    /** Drops live overlay sightings (TCP registry is cleared separately by the engine). */
+    @Synchronized
+    fun clearOverlaySightings() {
+        if (overlaySightings.isEmpty()) {
+            publish()
+            return
+        }
+        overlaySightings.clear()
+        publish()
+    }
+
     private fun openSocketAndLoops() {
         socket = runCatching {
             DatagramSocket(null).apply {

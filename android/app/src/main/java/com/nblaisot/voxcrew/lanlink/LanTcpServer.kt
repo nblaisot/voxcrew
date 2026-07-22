@@ -14,6 +14,7 @@ import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
@@ -21,6 +22,9 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Shared LAN TCP listener: one [ServerSocket] and beacon port for the whole device.
  * Inbound connections are dispatched to the registered [LanTcpClient] for that peer uid.
+ *
+ * Prefers fixed [TCP_PORT] (next to [LanBeacon.BEACON_PORT]) so overlay registry entries
+ * survive peer app restarts; falls back to an ephemeral port only if bind fails.
  */
 class LanTcpServer(
     private val scope: CoroutineScope,
@@ -38,8 +42,20 @@ class LanTcpServer(
     fun start(localUid: String) {
         this.localUid = localUid
         if (serverSocket != null) return
-        serverSocket = runCatching { ServerSocket(0) }.getOrNull()
+        serverSocket = bindListenSocket()
         acceptJob = scope.launch(Dispatchers.IO) { acceptLoop() }
+    }
+
+    private fun bindListenSocket(): ServerSocket? {
+        val fixed = runCatching {
+            ServerSocket().apply {
+                reuseAddress = true
+                bind(InetSocketAddress(TCP_PORT))
+            }
+        }.getOrNull()
+        if (fixed != null) return fixed
+        Log.w(TAG, "fixed TCP port $TCP_PORT busy; falling back to ephemeral")
+        return runCatching { ServerSocket(0) }.getOrNull()
     }
 
     fun stop() {
@@ -104,5 +120,7 @@ class LanTcpServer(
     companion object {
         private const val TAG = "LanTcpServer"
         const val HANDSHAKE_TIMEOUT_MS = 5_000L
+        /** Fixed mesh listen port (UDP discovery uses [LanBeacon.BEACON_PORT] = 47100). */
+        const val TCP_PORT = 47101
     }
 }
