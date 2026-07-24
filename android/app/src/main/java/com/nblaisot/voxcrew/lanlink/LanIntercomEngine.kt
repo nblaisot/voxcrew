@@ -163,6 +163,7 @@ class LanIntercomEngine(
     private var localUid: String = ""
     private var displayName: String = ""
     private var knownCrewUids: Set<String> = emptySet()
+    private val peerLanEndpoints = ConcurrentHashMap<String, LanFallbackEndpoint>()
     private val peerOverlayEndpoints = ConcurrentHashMap<String, OverlayEndpoint>()
     /** Cold-start probe hosts from the persisted roster; live sightings take precedence. */
     private val seededOverlayProbeHosts = ConcurrentHashMap<String, String>()
@@ -362,7 +363,7 @@ class LanIntercomEngine(
         filtered.forEach {
             ensureConnection(it).apply {
                 start()
-                resetDialBackoff()
+                requestDialReconciliation()
             }
         }
         if (isOutboundMediaActive()) {
@@ -460,7 +461,7 @@ class LanIntercomEngine(
     fun pttPress() {
         if (_voxEnabled.value) return
         logPttRouteSummary()
-        _activeRecipientUids.value.forEach { connections[it]?.resetDialBackoff() }
+        _activeRecipientUids.value.forEach { connections[it]?.requestDialReconciliation() }
         pttPolicy.onPress()
     }
 
@@ -793,8 +794,7 @@ class LanIntercomEngine(
                     }
                 },
                 lanPeerProvider = {
-                    beacon.presence.value.lanSightings[peerUid]
-                        ?.takeUnless { it.viaOverlay }
+                    lanPeerFor(peerUid, beacon.presence.value.lanSightings[peerUid])
                         ?.let { routePeer(it, connectivitySnapshot) }
                 },
                 onOverlayEndpointDead = { uid -> forgetOverlayEndpoint(uid) },
@@ -1118,6 +1118,7 @@ class LanIntercomEngine(
         val lanByUid = snapshot.lanSightings.filterKeys { it != localUid }
         val overlaySightings = snapshot.overlaySightings.filterKeys { it != localUid }
 
+        lanByUid.values.forEach { rememberLanEndpoint(it) }
         lanByUid.values.forEach { rememberOverlayEndpoint(it) }
         overlaySightings.values.forEach { rememberOverlayEndpoint(it) }
 
@@ -1127,7 +1128,8 @@ class LanIntercomEngine(
             .toSet()
 
         relevantUids.forEach { uid ->
-            val lan = lanByUid[uid]?.let { routePeer(it, connectivitySnapshot) }
+            val lan = lanPeerFor(uid, lanByUid[uid])
+                ?.let { routePeer(it, connectivitySnapshot) }
             val overlay = overlayPeerFor(uid, overlaySightings[uid])
                 ?.let { routePeer(it, connectivitySnapshot) }
             val conn = ensureConnection(uid)
@@ -1154,6 +1156,19 @@ class LanIntercomEngine(
             lastSeenMs = 0L,
             overlayHost = endpoint.host,
             viaOverlay = true,
+        )
+    }
+
+    private fun lanPeerFor(uid: String, sighting: LanPeer?): LanPeer? {
+        return lanPeerForFallback(uid, sighting, peerLanEndpoints[uid])
+    }
+
+    private fun rememberLanEndpoint(peer: LanPeer) {
+        if (peer.viaOverlay || peer.host.isBlank() || peer.port <= 0) return
+        peerLanEndpoints[peer.uid] = LanFallbackEndpoint(
+            host = peer.host,
+            port = peer.port,
+            displayName = peer.displayName,
         )
     }
 
@@ -1219,6 +1234,9 @@ class LanIntercomEngine(
         beacon.updateOverlayNetwork(if (overlayFallbackEnabled) next.overlayNetwork else null)
         if (invalidation.lanHandles.isNotEmpty()) {
             beacon.removeInvalidLanSightings { peer -> routePeer(peer, next) != null }
+            peerLanEndpoints.entries.removeIf { (_, endpoint) ->
+                routePeer(endpoint.toLanPeer(uid = "_probe"), next) == null
+            }
         }
         if (invalidation.overlayHandles.isNotEmpty()) beacon.clearOverlaySightings()
         if (invalidatedHandles.isNotEmpty()) {
@@ -1455,6 +1473,7 @@ class LanIntercomEngine(
         _isTransmitting.value = false
         _latencyCritical.value = false
         knownCrewUids = emptySet()
+        peerLanEndpoints.clear()
     }
 
     companion object {
@@ -1517,4 +1536,28 @@ internal fun overlayProbeTargets(
         .filter { it != localUid && it !in lanVisibleUids && it !in connectedUids }
         .mapNotNull { uid -> (endpointHosts[uid] ?: seededHosts[uid])?.let { uid to it } }
         .toMap()
+}
+
+internal data class LanFallbackEndpoint(
+    val host: String,
+    val port: Int,
+    val displayName: String,
+) {
+    fun toLanPeer(uid: String): LanPeer = LanPeer(
+        uid = uid,
+        displayName = displayName,
+        host = host,
+        port = port,
+        lastSeenMs = 0L,
+        viaOverlay = false,
+    )
+}
+
+internal fun lanPeerForFallback(
+    uid: String,
+    sighting: LanPeer?,
+    fallback: LanFallbackEndpoint?,
+): LanPeer? {
+    sighting?.takeUnless { it.viaOverlay }?.let { return it }
+    return fallback?.toLanPeer(uid)
 }

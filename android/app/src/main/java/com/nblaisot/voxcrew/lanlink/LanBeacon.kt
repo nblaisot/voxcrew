@@ -83,25 +83,28 @@ class LanBeacon(
     }
 
     /** Update only the routed overlay sender; the LAN listener survives VPN churn. */
-    @Synchronized
     fun updateOverlayNetwork(network: OverlayNetwork?) {
-        if (overlayNetwork == network) return
-        runCatching { overlaySocket?.close() }
-        overlaySocket = null
-        overlayNetwork = network
-        selfOverlayHost = network?.ipv4Address
-        val binder = networkSocketBinder
-        if (network != null && binder != null) {
-            overlaySocket = runCatching {
-                DatagramSocket(null).apply {
-                    reuseAddress = true
-                    binder.bindSocket(network.networkHandle, this)
-                    bind(InetSocketAddress(0))
-                }
-            }.onFailure { error ->
-                Log.w(TAG, "overlay sender unavailable: ${error.message}")
-            }.getOrNull()
+        var socketToClose: DatagramSocket? = null
+        synchronized(this) {
+            if (overlayNetwork == network) return
+            socketToClose = overlaySocket
+            overlaySocket = null
+            overlayNetwork = network
+            selfOverlayHost = network?.ipv4Address
+            val binder = networkSocketBinder
+            if (network != null && binder != null) {
+                overlaySocket = runCatching {
+                    DatagramSocket(null).apply {
+                        reuseAddress = true
+                        binder.bindSocket(network.networkHandle, this)
+                        bind(InetSocketAddress(0))
+                    }
+                }.onFailure { error ->
+                    Log.w(TAG, "overlay sender unavailable: ${error.message}")
+                }.getOrNull()
+            }
         }
+        closeOverlaySocketAsync(socketToClose, network?.networkHandle)
         announceSignal.trySend(Unit)
     }
 
@@ -262,6 +265,16 @@ class LanBeacon(
         runCatching {
             val address = InetAddress.getByName(host)
             overlaySocket?.send(DatagramPacket(payload, payload.size, address, BEACON_PORT))
+        }
+    }
+
+    private fun closeOverlaySocketAsync(socket: DatagramSocket?, nextHandle: Long?) {
+        if (socket == null) return
+        Log.i(TAG, "OVERLAY_SENDER_DETACHED nextHandle=$nextHandle")
+        scope.launch(Dispatchers.IO) {
+            runCatching { socket.close() }.onFailure { error ->
+                Log.w(TAG, "async overlay sender close failed: ${error.message}")
+            }
         }
     }
 

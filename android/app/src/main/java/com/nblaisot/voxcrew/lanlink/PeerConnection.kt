@@ -121,9 +121,9 @@ class PeerConnection(
         lanTcpClient.setTarget(peer)
     }
 
-    /** User action (PTT, recipient toggle) grants an immediate dial retry despite backoff. */
-    fun resetDialBackoff() {
-        lanTcpClient.resetDialBackoff()
+    /** Request connection work without bypassing the current target's retry deadline. */
+    fun requestDialReconciliation() {
+        lanTcpClient.requestDialReconciliation()
     }
 
     /**
@@ -215,12 +215,31 @@ class PeerConnection(
     /** Invalidate only sessions attached to exact networks that disappeared or changed IPv4. */
     fun onNetworksInvalidated(networkHandles: Set<Long>) {
         if (!started) return
-        when (lanTcpClient.onNetworksInvalidated(networkHandles)) {
+        val invalidation = lanTcpClient.onNetworksInvalidated(networkHandles)
+        if (invalidation.lostSessionPath != null) {
+            peerLink.onDisconnected(lanTcpClient, peerUid)
+        }
+        when (invalidation.affectedPath) {
             PeerPath.LAN -> {
                 lanDialFailed = true
-                overlayPeerProvider()?.let { promoteToOverlay(it) }
+                overlayPeerProvider()?.let {
+                    logInfo("LAN_INVALIDATED peer=$peerUid fallback=overlay host=${it.peer.host}:${it.peer.port}")
+                    promoteToOverlay(it)
+                }
             }
-            PeerPath.OVERLAY -> lanDialFailed = false
+            PeerPath.OVERLAY -> {
+                lanDialFailed = false
+                val lan = lanPeerProvider()
+                if (lan != null) {
+                    logInfo(
+                        "OVERLAY_INVALIDATED peer=$peerUid fallback=lan " +
+                            "network=${lan.route.networkHandle} host=${lan.peer.host}:${lan.peer.port}",
+                    )
+                    lanTcpClient.setTarget(lan)
+                } else {
+                    logInfo("OVERLAY_INVALIDATED peer=$peerUid fallback=none")
+                }
+            }
             null -> Unit
         }
     }
@@ -228,11 +247,17 @@ class PeerConnection(
     /** Test/observe: whether LAN dials are currently suppressed in favour of overlay. */
     internal fun lanDialFailedForTest(): Boolean = lanDialFailed
 
+    internal fun targetPathForTest(): PeerPath? = lanTcpClient.targetPathForTest()
+
     @Suppress("UNUSED")
     fun isWanted(): Boolean = isStillWanted()
 
     private companion object {
         const val TAG = "PeerConnection"
+
+        fun logInfo(message: String) {
+            runCatching { Log.i(TAG, message) }
+        }
     }
 }
 

@@ -6,6 +6,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import org.junit.After
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -77,6 +79,52 @@ class PeerConnectionPromoteTest {
         assertFalse(LocalLinkDeathPolicy.shouldPromoteOverlay(lan))
         assertTrue(LocalLinkDeathPolicy.shouldPromoteOverlay(null))
         conn.applyPathTargets(lanPeer = lanTarget, overlayPeer = overlayTarget)
+        assertFalse(conn.lanDialFailedForTest())
+        conn.stop()
+    }
+
+    @Test
+    fun `overlay invalidation immediately selects LAN fallback target`() {
+        val conn = PeerConnection(
+            peerUid = "peer",
+            scope = scope,
+            localUid = "local",
+            lanServer = server,
+            networkSocketBinder = NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
+            isStillWanted = { true },
+            overlayPeerProvider = { overlayTarget },
+            lanPeerProvider = { lanTarget },
+        )
+        conn.start()
+        conn.applyPathTargets(lanPeer = null, overlayPeer = overlayTarget)
+
+        conn.onNetworksInvalidated(setOf(overlayTarget.route.networkHandle))
+
+        assertEquals(PeerPath.LAN, conn.targetPathForTest())
+        assertFalse(conn.lanDialFailedForTest())
+        conn.stop()
+    }
+
+    @Test
+    fun `overlay invalidation without LAN fallback clears VPN target`() {
+        val conn = PeerConnection(
+            peerUid = "peer",
+            scope = scope,
+            localUid = "local",
+            lanServer = server,
+            networkSocketBinder = NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
+            isStillWanted = { true },
+            overlayPeerProvider = { overlayTarget },
+            lanPeerProvider = { null },
+        )
+        conn.start()
+        conn.applyPathTargets(lanPeer = null, overlayPeer = overlayTarget)
+
+        conn.onNetworksInvalidated(setOf(overlayTarget.route.networkHandle))
+
+        assertNull(conn.targetPathForTest())
         assertFalse(conn.lanDialFailedForTest())
         conn.stop()
     }

@@ -12,6 +12,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.net.DatagramSocket
 import java.net.Socket
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 
 class NetworkHandoverPolicyTest {
     private val lanPeer = LanPeer(
@@ -160,6 +166,68 @@ class NetworkHandoverPolicyTest {
                 SessionDirection.INBOUND,
             ),
         )
+    }
+
+    @Test
+    fun `pruned LAN sighting can fall back to retained LAN endpoint`() {
+        val retained = LanFallbackEndpoint(
+            host = lanPeer.host,
+            port = lanPeer.port,
+            displayName = lanPeer.displayName,
+        )
+
+        val fallback = lanPeerForFallback("peer", sighting = null, fallback = retained)
+
+        requireNotNull(fallback)
+        assertEquals(lanPeer.host, fallback.host)
+        assertEquals(PeerPath.LAN, routePeer(fallback, snapshot)?.route?.path)
+    }
+
+    @Test
+    fun `live LAN sighting wins over retained endpoint`() {
+        val stale = LanFallbackEndpoint(
+            host = "192.168.86.99",
+            port = lanPeer.port,
+            displayName = "Old",
+        )
+
+        val selected = lanPeerForFallback("peer", sighting = lanPeer, fallback = stale)
+
+        assertEquals(lanPeer.host, selected?.host)
+    }
+
+    @Test
+    fun `retained LAN endpoint is rejected when current LAN cannot route it`() {
+        val retained = LanFallbackEndpoint(
+            host = "192.168.99.12",
+            port = lanPeer.port,
+            displayName = lanPeer.displayName,
+        )
+
+        val fallback = lanPeerForFallback("peer", sighting = null, fallback = retained)
+
+        requireNotNull(fallback)
+        assertNull(routePeer(fallback, snapshot))
+    }
+
+    @Test
+    fun `detached invalidation resources close asynchronously`() {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val release = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val resources = DetachedNetworkResources(
+            listOf {
+                release.await(2, TimeUnit.SECONDS)
+                closed.countDown()
+            },
+        )
+
+        resources.closeAsync(scope, "test")
+
+        assertFalse(closed.await(50, TimeUnit.MILLISECONDS))
+        release.countDown()
+        assertTrue(closed.await(2, TimeUnit.SECONDS))
+        scope.cancel()
     }
 
     private class RecordingBinder : NetworkSocketBinder {

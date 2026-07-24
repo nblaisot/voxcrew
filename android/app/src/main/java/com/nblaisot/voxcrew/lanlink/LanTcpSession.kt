@@ -21,11 +21,12 @@ import java.net.Socket
 internal class LanTcpSession(
     private val scope: CoroutineScope,
     val peerUid: String,
+    val generation: Long,
+    val retryKey: String,
     private val socket: Socket,
     private val out: DataOutputStream,
     private val input: DataInputStream,
-    private val peerLink: PeerLink,
-    private val transport: FrameTransport,
+    private val onFrame: (LanTcpSession, LanFrame) -> Unit,
     private val onClosed: (LanTcpSession) -> Unit,
 ) {
     private var readerJob: Job? = null
@@ -39,10 +40,20 @@ internal class LanTcpSession(
     )
     @Volatile var closed = false
         private set
+    @Volatile var confirmed = false
+        private set
 
-    fun start() {
+    fun start(): Boolean = synchronized(this) {
+        if (closed) return@synchronized false
         writer.start()
         readerJob = scope.launch(Dispatchers.IO) { readLoop() }
+        true
+    }
+
+    fun confirm(): Boolean = synchronized(this) {
+        if (closed || confirmed) return@synchronized false
+        confirmed = true
+        true
     }
 
     fun sendFrame(frame: LanFrame) {
@@ -58,7 +69,7 @@ internal class LanTcpSession(
             while (currentCoroutineContext().isActive) {
                 val frame = LanProtocol.readFrame(input) ?: break
                 if (frame !is LanFrame.Hello) {
-                    peerLink.onFrameReceived(transport, frame)
+                    onFrame(this, frame)
                 }
             }
         } catch (e: IOException) {
@@ -68,10 +79,16 @@ internal class LanTcpSession(
         }
     }
 
-    @Synchronized
     fun close() {
-        if (closed) return
-        closed = true
+        val shouldClose = synchronized(this) {
+            if (closed) return@synchronized false
+            closed = true
+            true
+        }
+        if (!shouldClose) return
+        // Never invoke client callbacks while holding the session monitor. Adoption
+        // holds the client arbiter briefly, so doing so would recreate the lock cycle
+        // client -> session vs session -> client seen during VPN/LAN handover.
         writer.stop()
         readerJob?.cancel()
         runCatching { socket.close() }

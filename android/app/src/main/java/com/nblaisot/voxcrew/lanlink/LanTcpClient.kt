@@ -33,6 +33,8 @@ class LanTcpClient(
     private val server: LanTcpServer,
     private val networkSocketBinder: NetworkSocketBinder,
     private val inboundRouteResolver: (Socket) -> RoutedSocketPath?,
+    private val clockMs: () -> Long = System::currentTimeMillis,
+    private val socketFactory: () -> Socket = ::Socket,
 ) : FrameTransport {
     @Volatile private var sessionRoute: RoutedSocketPath? = null
     @Volatile private var sessionDirection: SessionDirection? = null
@@ -52,10 +54,13 @@ class LanTcpClient(
     @Volatile private var connectingSocket: Socket? = null
     /** At most one lower-priority overlay socket may be parked behind a healthy LAN. */
     @Volatile private var standby: ParkedSession? = null
-    @Volatile private var dialFailures = 0
     @Volatile private var lastTargetIdentity: String? = null
     /** Bumped on intentional cancel so in-flight dials do not count as failures. */
     @Volatile private var cancelGeneration = 0
+    private var nextSessionGeneration = 0L
+    private var nextDialGeneration = 0L
+    private var activeDialGeneration = 0L
+    private val retryStates = mutableMapOf<String, RetryState>()
 
     /** Fired after a *real* failed dial to a non-overlay (LAN) target (not intentional cancel). */
     @Volatile var onLanDialFailed: (() -> Unit)? = null
@@ -86,71 +91,75 @@ class LanTcpClient(
     }
 
     /** Sets (or clears) which peer this client dials. Host changes force a re-dial. */
-    @Synchronized
     fun setTarget(
         target: RoutedPeerTarget?,
         forceRestart: Boolean = false,
         preserveSession: Boolean = false,
     ) {
-        val previous = targetPeer
-        targetPeer = target
-        if (target == null) {
-            cancelConnectInFlight()
-            connectJob?.cancel()
-            connectJob = null
-            clearStandby()
-            session?.close()
-            session = null
-            sessionRoute = null
-            sessionDirection = null
-            lastTargetIdentity = null
-            return
-        }
-        val identity = targetIdentity(target)
-        if (identity != lastTargetIdentity) {
-            // New host/port/path — start fresh. Same endpoint with a newer lastSeenMs
-            // must NOT clear dialFailures (that caused the ~1 Hz LAN dial storm).
-            lastTargetIdentity = identity
-            dialFailures = 0
-        }
-        val hostChanged = previous != null && (
-            previous.peer.host != target.peer.host ||
-                previous.peer.port != target.peer.port ||
-                previous.route != target.route
-        )
-        val mustRestart = !preserveSession && (forceRestart || hostChanged)
-        if (mustRestart) {
-            cancelConnectInFlight()
-            connectJob?.cancel()
-            connectJob = null
-            if (session?.closed == false) {
-                session?.close()
+        val closeActions = mutableListOf<() -> Unit>()
+        var disconnected = false
+        synchronized(this) {
+            val previousIdentity = targetPeer?.let(::targetIdentity)
+            targetPeer = target
+            if (target == null) {
+                detachConnectInFlightLocked(closeActions)
+                cancelDialJobLocked()
+                standby?.let { parked -> closeActions += { parked.close() } }
+                standby = null
+                session?.let { current ->
+                    closeActions += { current.close() }
+                    disconnected = true
+                }
                 session = null
+                sessionRoute = null
+                sessionDirection = null
+                lastTargetIdentity = null
+                return@synchronized
             }
-        }
-        if (preserveSession && hostChanged && session?.closed == false) {
-            // The peer moved (e.g. new Tailscale IP): dial the new host make-before-break
-            // instead of waiting for the stale session's activity timeout.
-            if (connectJob?.isActive != true) {
-                connectJob = scope.launch(Dispatchers.IO) { dialMakeBeforeBreak(target) }
+
+            val identity = targetIdentity(target)
+            val identityChanged = previousIdentity != null && identity != previousIdentity
+            lastTargetIdentity = identity
+            if (identityChanged && connectJob?.isActive == true) {
+                detachConnectInFlightLocked(closeActions)
+                cancelDialJobLocked()
             }
-            return
+            val mustRestart = !preserveSession && (forceRestart || identityChanged)
+            if (mustRestart) {
+                session?.let { current ->
+                    closeActions += { current.close() }
+                    disconnected = true
+                }
+                session = null
+                sessionRoute = null
+                sessionDirection = null
+            }
+            ensureDialingLocked()
         }
-        if (session?.closed != false &&
-            (connectJob == null || connectJob?.isActive == false)
-        ) {
-            connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
+        if (disconnected) peerLink.onDisconnected(this, peerUid)
+        DetachedNetworkResources(closeActions).closeAsync(scope, TAG)
+    }
+
+    /** Reconciliation request; repeated user actions never bypass the target deadline. */
+    fun requestDialReconciliation() {
+        synchronized(this) { ensureDialingLocked() }
+    }
+
+    internal fun recordDialFailureForTest(target: RoutedPeerTarget? = targetPeer) {
+        synchronized(this) {
+            target?.let(::recordFailureLocked)
         }
     }
 
-    /** Immediate retry credit after an explicit user action (PTT press, recipient toggle). */
-    fun resetDialBackoff() {
-        dialFailures = 0
+    internal fun confirmTargetForTest(target: RoutedPeerTarget) {
+        synchronized(this) { retryStates.remove(targetIdentity(target)) }
     }
 
-    internal fun recordDialFailureForTest() {
-        dialFailures++
-    }
+    internal fun failureCountForTest(target: RoutedPeerTarget): Int =
+        synchronized(this) { retryStates[targetIdentity(target)]?.failures ?: 0 }
+
+    internal fun nextEligibleAtForTest(target: RoutedPeerTarget): Long =
+        synchronized(this) { retryStates[targetIdentity(target)]?.nextEligibleAtMs ?: 0L }
 
     internal fun cancelGenerationForTest(): Int = cancelGeneration
 
@@ -161,56 +170,83 @@ class LanTcpClient(
     internal fun isCancelledAttempt(generationAtStart: Int): Boolean =
         generationAtStart != cancelGeneration
 
-    /** Close only sessions and targets routed through a network that actually disappeared. */
-    @Synchronized
-    fun onNetworksInvalidated(networkHandles: Set<Long>): PeerPath? {
-        if (networkHandles.isEmpty()) return null
-        standby?.takeIf { it.route.networkHandle in networkHandles }?.let {
-            it.close()
-            standby = null
+    /** Detach only sessions and targets routed through networks that actually disappeared. */
+    internal fun onNetworksInvalidated(networkHandles: Set<Long>): NetworkInvalidationResult {
+        if (networkHandles.isEmpty()) return NetworkInvalidationResult()
+        val result = synchronized(this) {
+            val closeActions = mutableListOf<() -> Unit>()
+            var affectedPath: PeerPath? = null
+            var lostSessionPath: PeerPath? = null
+
+            standby?.takeIf { it.route.networkHandle in networkHandles }?.let {
+                closeActions += { it.close() }
+                standby = null
+                affectedPath = affectedPath ?: it.route.path
+            }
+            targetPeer?.takeIf { it.route.networkHandle in networkHandles }?.let {
+                affectedPath = affectedPath ?: it.route.path
+                detachConnectInFlightLocked(closeActions)
+                cancelDialJobLocked()
+                targetPeer = null
+                lastTargetIdentity = null
+            }
+            sessionRoute?.takeIf { it.networkHandle in networkHandles }?.let { route ->
+                affectedPath = affectedPath ?: route.path
+                lostSessionPath = route.path
+                detachConnectInFlightLocked(closeActions)
+                cancelDialJobLocked()
+                session?.let { closeActions += { it.close() } }
+                session = null
+                sessionRoute = null
+                sessionDirection = null
+            }
+
+            NetworkInvalidationResult(
+                affectedPath = affectedPath,
+                lostSessionPath = lostSessionPath,
+                detachedResources = DetachedNetworkResources(closeActions),
+            )
         }
-        if (targetPeer?.route?.networkHandle in networkHandles) {
-            cancelConnectInFlight()
-            connectJob?.cancel()
-            connectJob = null
-            targetPeer = null
-            lastTargetIdentity = null
-        }
-        val lostPath = sessionRoute?.takeIf { it.networkHandle in networkHandles }?.path
-        if (lostPath != null) {
-            cancelConnectInFlight()
-            connectJob?.cancel()
-            connectJob = null
-            session?.close()
-            session = null
-            sessionRoute = null
-            sessionDirection = null
-        }
-        return lostPath
+        result.detachedResources.closeAsync(scope, TAG)
+        return result
     }
 
     @Synchronized
+    internal fun targetPathForTest(): PeerPath? = targetPeer?.route?.path
+
+    private fun detachConnectInFlightLocked(closeActions: MutableList<() -> Unit>) {
+        cancelGeneration++
+        connectingSocket?.let { socket -> closeActions += { socket.close() } }
+        connectingSocket = null
+    }
+
     fun clearStandby() {
-        standby?.close()
-        standby = null
+        val parked = synchronized(this) {
+            standby.also { standby = null }
+        }
+        parked?.let { DetachedNetworkResources(listOf({ it.close() })).closeAsync(scope, TAG) }
     }
 
     /**
      * Promote a parked standby session into the active PeerLink path, if still open.
      * Caller should [setTarget] overlay with preserveSession first so [label] intent matches.
      */
-    @Synchronized
     fun promoteStandby(): Boolean {
-        val parked = standby
-        if (parked?.isOpen() != true) {
-            parked?.close()
+        val closeActions = mutableListOf<() -> Unit>()
+        val parked = synchronized(this) {
+            val candidate = standby
             standby = null
-            return false
+            if (candidate?.isOpen() != true) {
+                candidate?.let { closeActions += { it.close() } }
+                null
+            } else {
+                detachConnectInFlightLocked(closeActions)
+                cancelDialJobLocked()
+                candidate
+            }
         }
-        standby = null
-        cancelConnectInFlight()
-        connectJob?.cancel()
-        connectJob = null
+        DetachedNetworkResources(closeActions).closeAsync(scope, TAG)
+        if (parked == null) return false
         adoptParkedSession(parked)
         return true
     }
@@ -219,15 +255,20 @@ class LanTcpClient(
      * Dial [lanPeer] without dropping the current overlay session until Hello succeeds
      * (make-before-break back to LAN).
      */
-    @Synchronized
     fun switchToLanMakeBeforeBreak(lanPeer: RoutedPeerTarget) {
         if (lanPeer.route.path != PeerPath.LAN) return
-        targetPeer = lanPeer
-        lastTargetIdentity = targetIdentity(lanPeer)
-        if (connectJob?.isActive == true) return
-        connectJob = scope.launch(Dispatchers.IO) {
-            dialMakeBeforeBreak(lanPeer)
+        val closeActions = mutableListOf<() -> Unit>()
+        synchronized(this) {
+            val identityChanged = lastTargetIdentity != targetIdentity(lanPeer)
+            targetPeer = lanPeer
+            lastTargetIdentity = targetIdentity(lanPeer)
+            if (identityChanged && connectJob?.isActive == true) {
+                detachConnectInFlightLocked(closeActions)
+                cancelDialJobLocked()
+            }
+            ensureDialingLocked(makeBeforeBreak = true)
         }
+        DetachedNetworkResources(closeActions).closeAsync(scope, TAG)
     }
 
     override fun sendFrame(frame: LanFrame) {
@@ -239,19 +280,22 @@ class LanTcpClient(
     }
 
     override fun stop() {
-        targetPeer = null
-        lastTargetIdentity = null
-        cancelConnectInFlight()
-        connectJob?.cancel()
-        connectJob = null
-        clearStandby()
-        session?.close()
-        session = null
-        sessionRoute = null
-        sessionDirection = null
+        val closeActions = mutableListOf<() -> Unit>()
+        synchronized(this) {
+            targetPeer = null
+            lastTargetIdentity = null
+            detachConnectInFlightLocked(closeActions)
+            cancelDialJobLocked()
+            standby?.let { closeActions += { it.close() } }
+            standby = null
+            session?.let { closeActions += { it.close() } }
+            session = null
+            sessionRoute = null
+            sessionDirection = null
+        }
+        DetachedNetworkResources(closeActions).closeAsync(scope, TAG)
     }
 
-    @Synchronized
     internal fun adoptInboundSession(
         peerUid: String,
         socket: Socket,
@@ -297,10 +341,37 @@ class LanTcpClient(
     private fun targetIdentity(target: RoutedPeerTarget): String =
         "${target.peer.host}|${target.peer.port}|${target.route.path}|${target.route.networkHandle}"
 
-    private fun cancelConnectInFlight() {
-        cancelGeneration++
-        runCatching { connectingSocket?.close() }
-        connectingSocket = null
+    private fun cancelDialJobLocked() {
+        activeDialGeneration = ++nextDialGeneration
+        connectJob?.cancel()
+        connectJob = null
+    }
+
+    private fun ensureDialingLocked(makeBeforeBreak: Boolean = false) {
+        val target = targetPeer ?: return
+        if (target.peer.host.isBlank() || target.peer.port <= 0) return
+        val current = session?.takeIf { !it.closed }
+        val needsDial = current == null ||
+            makeBeforeBreak ||
+            !currentSessionMatchesTargetLocked(current, target)
+        if (!needsDial || connectJob?.isActive == true) return
+        val generation = ++nextDialGeneration
+        activeDialGeneration = generation
+        connectJob = scope.launch(Dispatchers.IO) {
+            try {
+                connectLoop(generation)
+            } finally {
+                onDialLoopFinished(generation)
+            }
+        }
+    }
+
+    private fun onDialLoopFinished(generation: Long) {
+        synchronized(this) {
+            if (activeDialGeneration != generation) return
+            connectJob = null
+            ensureDialingLocked()
+        }
     }
 
     private fun connectTimeoutMs(target: RoutedPeerTarget): Int =
@@ -317,120 +388,144 @@ class LanTcpClient(
             LAN_RETRY_DELAY_MS
         }
 
-    /**
-     * Exponential backoff capped at [MAX_RETRY_DELAY_MS]. Endpoint identity change or user
-     * action resets [dialFailures]; beacon heartbeats alone do not.
-     */
+    /** Exponential backoff is independent for each endpoint + Android network handle. */
     internal fun backoffDelayMs(target: RoutedPeerTarget): Long {
-        val exponent = dialFailures.coerceIn(0, MAX_BACKOFF_EXPONENT)
+        val failures = synchronized(this) { retryStates[targetIdentity(target)]?.failures ?: 0 }
+        val exponent = failures.coerceIn(0, MAX_BACKOFF_EXPONENT)
         return (retryDelayMs(target) shl exponent).coerceAtMost(MAX_RETRY_DELAY_MS)
+    }
+
+    private fun recordFailureLocked(target: RoutedPeerTarget): RetryState {
+        val key = targetIdentity(target)
+        val state = retryStates.getOrPut(key) { RetryState() }
+        state.failures++
+        state.nextEligibleAtMs = clockMs() + backoffForFailures(target, state.failures)
+        return state.copy()
+    }
+
+    private fun backoffForFailures(target: RoutedPeerTarget, failures: Int): Long {
+        val exponent = failures.coerceIn(0, MAX_BACKOFF_EXPONENT)
+        return (retryDelayMs(target) shl exponent).coerceAtMost(MAX_RETRY_DELAY_MS)
+    }
+
+    private fun confirmSessionLocked(source: LanTcpSession) {
+        if (session !== source || !source.confirm()) return
+        retryStates.remove(source.retryKey)
+        targetPeer
+            ?.takeIf { target ->
+                sessionRoute?.let { route ->
+                    target.route.path == route.path &&
+                        target.route.networkHandle == route.networkHandle
+                } == true
+            }
+            ?.let { retryStates.remove(targetIdentity(it)) }
+        logInfo(
+            "SESSION_CONFIRMED peer=${source.peerUid} generation=${source.generation} " +
+                "path=${sessionRoute?.label}",
+        )
     }
 
     private fun isLanTarget(target: RoutedPeerTarget): Boolean = target.route.path == PeerPath.LAN
 
-    private suspend fun connectLoop() {
+    private suspend fun connectLoop(dialGeneration: Long) {
         while (currentCoroutineContext().isActive) {
-            val target = targetPeer ?: return
+            val target = synchronized(this) {
+                if (activeDialGeneration != dialGeneration) return
+                targetPeer
+            } ?: return
             val peer = target.peer
-            if (session?.closed == false) {
-                return
+            val targetKey = targetIdentity(target)
+            val currentMatches = synchronized(this) {
+                session?.takeIf { !it.closed }
+                    ?.let { currentSessionMatchesTargetLocked(it, target) } == true
             }
-            if (peer.host.isBlank() || peer.port <= 0) {
-                delay(1_000)
-                continue
+            if (currentMatches) return
+            if (peer.host.isBlank() || peer.port <= 0) return
+
+            val waitMs = synchronized(this) {
+                (retryStates[targetKey]?.nextEligibleAtMs ?: 0L) - clockMs()
             }
+            if (waitMs > 0L) delay(waitMs)
+            if (!currentCoroutineContext().isActive) return
+
             peerLink.markConnecting(peer.uid)
             val generation = cancelGeneration
-            val socket = Socket()
-            connectingSocket = socket
+            val socket = socketFactory()
+            val registered = synchronized(this) {
+                if (activeDialGeneration != dialGeneration ||
+                    targetPeer?.let(::targetIdentity) != targetKey
+                ) {
+                    false
+                } else {
+                    connectingSocket = socket
+                    true
+                }
+            }
+            if (!registered) {
+                runCatching { socket.close() }
+                return
+            }
             try {
                 bindTargetSocket(networkSocketBinder, target, socket)
                 socket.connect(InetSocketAddress(peer.host, peer.port), connectTimeoutMs(target))
                 socket.tcpNoDelay = true
                 if (connectingSocket !== socket || isCancelledAttempt(generation)) {
                     runCatching { socket.close() }
-                    continue
+                    return
                 }
                 connectingSocket = null
                 performHandshakeAndAdopt(target, socket, generation)
-                if (session?.closed == false) return
+                return
             } catch (e: IOException) {
-                connectingSocket = null
-                runCatching { socket.close() }
-                if (isCancelledAttempt(generation)) {
-                    // Intentional cancel (forceRestart / path switch) — do not failover.
-                    continue
+                synchronized(this) {
+                    if (connectingSocket === socket) connectingSocket = null
                 }
-                dialFailures++
-                Log.i(
-                    TAG,
+                runCatching { socket.close() }
+                if (isCancelledAttempt(generation) ||
+                    synchronized(this) { activeDialGeneration != dialGeneration }
+                ) {
+                    // Intentional cancel (forceRestart / path switch) — do not failover.
+                    return
+                }
+                val failure = synchronized(this) { recordFailureLocked(target) }
+                logInfo(
                     "dial failed peer=${peer.uid} host=${peer.host}:${peer.port} " +
-                        "path=${target.route.path} failures=$dialFailures: ${e.message}",
+                        "path=${target.route.path} failures=${failure.failures}: ${e.message}",
                 )
                 val failedLan = isLanTarget(target)
                 if (failedLan) {
                     onLanDialFailed?.invoke()
                 } else {
-                    maybeInvalidateOverlayEndpoint(target, e)
+                    maybeInvalidateOverlayEndpoint(target, e, failure.failures)
                 }
                 // Target may have switched to overlay inside the callback.
                 if (failedLan && targetPeer?.let { !isLanTarget(it) } == true) {
                     continue
                 }
-                delay(backoffDelayMs(target))
             }
         }
     }
 
-    private fun maybeInvalidateOverlayEndpoint(target: RoutedPeerTarget, error: IOException) {
+    private fun currentSessionMatchesTargetLocked(
+        current: LanTcpSession,
+        target: RoutedPeerTarget,
+    ): Boolean {
+        if (current.retryKey == targetIdentity(target)) return true
+        val route = sessionRoute ?: return false
+        return sessionDirection == SessionDirection.INBOUND &&
+            route.path == target.route.path &&
+            route.networkHandle == target.route.networkHandle
+    }
+
+    private fun maybeInvalidateOverlayEndpoint(
+        target: RoutedPeerTarget,
+        error: IOException,
+        failures: Int,
+    ) {
         val msg = error.message.orEmpty()
         val refused = msg.contains("ECONNREFUSED", ignoreCase = true)
-        if (refused || dialFailures >= OVERLAY_INVALIDATE_AFTER_FAILURES) {
+        if (refused || failures >= OVERLAY_INVALIDATE_AFTER_FAILURES) {
             onOverlayEndpointDead?.invoke(target.peer.uid)
-        }
-    }
-
-    private suspend fun dialMakeBeforeBreak(target: RoutedPeerTarget) {
-        val lanPeer = target.peer
-        if (lanPeer.host.isBlank() || lanPeer.port <= 0) return
-        val socket = Socket()
-        connectingSocket = socket
-        try {
-            bindTargetSocket(networkSocketBinder, target, socket)
-            socket.connect(InetSocketAddress(lanPeer.host, lanPeer.port), connectTimeoutMs(target))
-            socket.tcpNoDelay = true
-            if (connectingSocket !== socket) {
-                runCatching { socket.close() }
-                return
-            }
-            connectingSocket = null
-            val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
-            val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
-            LanProtocol.writeFrame(out, LanFrame.Hello(localUid, peerLink.lastContiguousInSeq()))
-            val reply = withTimeoutOrNull(LanTcpServer.HANDSHAKE_TIMEOUT_MS) {
-                withContext(Dispatchers.IO) { LanProtocol.readFrame(input) }
-            }
-            if (reply !is LanFrame.Hello || reply.uid != lanPeer.uid) {
-                runCatching { socket.close() }
-                return
-            }
-            adoptSession(
-                lanPeer.uid,
-                socket,
-                out,
-                input,
-                reply.lastContiguousSeq,
-                target.route,
-                SessionDirection.OUTBOUND,
-            )
-        } catch (_: IOException) {
-            connectingSocket = null
-            runCatching { socket.close() }
-            if (targetPeer?.peer?.uid == lanPeer.uid) {
-                if (session?.closed != false) {
-                    connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
-                }
-            }
         }
     }
 
@@ -449,23 +544,7 @@ class LanTcpClient(
         if (reply !is LanFrame.Hello || reply.uid != peerUid) {
             runCatching { socket.close() }
             if (isCancelledAttempt(generation)) return
-            // Treat a bad/missing Hello like a connect failure so overlay failover can run.
-            dialFailures++
-            val activeTarget = targetPeer
-            if (activeTarget != null && isLanTarget(activeTarget)) {
-                Log.i(
-                    TAG,
-                    "handshake failed peer=$peerUid " +
-                        "host=${activeTarget.peer.host}:${activeTarget.peer.port}",
-                )
-                onLanDialFailed?.invoke()
-            } else if (activeTarget != null) {
-                maybeInvalidateOverlayEndpoint(activeTarget, IOException("handshake failed"))
-            }
-            if (activeTarget != null) {
-                delay(backoffDelayMs(activeTarget))
-            }
-            return
+            throw IOException("handshake failed")
         }
         adoptSession(
             peerUid,
@@ -475,45 +554,32 @@ class LanTcpClient(
             reply.lastContiguousSeq,
             target.route,
             SessionDirection.OUTBOUND,
+            targetIdentity(target),
         )
     }
 
-    @Synchronized
     private fun adoptParkedSession(parked: ParkedSession) {
-        dialFailures = 0
-        val previous = session
-        sessionRoute = parked.route
-        sessionDirection = parked.direction
-        val remote = parked.socket.inetAddress?.hostAddress ?: "?"
-        val remotePort = parked.socket.port
-        val newSession = LanTcpSession(
-            scope = scope,
+        adoptSession(
             peerUid = parked.peerUid,
             socket = parked.socket,
             out = parked.out,
             input = parked.input,
-            peerLink = peerLink,
-            transport = this,
-            onClosed = ::onSessionClosed,
-        )
-        session = newSession
-        previous?.close()
-        newSession.start()
-        peerLink.onHandshakeComplete(this, parked.peerUid, parked.peerAnnouncedLastContiguousSeq)
-        Log.i(
-            TAG,
-            "adopted peer=${parked.peerUid} path=${parked.route.label} " +
-                "network=${parked.route.networkHandle} remote=$remote:$remotePort (standby)",
+            peerAnnouncedLastContiguousSeq = parked.peerAnnouncedLastContiguousSeq,
+            route = parked.route,
+            direction = parked.direction,
+            retryKey = retryKeyForRoute(parked.route),
+            forceReplace = true,
+            suffix = " (standby)",
         )
     }
 
-    @Synchronized
     private fun replaceStandby(candidate: ParkedSession) {
-        standby?.close()
-        standby = candidate
+        val previous = synchronized(this) {
+            standby.also { standby = candidate }
+        }
+        previous?.let { DetachedNetworkResources(listOf({ it.close() })).closeAsync(scope, TAG) }
     }
 
-    @Synchronized
     private fun adoptSession(
         peerUid: String,
         socket: Socket,
@@ -522,67 +588,135 @@ class LanTcpClient(
         peerAnnouncedLastContiguousSeq: Long,
         route: RoutedSocketPath,
         direction: SessionDirection,
-    ) {
-        val activeSession = session?.takeIf { !it.closed }
-        val activeRoute = sessionRoute
-        val activeDirection = sessionDirection
-        if (activeSession != null && activeRoute != null && activeDirection != null &&
-            !shouldReplaceSession(
-                localUid = localUid,
-                peerUid = peerUid,
-                activePath = activeRoute.path,
-                activeDirection = activeDirection,
-                candidatePath = route.path,
-                candidateDirection = direction,
-            )
-        ) {
-            Log.i(
-                TAG,
-                "rejected duplicate peer=$peerUid candidate=${route.label}/${route.networkHandle} " +
-                    "active=${activeRoute.label}/${activeRoute.networkHandle}",
-            )
-            runCatching { socket.close() }
-            return
-        }
-        clearStandby()
-        dialFailures = 0
-        val previous = session
-        sessionRoute = route
-        sessionDirection = direction
+        retryKey: String = retryKeyForRoute(route),
+        forceReplace: Boolean = false,
+        suffix: String = "",
+    ): Boolean {
         val remote = socket.inetAddress?.hostAddress ?: "?"
         val remotePort = socket.port
-        val newSession = LanTcpSession(
-            scope = scope,
-            peerUid = peerUid,
-            socket = socket,
-            out = out,
-            input = input,
-            peerLink = peerLink,
-            transport = this,
-            onClosed = ::onSessionClosed,
+        val closeActions = mutableListOf<() -> Unit>()
+        var acceptedGeneration: Long? = null
+        var rejectedActive: RoutedSocketPath? = null
+        synchronized(this) {
+            val activeSession = session?.takeIf { !it.closed }
+            val activeRoute = sessionRoute
+            val activeDirection = sessionDirection
+            if (!forceReplace && activeSession != null && activeRoute != null && activeDirection != null &&
+                !shouldReplaceSession(
+                    localUid = localUid,
+                    peerUid = peerUid,
+                    activePath = activeRoute.path,
+                    activeDirection = activeDirection,
+                    candidatePath = route.path,
+                    candidateDirection = direction,
+                )
+            ) {
+                rejectedActive = activeRoute
+                closeActions += { socket.close() }
+                return@synchronized
+            }
+
+            standby?.let { parked -> closeActions += { parked.close() } }
+            standby = null
+            val previous = session
+            val previousRoute = sessionRoute
+            val previousDirection = sessionDirection
+            val generation = ++nextSessionGeneration
+            val newSession = LanTcpSession(
+                scope = scope,
+                peerUid = peerUid,
+                generation = generation,
+                retryKey = retryKey,
+                socket = socket,
+                out = out,
+                input = input,
+                onFrame = ::onSessionFrame,
+                onClosed = ::onSessionClosed,
+            )
+            session = newSession
+            sessionRoute = route
+            sessionDirection = direction
+            if (!newSession.start()) {
+                session = previous
+                sessionRoute = previousRoute
+                sessionDirection = previousDirection
+                closeActions += { socket.close() }
+                return@synchronized
+            }
+            // Serialize publication with the current-session close callback. No resource
+            // close occurs under this arbiter lock.
+            peerLink.onHandshakeComplete(this, peerUid, peerAnnouncedLastContiguousSeq)
+            previous?.let { old -> closeActions += { old.close() } }
+            acceptedGeneration = generation
+        }
+        DetachedNetworkResources(closeActions).closeAsync(scope, TAG)
+        rejectedActive?.let { active ->
+            logInfo(
+                "CANDIDATE_REJECTED peer=$peerUid candidate=${route.label}/${route.networkHandle} " +
+                    "active=${active.label}/${active.networkHandle}",
+            )
+            return false
+        }
+        val generation = acceptedGeneration ?: return false
+        logInfo(
+            "CANDIDATE_ACCEPTED peer=$peerUid generation=$generation path=${route.label} " +
+                "network=${route.networkHandle} remote=$remote:$remotePort$suffix",
         )
-        session = newSession
-        previous?.close()
-        newSession.start()
-        peerLink.onHandshakeComplete(this, peerUid, peerAnnouncedLastContiguousSeq)
-        Log.i(
-            TAG,
-            "adopted peer=$peerUid path=${route.label} network=${route.networkHandle} " +
-                "remote=$remote:$remotePort",
-        )
+        return true
     }
 
-    @Synchronized
+    private fun retryKeyForRoute(route: RoutedSocketPath): String = synchronized(this) {
+        targetPeer
+            ?.takeIf { it.route.path == route.path && it.route.networkHandle == route.networkHandle }
+            ?.let(::targetIdentity)
+            ?: "${route.path}|${route.networkHandle}|$peerUid"
+    }
+
+    private fun onSessionFrame(source: LanTcpSession, frame: LanFrame) {
+        synchronized(this) {
+            if (session !== source || source.closed) return
+            confirmSessionLocked(source)
+            peerLink.onFrameReceived(this, frame)
+        }
+    }
+
     private fun onSessionClosed(closedSession: LanTcpSession) {
-        if (session !== closedSession) return
-        session = null
-        sessionRoute = null
-        sessionDirection = null
-        peerLink.onDisconnected(this, closedSession.peerUid)
-        val target = targetPeer
-        if (target != null && target.peer.uid == closedSession.peerUid) {
-            if (connectJob?.isActive != true) {
-                connectJob = scope.launch(Dispatchers.IO) { connectLoop() }
+        var failedTarget: RoutedPeerTarget? = null
+        var failureCount = 0
+        val wasCurrent = synchronized(this) {
+            if (session !== closedSession) return@synchronized false
+            val route = sessionRoute
+            session = null
+            sessionRoute = null
+            sessionDirection = null
+            val target = targetPeer?.takeIf {
+                it.peer.uid == closedSession.peerUid && targetIdentity(it) == closedSession.retryKey
+            }
+            if (!closedSession.confirmed && target != null) {
+                failedTarget = target
+                failureCount = recordFailureLocked(target).failures
+            }
+            peerLink.onDisconnected(this, closedSession.peerUid)
+            ensureDialingLocked()
+            logInfo(
+                "ACTIVE_SESSION_CLOSED peer=${closedSession.peerUid} " +
+                    "generation=${closedSession.generation} path=${route?.label} " +
+                    "confirmed=${closedSession.confirmed}",
+            )
+            true
+        }
+        if (!wasCurrent) {
+            logInfo(
+                "STALE_SESSION_CLOSED peer=${closedSession.peerUid} " +
+                    "generation=${closedSession.generation}",
+            )
+            return
+        }
+        failedTarget?.let { target ->
+            if (isLanTarget(target)) {
+                onLanDialFailed?.invoke()
+            } else if (failureCount >= OVERLAY_INVALIDATE_AFTER_FAILURES) {
+                onOverlayEndpointDead?.invoke(target.peer.uid)
             }
         }
     }
@@ -613,12 +747,42 @@ class LanTcpClient(
         private const val MAX_BACKOFF_EXPONENT = 7
         /** Drop sticky overlay host:port after this many consecutive real dial failures. */
         internal const val OVERLAY_INVALIDATE_AFTER_FAILURES = 5
+
+        private fun logInfo(message: String) {
+            runCatching { Log.i(TAG, message) }
+        }
     }
 }
 
 internal enum class SessionDirection {
     INBOUND,
     OUTBOUND,
+}
+
+private data class RetryState(
+    var failures: Int = 0,
+    var nextEligibleAtMs: Long = 0L,
+)
+
+internal data class NetworkInvalidationResult(
+    val affectedPath: PeerPath? = null,
+    val lostSessionPath: PeerPath? = null,
+    val detachedResources: DetachedNetworkResources = DetachedNetworkResources(),
+)
+
+internal data class DetachedNetworkResources(
+    val closeActions: List<() -> Unit> = emptyList(),
+) {
+    fun closeAsync(scope: CoroutineScope, tag: String) {
+        if (closeActions.isEmpty()) return
+        scope.launch(Dispatchers.IO) {
+            closeActions.forEach { close ->
+                runCatching { close() }.onFailure { error ->
+                    Log.w(tag, "async network resource close failed: ${error.message}")
+                }
+            }
+        }
+    }
 }
 
 /**

@@ -36,31 +36,45 @@ class LanTcpClientBackoffTest {
     @Test
     fun `backoff grows exponentially and is capped`() {
         val first = client.backoffDelayMs(lanTarget)
-        repeat(3) { client.recordDialFailureForTest() }
+        repeat(3) { client.recordDialFailureForTest(lanTarget) }
         val afterThree = client.backoffDelayMs(lanTarget)
         assertEquals(first * 8, afterThree)
 
-        repeat(20) { client.recordDialFailureForTest() }
+        repeat(20) { client.recordDialFailureForTest(lanTarget) }
         assertEquals(LanTcpClient.MAX_RETRY_DELAY_MS, client.backoffDelayMs(lanTarget))
-        assertEquals(LanTcpClient.MAX_RETRY_DELAY_MS, client.backoffDelayMs(overlayTarget))
+        assertEquals(250L, client.backoffDelayMs(overlayTarget))
     }
 
     @Test
-    fun `user action resets backoff to the base delay`() {
-        repeat(10) { client.recordDialFailureForTest() }
+    fun `repeated user action does not bypass target backoff`() {
+        repeat(10) { client.recordDialFailureForTest(lanTarget) }
         assertTrue(client.backoffDelayMs(lanTarget) > 1_000L)
+        val deadline = client.nextEligibleAtForTest(lanTarget)
 
-        client.resetDialBackoff()
+        client.requestDialReconciliation()
+        client.requestDialReconciliation()
 
-        assertEquals(500L, client.backoffDelayMs(lanTarget))
+        assertEquals(LanTcpClient.MAX_RETRY_DELAY_MS, client.backoffDelayMs(lanTarget))
+        assertEquals(deadline, client.nextEligibleAtForTest(lanTarget))
         assertEquals(250L, client.backoffDelayMs(overlayTarget))
+    }
+
+    @Test
+    fun `confirmed session resets only its exact target`() {
+        repeat(4) { client.recordDialFailureForTest(lanTarget) }
+        repeat(2) { client.recordDialFailureForTest(overlayTarget) }
+
+        client.confirmTargetForTest(lanTarget)
+
+        assertEquals(0, client.failureCountForTest(lanTarget))
+        assertEquals(2, client.failureCountForTest(overlayTarget))
     }
 
     @Test
     fun `same endpoint with newer lastSeen does not reset backoff`() {
         peerLink.resetFor("b")
         client.setTarget(lanPeer.copy(lastSeenMs = 1_000L).routed())
-        repeat(3) { client.recordDialFailureForTest() }
+        repeat(3) { client.recordDialFailureForTest(lanTarget) }
         val afterFailures = client.backoffDelayMs(lanTarget)
 
         client.setTarget(lanPeer.copy(lastSeenMs = 2_000L).routed())
@@ -72,7 +86,7 @@ class LanTcpClientBackoffTest {
     fun `host change resets backoff`() {
         peerLink.resetFor("b")
         client.setTarget(lanPeer.copy(lastSeenMs = 1_000L).routed())
-        repeat(5) { client.recordDialFailureForTest() }
+        repeat(5) { client.recordDialFailureForTest(lanTarget) }
         assertTrue(client.backoffDelayMs(lanTarget) > 500L)
 
         client.setTarget(lanPeer.copy(host = "192.168.1.99", lastSeenMs = 2_000L).routed())
