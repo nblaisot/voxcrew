@@ -239,6 +239,12 @@ explicite de l'utilisateur et peut réduire, interrompre ou rerouter la musique 
 application. En PTT, cet impact Telecom est borné à la présence de VoxCrew au premier plan ;
 en arrière-plan, seule la parole entrante prend un focus média transitoire.
 
+Le verrou Wi-Fi faible latence est indépendant de cette demande Telecom : il n'est détenu
+que pendant une talkspurt sortante, une activité/réception distante ou des frames en attente,
+puis relâché après une traîne de 1 s. Le silence VOX conserve donc le micro/Telecom nécessaire
+à la détection sans désactiver en permanence l'économie d'énergie Wi-Fi. La découverte utilise
+des broadcasts IPv4 et ne demande pas de `MulticastLock`.
+
 ## Politique d'endpoints
 
 `getAvailableStartingCallEndpoints()` est collecté même sans appel actif afin d'alimenter

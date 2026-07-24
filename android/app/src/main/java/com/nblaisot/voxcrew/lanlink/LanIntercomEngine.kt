@@ -15,6 +15,7 @@ import com.nblaisot.voxcrew.audio.UiFeedbackPlayer
 import com.nblaisot.voxcrew.audio.VoiceActivatedTransmissionPolicy
 import com.nblaisot.voxcrew.audio.VoxGate
 import com.nblaisot.voxcrew.audio.VoxSensitivity
+import com.nblaisot.voxcrew.connectivity.ConnectivitySnapshot
 import com.nblaisot.voxcrew.connectivity.NetworkMonitor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -31,6 +32,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.decodeFromString
@@ -55,7 +57,7 @@ class LanIntercomEngine(
     private val telecomSession = telecomSession ?: IntercomTelecomSession(appContext, scope)
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val json = Json { ignoreUnknownKeys = true }
-    private val beacon = LanBeacon(context, scope)
+    private val beacon = LanBeacon(scope, networkMonitor)
     private val lanServer = LanTcpServer(scope)
     private val capture = AudioCapture(
         scope = scope,
@@ -70,6 +72,7 @@ class LanIntercomEngine(
     private val feedbackWatchJobs = ConcurrentHashMap<String, Job>()
     private val metricsWatchJobs = ConcurrentHashMap<String, Job>()
     private val receivingUntilMs = ConcurrentHashMap<String, Long>()
+    private val latencyRemotePeers = ConcurrentHashMap.newKeySet<String>()
     private val receivingExpiryLock = Any()
 
     private val pttPolicy = PushToTalkTransmissionPolicy()
@@ -140,8 +143,11 @@ class LanIntercomEngine(
     private val mediaDemandMutex = Mutex()
     private val mediaDemandState = MediaDemandState()
     private val _mediaDemanded = MutableStateFlow(false)
-    /** True while Telecom media is demanded (foreground PTT or VOX). Drives Wi‑Fi power hint. */
+    /** True while Telecom media is demanded (foreground PTT or VOX). */
     val mediaDemanded: StateFlow<Boolean> = _mediaDemanded.asStateFlow()
+    private val _latencyCritical = MutableStateFlow(false)
+    val latencyCritical: StateFlow<Boolean> = _latencyCritical.asStateFlow()
+    @Volatile private var hasPendingLatencyMedia = false
     private val incomingMediaMutex = Mutex()
     private val pendingIncomingMedia = mutableMapOf<String, ArrayDeque<IncomingMediaEvent>>()
     /** Frames arriving while Telecom teardown still holds [IntercomTelecomSession.hasCall]. */
@@ -160,6 +166,8 @@ class LanIntercomEngine(
     private val peerOverlayEndpoints = ConcurrentHashMap<String, OverlayEndpoint>()
     /** Cold-start probe hosts from the persisted roster; live sightings take precedence. */
     private val seededOverlayProbeHosts = ConcurrentHashMap<String, String>()
+    @Volatile private var connectivitySnapshot = ConnectivitySnapshot()
+    private val pathReconciliationSignal = Channel<Unit>(Channel.CONFLATED)
 
     private data class OverlayEndpoint(
         val host: String,
@@ -263,9 +271,7 @@ class LanIntercomEngine(
 
         lanServer.start(uid)
         lanServer.onUnknownInboundPeer = { peerUid -> ensureKnownPeer(peerUid) }
-        val overlayHost = if (overlayFallbackEnabled) TailscaleInterface.localOverlayIpv4() else null
-        beacon.start(uid, displayName, lanServer.localPort, overlayHost)
-        networkMonitor.start()
+        beacon.start(uid, displayName, lanServer.localPort)
 
         val restoreVoxEnabled = prefs.getBoolean(KEY_VOX_ENABLED, false)
         if (restoreVoxEnabled) {
@@ -278,24 +284,23 @@ class LanIntercomEngine(
         watchPolicy(activePolicy)
 
         lifecycleJobs += scope.launch {
-            beacon.presence.collect { snapshot -> updateLanTargets(snapshot) }
-        }
-        if (overlayFallbackEnabled) {
-            lifecycleJobs += scope.launch {
-                while (currentCoroutineContext().isActive) {
-                    delay(LanBeacon.PRUNE_INTERVAL_MS)
-                    if (started) updateLanTargets(beacon.presence.value)
-                }
+            for (ignored in pathReconciliationSignal) {
+                if (started) reconcilePeerPaths()
             }
         }
         lifecycleJobs += scope.launch {
-            networkMonitor.networkChanged.collect { onNetworkChanged() }
+            beacon.presence.collect { requestPathReconciliation() }
+        }
+        lifecycleJobs += scope.launch {
+            networkMonitor.connectivity.collect { onConnectivitySnapshot(it) }
         }
         lifecycleJobs += scope.launch(Dispatchers.IO) {
             telecomSession.callTornDown.collect { flushPendingMediaPlayback() }
         }
+        networkMonitor.start()
 
         loadPersistedActiveRecipients()
+        requestPathReconciliation()
         ensureAudioRoutingMonitor()
         scheduleMediaDemandReconciliation()
     }
@@ -326,8 +331,7 @@ class LanIntercomEngine(
             val removed = connections.keys - targetUids
             removed.forEach { removeConnection(it) }
         }
-        // Only live LAN sightings suppress overlay probes; overlay-visible peers still need them.
-        updateOverlayProbes(beacon.presence.value.lanSightings.keys.filter { it != localUid }.toSet())
+        requestPathReconciliation()
     }
 
     fun toggleRecipient(uid: String) {
@@ -365,6 +369,7 @@ class LanIntercomEngine(
             added.forEach { uid -> connections[uid]?.sendMediaActivity(true) }
             removed.forEach { uid -> connections[uid]?.sendMediaActivity(false) }
         }
+        requestPathReconciliation()
     }
 
     fun onMicrophonePermissionGranted() {
@@ -416,7 +421,10 @@ class LanIntercomEngine(
             // Foreground restores the Telecom path; multimedia inbound must not keep playing.
             mediaInboundPlayer.stop()
             scope.launch(Dispatchers.IO) {
-                incomingMediaMutex.withLock { pendingMediaPlayback.clear() }
+                incomingMediaMutex.withLock {
+                    pendingMediaPlayback.clear()
+                    refreshPendingLatencyMediaLocked()
+                }
             }
         } else if (!_voxEnabled.value) {
             pttPolicy.cancel()
@@ -626,6 +634,7 @@ class LanIntercomEngine(
     private fun setOutboundMediaActive(active: Boolean) {
         val changed = mediaDemandState.setOutbound(active)
         if (!changed) return
+        refreshLatencyCritical()
         _activeRecipientUids.value.forEach { uid ->
             ensureConnection(uid).apply {
                 start()
@@ -767,6 +776,10 @@ class LanIntercomEngine(
                 scope = scope,
                 localUid = localUid,
                 lanServer = lanServer,
+                networkSocketBinder = networkMonitor,
+                inboundRouteResolver = { socket ->
+                    classifyAcceptedSocket(socket, connectivitySnapshot)
+                },
                 isStillWanted = { peerUid in knownCrewUids || peerUid in _activeRecipientUids.value },
                 overlayPeerProvider = {
                     if (overlayFallbackEnabled) {
@@ -774,7 +787,7 @@ class LanIntercomEngine(
                             peerUid,
                             beacon.presence.value.overlaySightings[peerUid]
                                 ?.takeIf { it.uid != localUid },
-                        )
+                        )?.let { routePeer(it, connectivitySnapshot) }
                     } else {
                         null
                     }
@@ -782,6 +795,7 @@ class LanIntercomEngine(
                 lanPeerProvider = {
                     beacon.presence.value.lanSightings[peerUid]
                         ?.takeUnless { it.viaOverlay }
+                        ?.let { routePeer(it, connectivitySnapshot) }
                 },
                 onOverlayEndpointDead = { uid -> forgetOverlayEndpoint(uid) },
             )
@@ -797,10 +811,7 @@ class LanIntercomEngine(
         knownCrewUids = knownCrewUids + peerUid
         val conn = ensureConnection(peerUid)
         conn.start()
-        val peer = beacon.peers.value.firstOrNull { it.uid == peerUid }
-        val overlay = overlayPeerFor(peerUid, peer?.takeIf { it.viaOverlay })
-        val lan = peer?.takeUnless { it.viaOverlay }
-        conn.applyPathTargets(lan, overlay)
+        requestPathReconciliation()
     }
 
     private fun removeConnection(peerUid: String) {
@@ -809,15 +820,19 @@ class LanIntercomEngine(
         metricsWatchJobs.remove(peerUid)?.cancel()
         _peerMetrics.update { it - peerUid }
         connections.remove(peerUid)?.stop()
+        refreshBeaconConnectedPeers()
         setRemoteTelecomDemand(peerUid, false)
+        setLatencyRemoteActive(peerUid, false)
         scope.launch(Dispatchers.IO) {
             incomingMediaMutex.withLock {
                 pendingIncomingMedia.remove(peerUid)
                 pendingMediaPlayback.remove(peerUid)
+                refreshPendingLatencyMediaLocked()
             }
         }
         receivingUntilMs.remove(peerUid)
         refreshReceivingUids()
+        refreshLatencyCritical()
     }
 
     private fun startConnectionFeedback(conn: PeerConnection) {
@@ -831,7 +846,11 @@ class LanIntercomEngine(
                     state is PeerLink.LinkState.Disconnected
                 ) {
                     setRemoteTelecomDemand(conn.peerUid, false)
-                    incomingMediaMutex.withLock { pendingIncomingMedia.remove(conn.peerUid) }
+                    setLatencyRemoteActive(conn.peerUid, false)
+                    incomingMediaMutex.withLock {
+                        pendingIncomingMedia.remove(conn.peerUid)
+                        refreshPendingLatencyMediaLocked()
+                    }
                 }
                 if (conn.peerUid in activeRecipients) {
                     when {
@@ -845,8 +864,20 @@ class LanIntercomEngine(
                     }
                 }
                 previous = state
+                refreshBeaconConnectedPeers()
+                requestPathReconciliation()
             }
         }
+    }
+
+    private fun refreshBeaconConnectedPeers() {
+        beacon.setConnectedPeers(
+            connections.values.mapNotNull { connection ->
+                val connected = connection.linkState.value as? PeerLink.LinkState.Connected
+                    ?: return@mapNotNull null
+                connection.peerUid to (connected.via == PathLabels.VPN)
+            }.toMap(),
+        )
     }
 
     private fun startAudioCollection(conn: PeerConnection) {
@@ -864,6 +895,9 @@ class LanIntercomEngine(
 
     private suspend fun handleIncomingMedia(peerUid: String, event: IncomingMediaEvent) {
         incomingMediaMutex.withLock {
+            if (event is IncomingMediaEvent.Activity) {
+                setLatencyRemoteActive(peerUid, event.active)
+            }
             if (inboundPlaybackMode() == InboundPlaybackMode.MEDIA) {
                 handleIncomingMediaAsMultimediaLocked(peerUid, event)
                 return
@@ -908,11 +942,13 @@ class LanIntercomEngine(
     private fun handleIncomingMediaAsMultimediaLocked(peerUid: String, event: IncomingMediaEvent) {
         // Drop any Telecom-pending queue for this peer — that path is not used here.
         pendingIncomingMedia.remove(peerUid)
+        refreshPendingLatencyMediaLocked()
         when (event) {
             is IncomingMediaEvent.Activity -> {
                 if (!event.active) {
                     receivingUntilMs.remove(peerUid)
                     refreshReceivingUids()
+                    refreshLatencyCritical()
                 }
                 // Do not call setRemoteTelecomDemand — remote peers must not reopen Telecom.
             }
@@ -930,6 +966,7 @@ class LanIntercomEngine(
             Log.w(TAG, "incoming activation buffer full; oldest event dropped peer=$peerUid")
         }
         queue.addLast(event)
+        refreshPendingLatencyMediaLocked()
     }
 
     private fun drainPendingIncomingMedia() {
@@ -951,6 +988,7 @@ class LanIntercomEngine(
                     }
                     if (queue.isEmpty()) pendingIncomingMedia.remove(peerUid)
                 }
+                refreshPendingLatencyMediaLocked()
             }
         }
     }
@@ -973,6 +1011,7 @@ class LanIntercomEngine(
             val queue = pendingMediaPlayback.getOrPut(peerUid) { ArrayDeque() }
             while (queue.size >= MAX_PENDING_MEDIA_FRAMES) queue.removeFirst()
             queue.addLast(payload)
+            refreshPendingLatencyMediaLocked()
             return false
         }
         flushPendingMediaPlaybackLocked(peerUid)
@@ -987,6 +1026,7 @@ class LanIntercomEngine(
             if (telecomSession.hasCall) return
             if (inboundPlaybackMode() != InboundPlaybackMode.MEDIA) {
                 pendingMediaPlayback.clear()
+                refreshPendingLatencyMediaLocked()
                 return
             }
             pendingMediaPlayback.keys.toList().forEach { flushPendingMediaPlaybackLocked(it) }
@@ -995,6 +1035,7 @@ class LanIntercomEngine(
 
     private fun flushPendingMediaPlaybackLocked(peerUid: String) {
         val queue = pendingMediaPlayback.remove(peerUid) ?: return
+        refreshPendingLatencyMediaLocked()
         var played = false
         queue.forEach { payload ->
             if (mediaInboundPlayer.play(payload)) played = true
@@ -1005,6 +1046,7 @@ class LanIntercomEngine(
     private fun markReceiving(peerUid: String) {
         receivingUntilMs[peerUid] = System.currentTimeMillis() + RECEIVING_IDLE_MS
         refreshReceivingUids()
+        refreshLatencyCritical()
         ensureReceivingExpiryJob()
     }
 
@@ -1035,6 +1077,7 @@ class LanIntercomEngine(
             val now = System.currentTimeMillis()
             receivingUntilMs.entries.removeIf { it.value <= now }
             refreshReceivingUids()
+            refreshLatencyCritical()
         }
     }
 
@@ -1044,7 +1087,33 @@ class LanIntercomEngine(
         _receivingFromUids.value = active
     }
 
-    private fun updateLanTargets(snapshot: LanBeacon.PresenceSnapshot) {
+    private fun setLatencyRemoteActive(peerUid: String, active: Boolean) {
+        if (active) latencyRemotePeers.add(peerUid) else latencyRemotePeers.remove(peerUid)
+        refreshLatencyCritical()
+    }
+
+    /** Caller holds [incomingMediaMutex]. */
+    private fun refreshPendingLatencyMediaLocked() {
+        hasPendingLatencyMedia = pendingIncomingMedia.values.any { it.isNotEmpty() } ||
+            pendingMediaPlayback.values.any { it.isNotEmpty() }
+        refreshLatencyCritical()
+    }
+
+    private fun refreshLatencyCritical() {
+        _latencyCritical.value = latencyCriticalState(
+            outbound = mediaDemandState.isOutbound(),
+            remoteActive = latencyRemotePeers.isNotEmpty(),
+            receiving = receivingUntilMs.isNotEmpty(),
+            pending = hasPendingLatencyMedia,
+        )
+    }
+
+    private fun requestPathReconciliation() {
+        pathReconciliationSignal.trySend(Unit)
+    }
+
+    private fun reconcilePeerPaths() {
+        val snapshot = beacon.presence.value
         val nowMs = System.currentTimeMillis()
         val lanByUid = snapshot.lanSightings.filterKeys { it != localUid }
         val overlaySightings = snapshot.overlaySightings.filterKeys { it != localUid }
@@ -1058,8 +1127,9 @@ class LanIntercomEngine(
             .toSet()
 
         relevantUids.forEach { uid ->
-            val lan = lanByUid[uid]
+            val lan = lanByUid[uid]?.let { routePeer(it, connectivitySnapshot) }
             val overlay = overlayPeerFor(uid, overlaySightings[uid])
+                ?.let { routePeer(it, connectivitySnapshot) }
             val conn = ensureConnection(uid)
             if (lan != null || overlay != null) {
                 conn.start()
@@ -1089,7 +1159,7 @@ class LanIntercomEngine(
 
     private fun rememberOverlayEndpoint(peer: LanPeer) {
         val overlayHost = peer.overlayHost
-            ?: peer.host.takeIf { TailscaleInterface.isTailscaleAddress(peer.host) }
+            ?: peer.host.takeIf { TailscaleInterface.isCgnatAddress(peer.host) }
         if (overlayHost.isNullOrBlank() || peer.port <= 0) return
         peerOverlayEndpoints[peer.uid] = OverlayEndpoint(
             host = overlayHost,
@@ -1102,13 +1172,7 @@ class LanIntercomEngine(
     fun forgetOverlayEndpoint(uid: String) {
         if (peerOverlayEndpoints.remove(uid) != null) {
             Log.i(TAG, "forgot overlay endpoint for $uid")
-            // Clear TCP target that was dialing the dead endpoint; next presence tick re-probes.
-            connections[uid]?.updateLanTarget(null)
-            if (overlayFallbackEnabled) {
-                updateOverlayProbes(
-                    beacon.presence.value.lanSightings.keys.filter { it != localUid }.toSet(),
-                )
-            }
+            requestPathReconciliation()
         }
     }
 
@@ -1121,38 +1185,47 @@ class LanIntercomEngine(
         hosts.forEach { (uid, host) ->
             if (uid.isNotBlank() && host.isNotBlank()) seededOverlayProbeHosts[uid] = host
         }
+        requestPathReconciliation()
     }
 
     /** Probe overlay only for peers without a live LAN sighting. */
     private fun updateOverlayProbes(lanVisibleUids: Set<String>) {
-        val targets = (knownCrewUids + _activeRecipientUids.value)
-            .filter { it != localUid && it !in lanVisibleUids }
-            .mapNotNull { uid ->
-                val host = peerOverlayEndpoints[uid]?.host ?: seededOverlayProbeHosts[uid]
-                host?.let { uid to it }
+        val connectedUids = connections.values.mapNotNullTo(mutableSetOf()) { connection ->
+            connection.peerUid.takeIf {
+                connection.linkState.value is PeerLink.LinkState.Connected
             }
-            .toMap()
+        }
+        val targets = overlayProbeTargets(
+            overlayAvailable = connectivitySnapshot.overlayNetwork != null,
+            localUid = localUid,
+            relevantUids = knownCrewUids + _activeRecipientUids.value,
+            lanVisibleUids = lanVisibleUids,
+            connectedUids = connectedUids,
+            endpointHosts = peerOverlayEndpoints.mapValues { it.value.host },
+            seededHosts = seededOverlayProbeHosts,
+        )
         beacon.setOverlayProbeTargets(targets)
     }
 
-    private fun onNetworkChanged() {
+    private fun onConnectivitySnapshot(next: ConnectivitySnapshot) {
         if (!started) return
-        val overlayHost = if (overlayFallbackEnabled) TailscaleInterface.localOverlayIpv4() else null
-        if (overlayHost != null) {
-            Log.i(TAG, "network changed; announcing overlay=$overlayHost")
-        } else {
-            Log.i(TAG, "network changed; no local overlay IP")
+        val previous = connectivitySnapshot
+        if (next == previous) return
+        connectivitySnapshot = next
+
+        val invalidation = connectivityInvalidation(previous, next)
+        val invalidatedHandles = invalidation.lanHandles + invalidation.overlayHandles
+
+        beacon.updateOverlayNetwork(if (overlayFallbackEnabled) next.overlayNetwork else null)
+        if (invalidation.lanHandles.isNotEmpty()) {
+            beacon.removeInvalidLanSightings { peer -> routePeer(peer, next) != null }
         }
-        // 1) Forget previous-subnet LAN IPs and stale overlay sightings.
-        beacon.clearLanSightings()
-        beacon.clearOverlaySightings()
-        // Sticky TCP registry is invalid across network flips; keep UDP probe seeds.
-        peerOverlayEndpoints.clear()
-        // 2) Drop live sockets / dial targets so nothing keeps dialing those IPs.
-        connections.values.forEach { it.onNetworkChanged() }
-        // 3) Rebind beacon (new overlay announce) and dial from the cleared snapshot.
-        beacon.rebind(overlayHost)
-        updateLanTargets(beacon.presence.value)
+        if (invalidation.overlayHandles.isNotEmpty()) beacon.clearOverlaySightings()
+        if (invalidatedHandles.isNotEmpty()) {
+            connections.values.forEach { it.onNetworksInvalidated(invalidatedHandles) }
+        }
+        if (previous.lanNetworks != next.lanNetworks) beacon.requestAnnouncement()
+        requestPathReconciliation()
     }
 
     private fun startVoxCapture(): CaptureStartResult {
@@ -1328,6 +1401,9 @@ class LanIntercomEngine(
         stopVoxCapture()
         setOutboundMediaActive(false)
         mediaDemandState.endSession()
+        latencyRemotePeers.clear()
+        hasPendingLatencyMedia = false
+        _latencyCritical.value = false
         mediaInboundPlayer.stop()
         playback.stop()
         telecomSession.stop()
@@ -1365,14 +1441,19 @@ class LanIntercomEngine(
         lanServer.onUnknownInboundPeer = null
         lanServer.stop()
         networkMonitor.stop()
+        connectivitySnapshot = ConnectivitySnapshot()
+        while (pathReconciliationSignal.tryReceive().isSuccess) Unit
 
         peerOverlayEndpoints.clear()
         seededOverlayProbeHosts.clear()
 
         receivingUntilMs.clear()
+        latencyRemotePeers.clear()
+        hasPendingLatencyMedia = false
         _receivingFromUids.value = emptySet()
         _peerMetrics.value = emptyMap()
         _isTransmitting.value = false
+        _latencyCritical.value = false
         knownCrewUids = emptySet()
     }
 
@@ -1389,4 +1470,51 @@ class LanIntercomEngine(
         private const val KEY_VOX_ENABLED = "vox_enabled"
         private const val KEY_VOX_SENSITIVITY = "vox_sensitivity"
     }
+}
+
+internal fun latencyCriticalState(
+    outbound: Boolean,
+    remoteActive: Boolean,
+    receiving: Boolean,
+    pending: Boolean,
+): Boolean = outbound || remoteActive || receiving || pending
+
+internal data class ConnectivityInvalidation(
+    val lanHandles: Set<Long> = emptySet(),
+    val overlayHandles: Set<Long> = emptySet(),
+)
+
+internal fun connectivityInvalidation(
+    previous: ConnectivitySnapshot,
+    next: ConnectivitySnapshot,
+): ConnectivityInvalidation {
+    val oldLan = previous.lanNetworks.associateBy { it.networkHandle }
+    val newLan = next.lanNetworks.associateBy { it.networkHandle }
+    val invalidLan = oldLan.keys.filterTo(mutableSetOf()) { handle ->
+        newLan[handle] != oldLan[handle]
+    }
+    val oldOverlay = previous.overlayNetwork
+    val invalidOverlay = if (oldOverlay != null && oldOverlay != next.overlayNetwork) {
+        setOf(oldOverlay.networkHandle)
+    } else {
+        emptySet()
+    }
+    return ConnectivityInvalidation(invalidLan, invalidOverlay)
+}
+
+internal fun overlayProbeTargets(
+    overlayAvailable: Boolean,
+    localUid: String,
+    relevantUids: Set<String>,
+    lanVisibleUids: Set<String>,
+    connectedUids: Set<String>,
+    endpointHosts: Map<String, String>,
+    seededHosts: Map<String, String>,
+): Map<String, String> {
+    if (!overlayAvailable) return emptyMap()
+    return relevantUids
+        .asSequence()
+        .filter { it != localUid && it !in lanVisibleUids && it !in connectedUids }
+        .mapNotNull { uid -> (endpointHosts[uid] ?: seededHosts[uid])?.let { uid to it } }
+        .toMap()
 }

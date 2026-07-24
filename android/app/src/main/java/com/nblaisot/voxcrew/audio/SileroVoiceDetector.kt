@@ -36,14 +36,12 @@ class SileroVoiceDetector(
         .setSilenceDurationMs(SILENCE_DURATION_MS)
         .build()
 
-    private val pending = ArrayDeque<Short>()
+    private val accumulator = FixedPcmWindowAccumulator(FRAME_SIZE.value)
 
     override fun accept(pcm: ShortArray): Boolean? {
-        pending.addAll(pcm.asIterable())
         var lastDecision: Boolean? = null
-        while (pending.size >= FRAME_SIZE.value) {
-            val chunk = ShortArray(FRAME_SIZE.value) { pending.removeFirst() }
-            lastDecision = vad.isSpeech(chunk)
+        accumulator.append(pcm) { window ->
+            lastDecision = vad.isSpeech(window)
         }
         return lastDecision
     }
@@ -73,6 +71,31 @@ class SileroVoiceDetector(
             1 -> 200
             2, 3 -> 100
             else -> 50
+        }
+    }
+}
+
+/** Primitive, reusable window accumulator; avoids boxing every microphone sample. */
+internal class FixedPcmWindowAccumulator(windowSize: Int) {
+    private val window = ShortArray(windowSize)
+    private var count = 0
+
+    fun append(samples: ShortArray, onWindow: (ShortArray) -> Unit) {
+        var sourceOffset = 0
+        while (sourceOffset < samples.size) {
+            val copyCount = minOf(window.size - count, samples.size - sourceOffset)
+            samples.copyInto(
+                destination = window,
+                destinationOffset = count,
+                startIndex = sourceOffset,
+                endIndex = sourceOffset + copyCount,
+            )
+            count += copyCount
+            sourceOffset += copyCount
+            if (count == window.size) {
+                onWindow(window)
+                count = 0
+            }
         }
     }
 }

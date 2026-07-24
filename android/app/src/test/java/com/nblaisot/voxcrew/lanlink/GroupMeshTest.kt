@@ -84,7 +84,14 @@ class LanTcpServerDispatchTest {
         val server = LanTcpServer(scope)
         server.start("local-a")
         val linkB = newPeerLink("peer-b")
-        val clientB = LanTcpClient(scope, "local-a", linkB, server)
+        val clientB = LanTcpClient(
+            scope,
+            "local-a",
+            linkB,
+            server,
+            NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
+        )
         server.registerClient("peer-b", clientB)
 
         assertEquals("peer-b", linkB.selectedPeerUid)

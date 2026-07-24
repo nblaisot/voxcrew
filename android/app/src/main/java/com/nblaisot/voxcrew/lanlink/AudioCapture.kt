@@ -18,8 +18,6 @@ import com.nblaisot.voxcrew.audio.VoxEchoGuard
 import com.nblaisot.voxcrew.audio.VoxGate
 import com.nblaisot.voxcrew.audio.VoiceDetector
 import com.nblaisot.voxcrew.audio.observedDeviceKind
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -232,7 +230,8 @@ class AudioCapture(
         val recorder = opened.recorder
         val encoder = OpusCodec.Encoder()
         val leveler = PcmSpeechLeveler()
-        val preRoll = ArrayDeque<ByteArray>()
+        val preRoll = PcmPreRoll(PRE_ROLL_FRAMES, FRAME_BYTES)
+        val detectorSamples = ShortArray(FRAME_BYTES / BYTES_PER_SAMPLE)
         var fullFrames = 0
         var encodedFrames = 0L
         try {
@@ -258,21 +257,19 @@ class AudioCapture(
 
                 val nowMs = SystemClock.elapsedRealtime()
                 echoGuard.onReceivingChanged(isReceiving(), nowMs)
-                val decision = voiceDetector.accept(bytesToShorts(frame))
+                pcm16LeToShorts(frame, detectorSamples)
+                val decision = voiceDetector.accept(detectorSamples)
                 val result = gate.update(echoGuard.filterSpeechDecision(decision, nowMs), nowMs)
                 onTransmittingChanged(result.transmitting)
 
                 if (result.transmitting) {
                     if (result.onset) {
                         leveler.reset()
-                        while (preRoll.isNotEmpty()) {
-                            sendLeveled(preRoll.removeFirst())
-                        }
+                        preRoll.drain(::sendLeveled)
                     }
                     sendLeveled(frame)
                 } else {
-                    preRoll.addLast(frame.copyOf())
-                    while (preRoll.size > PRE_ROLL_FRAMES) preRoll.removeFirst()
+                    preRoll.push(frame)
                 }
             }
         } catch (error: CaptureReadException) {
@@ -377,12 +374,9 @@ class AudioCapture(
     private fun routedDevice(recorder: AudioRecord): AudioDeviceInfo? =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) recorder.routedDevice else null
 
-    private fun bytesToShorts(bytes: ByteArray): ShortArray = ShortArray(bytes.size / 2).also {
-        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(it)
-    }
-
     private fun pcmRms(frame: ByteArray): Int {
-        val samples = bytesToShorts(frame)
+        val samples = ShortArray(frame.size / BYTES_PER_SAMPLE)
+        pcm16LeToShorts(frame, samples)
         if (samples.isEmpty()) return 0
         return kotlin.math.sqrt(samples.sumOf { it.toDouble() * it.toDouble() } / samples.size).toInt()
     }
@@ -400,6 +394,43 @@ class AudioCapture(
 
     private data class OpenedRecorder(val recorder: AudioRecord, val callState: TelecomCallState)
     private class CaptureReadException(message: String) : IllegalStateException(message)
+}
+
+/** Converts PCM16 little-endian bytes into a caller-owned primitive buffer. */
+internal fun pcm16LeToShorts(bytes: ByteArray, destination: ShortArray) {
+    require(bytes.size == destination.size * 2)
+    var byteIndex = 0
+    var sampleIndex = 0
+    while (sampleIndex < destination.size) {
+        val low = bytes[byteIndex].toInt() and 0xff
+        val high = bytes[byteIndex + 1].toInt()
+        destination[sampleIndex] = ((high shl 8) or low).toShort()
+        byteIndex += 2
+        sampleIndex++
+    }
+}
+
+/** Fixed-capacity PCM frame ring used for VOX pre-roll without per-frame allocation. */
+internal class PcmPreRoll(capacity: Int, frameBytes: Int) {
+    private val frames = Array(capacity) { ByteArray(frameBytes) }
+    private var start = 0
+    private var size = 0
+
+    fun push(frame: ByteArray) {
+        require(frame.size == frames[0].size)
+        val destination = if (size < frames.size) {
+            (start + size).mod(frames.size).also { size++ }
+        } else {
+            start.also { start = (start + 1).mod(frames.size) }
+        }
+        frame.copyInto(frames[destination])
+    }
+
+    fun drain(consume: (ByteArray) -> Unit) {
+        repeat(size) { offset -> consume(frames[(start + offset).mod(frames.size)]) }
+        start = 0
+        size = 0
+    }
 }
 
 sealed interface CaptureStartResult {

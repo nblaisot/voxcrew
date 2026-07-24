@@ -1,38 +1,33 @@
 package com.nblaisot.voxcrew.lanlink
 
-import android.content.Context
-import io.mockk.mockk
+import com.nblaisot.voxcrew.connectivity.NetworkSocketBinder
+import com.nblaisot.voxcrew.connectivity.OverlayNetwork
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
+import java.net.DatagramSocket
+import java.net.Socket
 
 class LanBeaconOverlayTest {
 
     @Test
-    fun `overlay host appearing after start is announced and survives a transient dropout`() {
-        var resolved: String? = null
-        val beacon = LanBeacon(
-            context = mockk<Context>(relaxed = true),
-            scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
-            overlayHostResolver = { resolved },
-        )
+    fun `advertised overlay host follows verified connectivity state exactly`() {
+        val beacon = LanBeacon(CoroutineScope(SupervisorJob() + Dispatchers.Unconfined))
 
         // Tailscale not up yet at start: nothing to announce.
         assertNull(beacon.announcedOverlayHostForTest())
 
-        // Overlay comes up later: announced within the next broadcast tick.
-        resolved = "100.64.0.7"
+        beacon.updateOverlayNetwork(OverlayNetwork(7L, "tun1", "100.64.0.7"))
         assertEquals("100.64.0.7", beacon.announcedOverlayHostForTest())
 
-        // Momentary dropout: the node-stable last-known address keeps being announced.
-        resolved = null
-        assertEquals("100.64.0.7", beacon.announcedOverlayHostForTest())
+        // A lost overlay is no longer advertised as if it were live.
+        beacon.updateOverlayNetwork(null)
+        assertNull(beacon.announcedOverlayHostForTest())
 
-        // Address change is picked up live.
-        resolved = "100.64.0.8"
+        beacon.updateOverlayNetwork(OverlayNetwork(8L, "tun2", "100.64.0.8"))
         assertEquals("100.64.0.8", beacon.announcedOverlayHostForTest())
     }
 
@@ -53,5 +48,28 @@ class LanBeaconOverlayTest {
         val decoded = LanBeacon.decodeForTest(bytes)
         requireNotNull(decoded)
         assertEquals("100.64.0.2", decoded.overlayHost)
+    }
+
+    @Test
+    fun `overlay sender is bound to verified VPN network`() {
+        val binder = RecordingBinder()
+        val beacon = LanBeacon(
+            CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            networkSocketBinder = binder,
+        )
+
+        beacon.updateOverlayNetwork(OverlayNetwork(7L, "tun1", "100.64.0.7"))
+
+        assertEquals(listOf(7L), binder.datagramHandles)
+    }
+
+    private class RecordingBinder : NetworkSocketBinder {
+        val datagramHandles = mutableListOf<Long>()
+
+        override fun bindSocket(networkHandle: Long, socket: Socket) = Unit
+
+        override fun bindSocket(networkHandle: Long, socket: DatagramSocket) {
+            datagramHandles += networkHandle
+        }
     }
 }

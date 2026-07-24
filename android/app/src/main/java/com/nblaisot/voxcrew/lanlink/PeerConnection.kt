@@ -1,6 +1,7 @@
 package com.nblaisot.voxcrew.lanlink
 
 import android.util.Log
+import com.nblaisot.voxcrew.connectivity.NetworkSocketBinder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.StateFlow
@@ -15,13 +16,22 @@ class PeerConnection(
     private val scope: CoroutineScope,
     private val localUid: String,
     private val lanServer: LanTcpServer,
+    networkSocketBinder: NetworkSocketBinder,
+    inboundRouteResolver: (java.net.Socket) -> RoutedSocketPath?,
     private val isStillWanted: () -> Boolean,
-    private val overlayPeerProvider: () -> LanPeer? = { null },
-    private val lanPeerProvider: () -> LanPeer? = { null },
+    private val overlayPeerProvider: () -> RoutedPeerTarget? = { null },
+    private val lanPeerProvider: () -> RoutedPeerTarget? = { null },
     private val onOverlayEndpointDead: (String) -> Unit = {},
 ) {
     val peerLink = PeerLink(scope)
-    private val lanTcpClient = LanTcpClient(scope, localUid, peerLink, lanServer)
+    private val lanTcpClient = LanTcpClient(
+        scope,
+        localUid,
+        peerLink,
+        lanServer,
+        networkSocketBinder,
+        inboundRouteResolver,
+    )
 
     val linkState: StateFlow<PeerLink.LinkState> = peerLink.state
     val rttMs: StateFlow<Long?> = peerLink.rttMs
@@ -42,7 +52,10 @@ class PeerConnection(
                 lanDialFailed = true
                 val overlay = overlayPeerProvider()
                 if (overlay != null) {
-                    Log.i(TAG, "LAN dial failed for $peerUid; switching to overlay ${overlay.host}")
+                    Log.i(
+                        TAG,
+                        "LAN dial failed for $peerUid; switching to overlay ${overlay.peer.host}",
+                    )
                     promoteToOverlay(overlay)
                 }
             }
@@ -87,8 +100,8 @@ class PeerConnection(
                         val diedVia = lastConnectedVia
                         lastConnectedVia = null
                         if (diedVia == PathLabels.LOCAL && started) {
-                            val lan = lanPeerProvider()?.takeUnless { it.viaOverlay }
-                            if (LocalLinkDeathPolicy.shouldPromoteOverlay(lan)) {
+                            val lan = lanPeerProvider()
+                            if (LocalLinkDeathPolicy.shouldPromoteOverlay(lan?.peer)) {
                                 lanDialFailed = true
                                 overlayPeerProvider()?.let { promoteToOverlay(it) }
                             } else if (lan != null) {
@@ -103,7 +116,7 @@ class PeerConnection(
         }
     }
 
-    fun updateLanTarget(peer: LanPeer?) {
+    fun updateLanTarget(peer: RoutedPeerTarget?) {
         if (!started) return
         lanTcpClient.setTarget(peer)
     }
@@ -118,16 +131,16 @@ class PeerConnection(
      * A healthy TCP session is never torn down solely because UDP presence went quiet.
      */
     fun applyPathTargets(
-        lanPeer: LanPeer?,
-        overlayPeer: LanPeer?,
+        lanPeer: RoutedPeerTarget?,
+        overlayPeer: RoutedPeerTarget?,
         nowMs: Long = System.currentTimeMillis(),
     ) {
         if (!started) return
-        val lan = lanPeer?.takeUnless { it.viaOverlay }
+        val lan = lanPeer?.takeIf { it.route.path == PeerPath.LAN }
         val connected = peerLink.state.value as? PeerLink.LinkState.Connected
         val sessionHealthy = connected != null && lanTcpClient.hasOpenSession()
         val decision = OverlayFailoverPolicy.decide(
-            lanSighting = lan,
+            lanSighting = lan?.peer,
             hasOverlayEndpoint = overlayPeer != null,
             activeVia = connected?.via,
             sessionHealthy = sessionHealthy,
@@ -165,7 +178,7 @@ class PeerConnection(
      * Switch to overlay without aborting an in-flight dial to the same endpoint every tick.
      * [forceRestart] only when tearing down a non-VPN session to dial overlay.
      */
-    fun promoteToOverlay(overlayPeer: LanPeer) {
+    fun promoteToOverlay(overlayPeer: RoutedPeerTarget) {
         if (!started) return
         // Intent first so handshake label / policy see VPN, then adopt standby if live.
         lanTcpClient.setTarget(overlayPeer, preserveSession = true)
@@ -184,7 +197,7 @@ class PeerConnection(
     }
 
     /** LAN sighting expired — switch to overlay if available; never kill healthy overlay TCP. */
-    fun onLanPeerAbsent(overlayPeer: LanPeer? = null) {
+    fun onLanPeerAbsent(overlayPeer: RoutedPeerTarget? = null) {
         if (!started) return
         applyPathTargets(lanPeer = null, overlayPeer = overlayPeer)
     }
@@ -199,11 +212,17 @@ class PeerConnection(
         peerLink.sendMediaActivity(active)
     }
 
-    /** Connectivity flipped: drop sockets and allow LAN dials again on the new path. */
-    fun onNetworkChanged() {
+    /** Invalidate only sessions attached to exact networks that disappeared or changed IPv4. */
+    fun onNetworksInvalidated(networkHandles: Set<Long>) {
         if (!started) return
-        lanDialFailed = false
-        lanTcpClient.resetForNetworkChange()
+        when (lanTcpClient.onNetworksInvalidated(networkHandles)) {
+            PeerPath.LAN -> {
+                lanDialFailed = true
+                overlayPeerProvider()?.let { promoteToOverlay(it) }
+            }
+            PeerPath.OVERLAY -> lanDialFailed = false
+            null -> Unit
+        }
     }
 
     /** Test/observe: whether LAN dials are currently suppressed in favour of overlay. */

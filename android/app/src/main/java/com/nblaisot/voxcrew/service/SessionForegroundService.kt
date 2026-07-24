@@ -23,6 +23,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
@@ -36,6 +37,7 @@ import kotlinx.coroutines.launch
 class SessionForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var observeJob: Job? = null
+    private var wifiReleaseJob: Job? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var lastStatusLabel: String = "Connexion…"
     private var lastVoxEnabled: Boolean = false
@@ -46,6 +48,7 @@ class SessionForegroundService : Service() {
         when (intent?.action) {
             ACTION_STOP -> {
                 observeJob?.cancel()
+                wifiReleaseJob?.cancel()
                 releaseWifiLock()
                 // "Leave session" must stop the mesh too: without shutdown() the beacon,
                 // TCP server and dial loops keep running unprotected after the FGS dies.
@@ -91,6 +94,7 @@ class SessionForegroundService : Service() {
 
     override fun onDestroy() {
         observeJob?.cancel()
+        wifiReleaseJob?.cancel()
         releaseWifiLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
@@ -110,8 +114,17 @@ class SessionForegroundService : Service() {
                     }
             }
             launch {
-                engine.mediaDemanded.collect { demanded ->
-                    if (demanded) acquireLowLatencyWifiLock() else releaseWifiLock()
+                engine.latencyCritical.collect { critical ->
+                    wifiReleaseJob?.cancel()
+                    wifiReleaseJob = null
+                    if (critical) {
+                        acquireLowLatencyWifiLock()
+                    } else {
+                        wifiReleaseJob = serviceScope.launch {
+                            delay(WIFI_LOCK_RELEASE_TAIL_MS)
+                            releaseWifiLock()
+                        }
+                    }
                 }
             }
         }
@@ -182,6 +195,7 @@ class SessionForegroundService : Service() {
         const val EXTRA_TRANSPORT = "transport"
 
         private const val TAG = "SessionForegroundService"
+        private const val WIFI_LOCK_RELEASE_TAIL_MS = 1_000L
 
         fun start(context: Context, transportLabel: String? = null) {
             val intent = Intent(context, SessionForegroundService::class.java)

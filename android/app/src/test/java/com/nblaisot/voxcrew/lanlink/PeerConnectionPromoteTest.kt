@@ -30,6 +30,8 @@ class PeerConnectionPromoteTest {
         lastSeenMs = System.currentTimeMillis(),
         viaOverlay = false,
     )
+    private val overlayTarget get() = overlay.routed()
+    private val lanTarget get() = lan.routed()
 
     @After
     fun tearDown() {
@@ -43,14 +45,16 @@ class PeerConnectionPromoteTest {
             scope = scope,
             localUid = "local",
             lanServer = server,
+            networkSocketBinder = NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
             isStillWanted = { true },
-            overlayPeerProvider = { overlay },
+            overlayPeerProvider = { overlayTarget },
             lanPeerProvider = { null },
         )
         conn.start()
-        conn.promoteToOverlay(overlay)
-        conn.promoteToOverlay(overlay)
-        conn.promoteToOverlay(overlay)
+        conn.promoteToOverlay(overlayTarget)
+        conn.promoteToOverlay(overlayTarget)
+        conn.promoteToOverlay(overlayTarget)
         conn.stop()
     }
 
@@ -61,16 +65,18 @@ class PeerConnectionPromoteTest {
             scope = scope,
             localUid = "local",
             lanServer = server,
+            networkSocketBinder = NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
             isStillWanted = { true },
-            overlayPeerProvider = { overlay },
-            lanPeerProvider = { lan },
+            overlayPeerProvider = { overlayTarget },
+            lanPeerProvider = { lanTarget },
         )
         conn.start()
-        conn.applyPathTargets(lanPeer = null, overlayPeer = overlay)
+        conn.applyPathTargets(lanPeer = null, overlayPeer = overlayTarget)
         assertFalse(conn.lanDialFailedForTest())
         assertFalse(LocalLinkDeathPolicy.shouldPromoteOverlay(lan))
         assertTrue(LocalLinkDeathPolicy.shouldPromoteOverlay(null))
-        conn.applyPathTargets(lanPeer = lan, overlayPeer = overlay)
+        conn.applyPathTargets(lanPeer = lanTarget, overlayPeer = overlayTarget)
         assertFalse(conn.lanDialFailedForTest())
         conn.stop()
     }

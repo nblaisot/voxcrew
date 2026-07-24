@@ -3,8 +3,8 @@ package com.nblaisot.voxcrew.lanlink
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.TreeMap
 import kotlin.coroutines.CoroutineContext
 
@@ -40,6 +41,7 @@ sealed interface IncomingMediaEvent {
 class PeerLink(
     private val scope: CoroutineScope,
     private val healthDispatcher: CoroutineContext = Dispatchers.IO,
+    private val clockMs: () -> Long = System::currentTimeMillis,
 ) {
     sealed class LinkState {
         data object Idle : LinkState()
@@ -69,6 +71,7 @@ class PeerLink(
     private var currentPeerUid: String? = null
     private var activeTransport: FrameTransport? = null
     private var healthLoopJob: Job? = null
+    private val healthSignal = Channel<Unit>(Channel.CONFLATED)
 
     private val sendBuffer = SendBuffer()
     @Volatile private var outSeq = 0L
@@ -76,9 +79,11 @@ class PeerLink(
     /** Highest sequence the peer has confirmed (Hello resume or Ack). Drives [maybeSendSkip]. */
     @Volatile private var peerAckedSeq = -1L
     private val pendingInbound = TreeMap<Long, LanFrame>()
-    @Volatile private var lastActivityMs = System.currentTimeMillis()
+    @Volatile private var lastActivityMs = clockMs()
     @Volatile private var lastPingSentMs = 0L
     @Volatile private var awaitingPongSinceMs: Long? = null
+    @Volatile private var lastAckSentSeq = -1L
+    @Volatile private var lastAckSentMs = Long.MIN_VALUE
 
     val selectedPeerUid: String? get() = currentPeerUid
 
@@ -87,7 +92,7 @@ class PeerLink(
     /** Age of the oldest frame the peer has not acknowledged yet, 0 if none pending. */
     fun oldestUnackedAgeMs(): Long {
         val oldest = sendBuffer.oldestEnqueuedAtMs() ?: return 0L
-        return System.currentTimeMillis() - oldest
+        return clockMs() - oldest
     }
 
     /**
@@ -109,9 +114,11 @@ class PeerLink(
         lastContiguousInSeq = -1
         peerAckedSeq = -1
         pendingInbound.clear()
-        lastActivityMs = System.currentTimeMillis()
+        lastActivityMs = clockMs()
         awaitingPongSinceMs = null
         lastPingSentMs = 0L
+        lastAckSentSeq = -1L
+        lastAckSentMs = Long.MIN_VALUE
         _backlogMs.value = 0
         _rttMs.value = null
         _state.value = LinkState.Idle
@@ -129,6 +136,8 @@ class PeerLink(
         pendingInbound.clear()
         awaitingPongSinceMs = null
         lastPingSentMs = 0L
+        lastAckSentSeq = -1L
+        lastAckSentMs = Long.MIN_VALUE
         _backlogMs.value = 0
         _rttMs.value = null
         _state.value = LinkState.Idle
@@ -173,9 +182,11 @@ class PeerLink(
             activeTransport?.stop()
         }
         activeTransport = transport
-        lastActivityMs = System.currentTimeMillis()
+        lastActivityMs = clockMs()
         awaitingPongSinceMs = null
-        lastPingSentMs = 0L
+        lastPingSentMs = lastActivityMs - PING_INTERVAL_MS
+        lastAckSentSeq = lastContiguousInSeq
+        lastAckSentMs = lastActivityMs
         peerAckedSeq = peerAnnouncedLastContiguousSeq
         sendBuffer.trimTo(peerAnnouncedLastContiguousSeq)
         expireStaleFrames()
@@ -193,7 +204,7 @@ class PeerLink(
     /** Called by the active transport for every frame it decodes other than its own Hello. */
     fun onFrameReceived(transport: FrameTransport, frame: LanFrame) {
         if (activeTransport !== transport) return
-        lastActivityMs = System.currentTimeMillis()
+        lastActivityMs = clockMs()
         when (frame) {
             is LanFrame.Audio -> acceptSequenced(frame.seq, frame)
             is LanFrame.MediaActivity -> acceptSequenced(frame.seq, frame)
@@ -208,7 +219,7 @@ class PeerLink(
                 // Ignore pongs from other ping sources (e.g. UDP keepalive) or delayed replies.
                 if (frame.timestampMs != lastPingSentMs) return
                 awaitingPongSinceMs = null
-                val rtt = System.currentTimeMillis() - frame.timestampMs
+                val rtt = clockMs() - frame.timestampMs
                 if (rtt in 0..PEER_TIMEOUT_MS) {
                     _rttMs.value = rtt
                 }
@@ -286,7 +297,6 @@ class PeerLink(
 
     private suspend fun runHealthLoop() {
         while (currentCoroutineContext().isActive) {
-            delay(ACK_INTERVAL_MS)
             val transport = activeTransport
             if (transport == null) {
                 // Exit only after re-checking under the monitor: a handshake racing this
@@ -302,13 +312,33 @@ class PeerLink(
                 if (shouldExit) return
                 continue
             }
+            val beforeWait = clockMs()
+            val ackDueAt = if (lastContiguousInSeq > lastAckSentSeq) {
+                maxOf(beforeWait, lastAckSentMs.saturatedPlus(ACK_INTERVAL_MS))
+            } else {
+                Long.MAX_VALUE
+            }
+            val pingDueAt = lastPingSentMs.saturatedPlus(PING_INTERVAL_MS)
+            val livenessDueAt = lastActivityMs.saturatedPlus(PEER_TIMEOUT_MS + 1L)
+            val nextDueAt = minOf(ackDueAt, pingDueAt, livenessDueAt)
+            withTimeoutOrNull((nextDueAt - beforeWait).coerceAtLeast(1L)) {
+                healthSignal.receive()
+            }
+            if (activeTransport !== transport) continue
+
+            val now = clockMs()
             synchronized(this@PeerLink) {
                 expireStaleFrames()
                 maybeSendSkip(transport)
+                if (lastContiguousInSeq > lastAckSentSeq &&
+                    now - lastAckSentMs >= ACK_INTERVAL_MS
+                ) {
+                    lastAckSentSeq = lastContiguousInSeq
+                    lastAckSentMs = now
+                    transport.sendFrame(LanFrame.Ack(lastContiguousInSeq))
+                }
             }
-            transport.sendFrame(LanFrame.Ack(lastContiguousInSeq))
-            val now = System.currentTimeMillis()
-            if (now - lastPingSentMs > PING_INTERVAL_MS) {
+            if (now - lastPingSentMs >= PING_INTERVAL_MS) {
                 lastPingSentMs = now
                 awaitingPongSinceMs = now
                 transport.sendFrame(LanFrame.Ping(now))
@@ -344,8 +374,11 @@ class PeerLink(
     private fun acceptSequenced(seq: Long, frame: LanFrame) {
         if (seq <= lastContiguousInSeq || pendingInbound.containsKey(seq)) return
         if (pendingInbound.size >= MAX_PENDING_INBOUND_FRAMES) return
+        val previousContiguous = lastContiguousInSeq
+        val ackWasPending = previousContiguous > lastAckSentSeq
         pendingInbound[seq] = frame
         drainContiguousLocked()
+        if (!ackWasPending && lastContiguousInSeq > previousContiguous) healthSignal.trySend(Unit)
     }
 
     /**
@@ -355,9 +388,11 @@ class PeerLink(
     @Synchronized
     private fun acceptSkip(untilSeq: Long) {
         if (untilSeq <= lastContiguousInSeq) return
+        val ackWasPending = lastContiguousInSeq > lastAckSentSeq
         lastContiguousInSeq = untilSeq
         pendingInbound.headMap(untilSeq, true).clear()
         drainContiguousLocked()
+        if (!ackWasPending) healthSignal.trySend(Unit)
     }
 
     /**
@@ -401,3 +436,6 @@ class PeerLink(
         private const val MAX_PENDING_INBOUND_FRAMES = 512
     }
 }
+
+private fun Long.saturatedPlus(delta: Long): Long =
+    if (this > Long.MAX_VALUE - delta) Long.MAX_VALUE else this + delta

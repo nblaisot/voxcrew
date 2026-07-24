@@ -1,3 +1,5 @@
+@file:OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+
 package com.nblaisot.voxcrew.lanlink
 
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -316,22 +318,66 @@ class PeerLinkTest {
     @Test
     fun `health loop restarts after a disconnect and reconnect`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
-        val peerLink = PeerLink(this, healthDispatcher = dispatcher)
+        val peerLink = PeerLink(
+            this,
+            healthDispatcher = dispatcher,
+            clockMs = { testScheduler.currentTime },
+        )
         peerLink.resetFor("peer-b")
 
         val transportA = FakeTransport("A")
         peerLink.onHandshakeComplete(transportA, "peer-b", -1)
-        testScheduler.advanceTimeBy(300)
+        testScheduler.advanceTimeBy(1)
         testScheduler.runCurrent()
-        assertTrue(transportA.sent.any { it is LanFrame.Ack })
+        assertTrue(transportA.sent.any { it is LanFrame.Ping })
+        assertFalse(transportA.sent.any { it is LanFrame.Ack })
 
         peerLink.onDisconnected(transportA, "peer-b")
         val transportB = FakeTransport("B")
         peerLink.onHandshakeComplete(transportB, "peer-b", -1)
-        testScheduler.advanceTimeBy(300)
+        testScheduler.advanceTimeBy(1)
         testScheduler.runCurrent()
 
-        assertTrue(transportB.sent.any { it is LanFrame.Ack })
+        assertTrue(transportB.sent.any { it is LanFrame.Ping })
+        peerLink.clear()
+    }
+
+    @Test
+    fun `idle link sends ping heartbeat without periodic ack`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val peerLink = PeerLink(this, dispatcher) { testScheduler.currentTime }
+        peerLink.resetFor("peer-b")
+        val transport = FakeTransport("A")
+        peerLink.onHandshakeComplete(transport, "peer-b", -1)
+
+        testScheduler.advanceTimeBy(4_100)
+        testScheduler.runCurrent()
+
+        assertEquals(3, transport.sent.filterIsInstance<LanFrame.Ping>().size)
+        assertTrue(transport.sent.none { it is LanFrame.Ack })
+        peerLink.clear()
+    }
+
+    @Test
+    fun `incoming media is acknowledged within coalescing interval`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val peerLink = PeerLink(this, dispatcher) { testScheduler.currentTime }
+        peerLink.resetFor("peer-b")
+        val transport = FakeTransport("A")
+        peerLink.onHandshakeComplete(transport, "peer-b", -1)
+        testScheduler.runCurrent()
+
+        peerLink.onFrameReceived(transport, LanFrame.Audio(0, byteArrayOf(1)))
+        testScheduler.advanceTimeBy(249)
+        testScheduler.runCurrent()
+        assertTrue(transport.sent.none { it is LanFrame.Ack })
+        testScheduler.advanceTimeBy(1)
+        testScheduler.runCurrent()
+
+        assertEquals(
+            listOf(0L),
+            transport.sent.filterIsInstance<LanFrame.Ack>().map { it.lastContiguousSeq },
+        )
         peerLink.clear()
     }
 

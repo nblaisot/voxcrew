@@ -1,50 +1,17 @@
 package com.nblaisot.voxcrew.lanlink
 
-import java.net.Inet4Address
-import java.net.NetworkInterface
+import java.net.InetAddress
 
-/**
- * Detects the local Tailscale (or similar overlay) IPv4 address on 100.64.0.0/10.
- * Used as an optional overlay endpoint in LAN beacons for plan-B connectivity.
- */
+/** Address helpers only; local overlay identity comes from NetworkMonitor. */
 object TailscaleInterface {
-    data class OverlayCandidate(val ifaceName: String, val address: String)
-
-    fun localOverlayIpv4(): String? = runCatching {
-        NetworkInterface.getNetworkInterfaces()?.toList()
-            ?.asSequence()
-            ?.filter { it.isUp && !it.isLoopback }
-            ?.flatMap { ni ->
-                ni.inetAddresses.toList().asSequence()
-                    .filterIsInstance<Inet4Address>()
-                    .mapNotNull { addr ->
-                        addr.hostAddress?.let { OverlayCandidate(ni.name, it) }
-                    }
-            }
-            ?.toList()
-            ?.let { selectLocalOverlayIpv4(it) }
-    }.getOrNull()
-
-    /**
-     * Prefer `tun*` (Tailscale) over other 100.x VPNs, then a stable iface/address order
-     * so dual-tun / Zscaler coexistence does not flip the announced overlay IP every call.
-     */
-    fun selectLocalOverlayIpv4(candidates: List<OverlayCandidate>): String? {
-        val ts = candidates.filter { isTailscaleAddress(it.address) }
-        if (ts.isEmpty()) return null
-        val tun = ts.filter { it.ifaceName.startsWith("tun", ignoreCase = true) }
-        val pool = tun.ifEmpty { ts }
-        return pool.minWithOrNull(
-            compareBy<OverlayCandidate> { it.ifaceName.lowercase() }
-                .thenBy { it.address },
-        )?.address
+    /** True for an IPv4 address in RFC 6598 CGNAT space; not proof of Tailscale identity. */
+    fun isCgnatAddress(host: String): Boolean {
+        val bytes = runCatching { InetAddress.getByName(host).address }.getOrNull() ?: return false
+        if (bytes.size != 4) return false
+        return (bytes[0].toInt() and 0xff) == 100 &&
+            (bytes[1].toInt() and 0xff) in 64..127
     }
 
-    fun isTailscaleAddress(host: String): Boolean {
-        val parts = host.split('.')
-        if (parts.size != 4) return false
-        val first = parts[0].toIntOrNull() ?: return false
-        val second = parts[1].toIntOrNull() ?: return false
-        return first == 100 && second in 64..127
-    }
+    @Deprecated("CGNAT membership alone does not identify a Tailscale network")
+    fun isTailscaleAddress(host: String): Boolean = isCgnatAddress(host)
 }
