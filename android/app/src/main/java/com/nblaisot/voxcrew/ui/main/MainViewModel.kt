@@ -28,6 +28,7 @@ import com.nblaisot.voxcrew.demo.DemoRosterPolicy
 import com.nblaisot.voxcrew.lanlink.LanIntercomEngine
 import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.lanlink.PeerMetrics
+import com.nblaisot.voxcrew.relay.RelayOfferPolicy
 import com.nblaisot.voxcrew.roster.CrewMember
 import com.nblaisot.voxcrew.roster.CrewRosterRepository
 import com.nblaisot.voxcrew.service.SessionForegroundService
@@ -59,6 +60,7 @@ data class MainUiState(
     val audioRouteReady: Boolean = false,
     val audioStartAllowed: Boolean = true,
     val permissionPrompt: AudioPermissionIssue? = null,
+    val pendingRelayOffer: RelayOfferPolicy.Offer? = null,
     val audioRouteChoices: List<AudioRouteChoice> = emptyList(),
     val selectedAudioRoute: AudioRouteChoice = deviceAudioRouteChoice(),
     val audioRouteStatus: ManualRouteStatus = ManualRouteStatus.STARTING,
@@ -166,6 +168,11 @@ class MainViewModel(
         }
         viewModelScope.launch {
             lanEngine.statusText.collect { status -> _uiState.update { it.copy(statusMessage = status) } }
+        }
+        viewModelScope.launch {
+            lanEngine.pendingRelayOffer.collect { offer ->
+                _uiState.update { it.copy(pendingRelayOffer = offer) }
+            }
         }
         viewModelScope.launch {
             lanEngine.activeRecipientUids.collect { uids ->
@@ -432,6 +439,14 @@ class MainViewModel(
 
     fun dismissPermissionPrompt() {
         _uiState.update { it.copy(permissionPrompt = null).withPttEnabled() }
+    }
+
+    fun acceptRelayOffer() {
+        lanEngine.acceptPendingRelayOffer()
+    }
+
+    fun dismissRelayOffer() {
+        lanEngine.dismissPendingRelayOffer()
     }
 
     fun retryAudio() {

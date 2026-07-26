@@ -64,6 +64,12 @@ class LanIntercomEngine(
     private val _relayReady = MutableStateFlow(false)
     val relayReady: StateFlow<Boolean> = _relayReady.asStateFlow()
     private var relayReadyWatchJob: Job? = null
+    private val _pendingRelayOffer =
+        MutableStateFlow<com.nblaisot.voxcrew.relay.RelayOfferPolicy.Offer?>(null)
+    val pendingRelayOffer:
+        StateFlow<com.nblaisot.voxcrew.relay.RelayOfferPolicy.Offer?> =
+        _pendingRelayOffer.asStateFlow()
+    private val dismissedRelayOfferPeers = mutableSetOf<String>()
     private val capture = AudioCapture(
         scope = scope,
         telecomSession = this.telecomSession,
@@ -803,12 +809,55 @@ class LanIntercomEngine(
                         ?.let { routePeer(it, connectivitySnapshot) }
                 },
                 relayClientProvider = { relayClient },
+                relayOfferProvider = ::localRelayOfferForLanHello,
+                onRelayOffer = ::considerIncomingRelayOffer,
             )
             startAudioCollection(conn)
             startConnectionFeedback(conn)
             startMetricsWatch(conn)
             conn
         }
+    }
+
+    private fun localRelayOfferForLanHello(): com.nblaisot.voxcrew.relay.RelayConfigLink? {
+        val settings = relaySettingsRepository.current()
+        if (!settings.isConfigured) return null
+        return com.nblaisot.voxcrew.relay.RelayConfigLink(
+            url = settings.url,
+            secret = settings.secret,
+            certSha256 = settings.certSha256,
+        )
+    }
+
+    private fun considerIncomingRelayOffer(
+        peerUid: String,
+        link: com.nblaisot.voxcrew.relay.RelayConfigLink,
+    ) {
+        val displayName = beacon.presence.value.sightings[peerUid]?.displayName
+            ?: peers.value.firstOrNull { it.uid == peerUid }?.displayName
+            ?: peerUid
+        val offer = com.nblaisot.voxcrew.relay.RelayOfferPolicy.decide(
+            localConfigured = relaySettingsRepository.current().isConfigured,
+            incoming = link,
+            peerUid = peerUid,
+            peerDisplayName = displayName,
+            dismissedPeerUids = dismissedRelayOfferPeers,
+            pendingPeerUid = _pendingRelayOffer.value?.peerUid,
+        ) ?: return
+        _pendingRelayOffer.value = offer
+    }
+
+    fun acceptPendingRelayOffer() {
+        val offer = _pendingRelayOffer.value ?: return
+        relaySettingsRepository.applyLink(offer.link, enable = true)
+        dismissedRelayOfferPeers.clear()
+        _pendingRelayOffer.value = null
+    }
+
+    fun dismissPendingRelayOffer() {
+        val offer = _pendingRelayOffer.value ?: return
+        dismissedRelayOfferPeers += offer.peerUid
+        _pendingRelayOffer.value = null
     }
 
     private fun ensureKnownPeer(peerUid: String) {
@@ -1404,6 +1453,8 @@ class LanIntercomEngine(
         _latencyCritical.value = false
         knownCrewUids = emptySet()
         _activeRecipientUids.value = emptySet()
+        _pendingRelayOffer.value = null
+        dismissedRelayOfferPeers.clear()
     }
 
     companion object {

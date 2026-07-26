@@ -23,6 +23,8 @@ class PeerConnection(
     private val overlayPeerProvider: () -> RoutedPeerTarget? = { null },
     private val lanPeerProvider: () -> RoutedPeerTarget? = { null },
     private val relayClientProvider: () -> RelayClient? = { null },
+    relayOfferProvider: () -> com.nblaisot.voxcrew.relay.RelayConfigLink? = { null },
+    onRelayOffer: (peerUid: String, offer: com.nblaisot.voxcrew.relay.RelayConfigLink) -> Unit = { _, _ -> },
 ) {
     val peerLink = PeerLink(scope)
     private val lanTcpClient = LanTcpClient(
@@ -32,7 +34,10 @@ class PeerConnection(
         lanServer,
         networkSocketBinder,
         inboundRouteResolver,
-    )
+        relayOfferProvider = relayOfferProvider,
+    ).also { client ->
+        client.onRelayOffer = onRelayOffer
+    }
 
     val linkState: StateFlow<PeerLink.LinkState> = peerLink.state
     val rttMs: StateFlow<Long?> = peerLink.rttMs

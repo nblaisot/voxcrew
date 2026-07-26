@@ -89,10 +89,19 @@
     <string name="relay_secret_label">Secret d\'équipe</string>
     <string name="relay_cert_label">Empreinte cert SHA-256 (optionnel)</string>
     <string name="relay_save">Enregistrer</string>
+    <string name="relay_saved">Paramètres du relais enregistrés</string>
+    <string name="relay_need_url_secret">URL et secret obligatoires</string>
+    <string name="relay_paste_failed">Impossible de lire ce lien</string>
+    <string name="relay_paste_link_label">Coller le lien d\'invitation</string>
+    <string name="relay_paste_apply">Appliquer le lien collé</string>
     <string name="relay_share">Partager le lien</string>
     <string name="relay_status_connected">Relais connecté</string>
     <string name="relay_status_disconnected">Relais non connecté</string>
     <string name="relay_config_applied">Paramètres du relais enregistrés</string>
+    <string name="relay_offer_title">Relais d\'équipe</string>
+    <string name="relay_offer_body">%1$s a partagé un relais d\'équipe (%2$s). L\'accepter et l\'activer sur cet appareil ?</string>
+    <string name="relay_offer_accept">Accepter</string>
+    <string name="relay_offer_decline">Pas maintenant</string>
 
     <!-- Audio / route banners -->
     <string name="audio_session_unavailable">Session audio Android indisponible</string>

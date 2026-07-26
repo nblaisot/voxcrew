@@ -126,6 +126,22 @@ URL-encode the `wss://` URL. Example:
 voxcrew://relay-config?url=wss%3A%2F%2FYOUR_HOST%3A8443&secret=YOUR_SECRET&certSha256=YOUR_FINGERPRINT
 ```
 
+**WhatsApp / Chrome:** those apps do **not** open custom schemes (`voxcrew://`) as
+tappable links. Share the HTTPS invite instead (same query params):
+
+```
+https://YOUR_HOST:8443/invite?url=wss%3A%2F%2FYOUR_HOST%3A8443&secret=YOUR_SECRET&certSha256=YOUR_FINGERPRINT
+```
+
+The relay serves a landing page with an **Open in VoxCrew** button. Self-signed TLS
+may show a browser warning first — proceed, then tap the button. The in-app Share
+action already prefers this HTTPS form.
+
+**LAN peer share:** if one phone already has relay settings and connects over **Local**
+TCP to a phone with none, the configured side may include the settings on Hello.
+The other phone shows a confirmation dialog before applying (same trust model as
+LAN audio — do not put the secret on UDP beacons).
+
 ---
 
 ## Network / router

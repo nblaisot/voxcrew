@@ -52,6 +52,108 @@ export function decodeBinaryEnvelope(buf) {
   return { peerUid, frame };
 }
 
+/**
+ * HTTPS landing page for WhatsApp / Chrome. Custom schemes (voxcrew://) are not
+ * auto-linked there; https://HOST/invite?... is. The page then opens the app.
+ */
+export function buildInviteHtml({ deepLink, wssUrl, intentLink }) {
+  const safeDeep = escapeHtml(deepLink);
+  const safeIntent = escapeHtml(intentLink || deepLink);
+  const safeWss = escapeHtml(wssUrl || '');
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>VoxCrew relay</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 28rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.4; }
+    a.btn { display: block; text-align: center; background: #e85d04; color: #fff; text-decoration: none;
+            padding: 0.9rem 1rem; border-radius: 0.5rem; font-weight: 600; margin: 1.25rem 0; }
+    code { word-break: break-all; font-size: 0.8rem; }
+    .muted { color: #555; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>VoxCrew crew relay</h1>
+  <p>Tap below to open VoxCrew and apply this relay (install the app first).</p>
+  <a class="btn" id="open" href="${safeIntent}">Open in VoxCrew</a>
+  <p class="muted">If nothing happens: open VoxCrew → Menu → Relay → paste this link:</p>
+  <p><code id="deep">${safeDeep}</code></p>
+  ${safeWss ? `<p class="muted">Relay: <code>${safeWss}</code></p>` : ''}
+  <script>
+    (function () {
+      var deep = ${JSON.stringify(deepLink)};
+      var intent = ${JSON.stringify(intentLink || deepLink)};
+      var a = document.getElementById('open');
+      a.addEventListener('click', function (e) {
+        // Prefer Android intent:// (Chrome); fall back to custom scheme.
+        a.href = intent;
+        setTimeout(function () { window.location.href = deep; }, 800);
+      });
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+export function handleHttpRequest(req, res) {
+  const host = req.headers.host || 'localhost';
+  let parsed;
+  try {
+    parsed = new URL(req.url || '/', `https://${host}`);
+  } catch {
+    res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('bad request\n');
+    return;
+  }
+
+  const path = parsed.pathname.replace(/\/+$/, '') || '/';
+  if (req.method === 'GET' && (path === '/invite' || path === '/relay-config')) {
+    const wssUrl = parsed.searchParams.get('url') || '';
+    const secret = parsed.searchParams.get('secret') || '';
+    const certSha256 = parsed.searchParams.get('certSha256') || '';
+    if (!wssUrl || !secret) {
+      res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Missing url or secret query params.\n');
+      return;
+    }
+    const deep = new URL('voxcrew://relay-config');
+    deep.searchParams.set('url', wssUrl);
+    deep.searchParams.set('secret', secret);
+    if (certSha256) deep.searchParams.set('certSha256', certSha256);
+    const deepLink = deep.toString();
+    // Chrome prefers intent:// with an explicit package over raw custom schemes.
+    const q = deepLink.substring(deepLink.indexOf('?') + 1);
+    const intentLink =
+      `intent://relay-config?${q}#Intent;scheme=voxcrew;package=com.nblaisot.voxcrew;end`;
+    const html = buildInviteHtml({ deepLink, intentLink, wssUrl });
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+    });
+    res.end(html);
+    return;
+  }
+
+  if (req.method === 'GET' && (path === '/' || path === '/health')) {
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('voxcrew-relay\n');
+    return;
+  }
+
+  res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+  res.end('not found\n');
+}
+
 function sendJson(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
@@ -165,17 +267,11 @@ export function createRelayServer({
 
   let server;
   if (allowInsecure) {
-    server = http.createServer((_req, res) => {
-      res.writeHead(200, { 'content-type': 'text/plain' });
-      res.end('voxcrew-relay insecure\n');
-    });
+    server = http.createServer(handleHttpRequest);
   } else {
     const cert = fs.readFileSync(certPath);
     const key = fs.readFileSync(keyPath);
-    server = https.createServer({ cert, key }, (_req, res) => {
-      res.writeHead(200, { 'content-type': 'text/plain' });
-      res.end('voxcrew-relay\n');
-    });
+    server = https.createServer({ cert, key }, handleHttpRequest);
   }
 
   const wss = new WebSocketServer({ server });

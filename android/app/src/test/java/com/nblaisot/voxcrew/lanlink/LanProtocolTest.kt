@@ -30,6 +30,38 @@ class LanProtocolTest {
     }
 
     @Test
+    fun `hello with relay offer round trips`() {
+        val offer = com.nblaisot.voxcrew.relay.RelayConfigLink(
+            url = "wss://mini.example:8443",
+            secret = "crew-secret",
+            certSha256 = "deadbeef",
+        )
+        val frame = LanFrame.Hello("user-a", 3L, offer)
+        assertEquals(frame, roundTrip(frame))
+    }
+
+    @Test
+    fun `hello without offer still decodes when trailing bytes absent`() {
+        val classic = LanFrame.Hello("user-a", -1L, relayOffer = null)
+        val decoded = roundTrip(classic) as LanFrame.Hello
+        assertEquals("user-a", decoded.uid)
+        assertEquals(-1L, decoded.lastContiguousSeq)
+        assertNull(decoded.relayOffer)
+    }
+
+    @Test
+    fun `encodeFrame hello offer round trips for datagram path`() {
+        val offer = com.nblaisot.voxcrew.relay.RelayConfigLink(
+            url = "wss://x",
+            secret = "s",
+            certSha256 = null,
+        )
+        val bytes = LanProtocol.encodeFrame(LanFrame.Hello("u", 0L, offer))
+        val decoded = LanProtocol.decodeFrame(bytes) as LanFrame.Hello
+        assertEquals(offer, decoded.relayOffer)
+    }
+
+    @Test
     fun `audio frame round trips with pcm payload preserved exactly`() {
         val pcm = ByteArray(640) { (it % 256).toByte() }
         val frame = LanFrame.Audio(seq = 7L, payload = pcm)

@@ -4,6 +4,7 @@ import test from 'node:test';
 import { WebSocket } from 'ws';
 import {
   attachClient,
+  buildInviteHtml,
   createRelayServer,
   decodeBinaryEnvelope,
   encodeBinaryEnvelope,
@@ -21,6 +22,15 @@ test('binary envelope round-trips', () => {
   const decoded = decodeBinaryEnvelope(packed);
   assert.equal(decoded.peerUid, 'peer-a');
   assert.deepEqual(Buffer.from(decoded.frame), frame);
+});
+
+test('invite html includes deep link button', () => {
+  const html = buildInviteHtml({
+    deepLink: 'voxcrew://relay-config?url=wss%3A%2F%2Fx&secret=s',
+    wssUrl: 'wss://x',
+  });
+  assert.match(html, /Open in VoxCrew/);
+  assert.match(html, /voxcrew:\/\/relay-config/);
 });
 
 function onceMessage(ws) {
@@ -42,6 +52,11 @@ test('hello rejects bad secret and dial bridges when both registered', async () 
   const addr = await relay.listen();
   const port = typeof addr === 'object' && addr ? addr.port : 0;
   const url = `ws://127.0.0.1:${port}`;
+
+  const inviteRes = await fetch(`http://127.0.0.1:${port}/invite?url=wss://x&secret=s`);
+  assert.equal(inviteRes.status, 200);
+  const inviteHtml = await inviteRes.text();
+  assert.match(inviteHtml, /Open in VoxCrew/);
 
   const bad = new WebSocket(url);
   await new Promise((r) => bad.once('open', r));

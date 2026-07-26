@@ -89,10 +89,19 @@
     <string name="relay_secret_label">Crew secret</string>
     <string name="relay_cert_label">Cert SHA-256 (optional)</string>
     <string name="relay_save">Save</string>
+    <string name="relay_saved">Relay settings saved</string>
+    <string name="relay_need_url_secret">URL and secret are required</string>
+    <string name="relay_paste_failed">Could not parse that link</string>
+    <string name="relay_paste_link_label">Paste invite / deep link</string>
+    <string name="relay_paste_apply">Apply pasted link</string>
     <string name="relay_share">Share invite link</string>
     <string name="relay_status_connected">Relay connected</string>
     <string name="relay_status_disconnected">Relay not connected</string>
     <string name="relay_config_applied">Relay settings saved</string>
+    <string name="relay_offer_title">Crew relay</string>
+    <string name="relay_offer_body">%1$s shared a crew relay (%2$s). Accept and enable it on this device?</string>
+    <string name="relay_offer_accept">Accept</string>
+    <string name="relay_offer_decline">Not now</string>
 
     <!-- Audio / route banners -->
     <string name="audio_session_unavailable">Android audio session unavailable</string>

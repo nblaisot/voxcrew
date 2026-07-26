@@ -34,7 +34,7 @@ fun VoxCrewNavHost(
 
     LaunchedEffect(pendingRelayConfig) {
         val link = pendingRelayConfig ?: return@LaunchedEffect
-        container.relaySettingsRepository.applyLink(link, enable = true)
+        // Settings are already applied in MainActivity; navigate to show them.
         onRelayConfigConsumed()
         if (profileConfigured) {
             navController.navigate(Routes.RELAY)

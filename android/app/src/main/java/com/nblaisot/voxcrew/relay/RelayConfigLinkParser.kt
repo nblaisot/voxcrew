@@ -21,16 +21,25 @@ object RelayConfigLinkParser {
         val schemeSep = withoutFragment.indexOf("://")
         if (schemeSep < 0) return null
         val scheme = withoutFragment.substring(0, schemeSep)
-        if (!scheme.equals(SCHEME, ignoreCase = true)) return null
-        val rest = withoutFragment.substring(schemeSep + 3)
-        val pathAndQuery = rest.substringBefore('?')
-        val host = pathAndQuery.substringBefore('/').lowercase()
-        val path = pathAndQuery.substringAfter('/', missingDelimiterValue = "").trim('/')
-        if (host != HOST && path != HOST && host.isNotEmpty()) {
-            // voxcrew://relay-config?... → host is relay-config
-            return null
+
+        // App deep link, or https invite page query (same params).
+        val isAppDeepLink = scheme.equals(SCHEME, ignoreCase = true)
+        val isHttpsInvite = scheme.equals("https", ignoreCase = true) ||
+            scheme.equals("http", ignoreCase = true)
+        if (!isAppDeepLink && !isHttpsInvite) return null
+
+        if (isAppDeepLink) {
+            val rest = withoutFragment.substring(schemeSep + 3)
+            val pathAndQuery = rest.substringBefore('?')
+            val host = pathAndQuery.substringBefore('/').lowercase()
+            val path = pathAndQuery.substringAfter('/', missingDelimiterValue = "").trim('/')
+            if (host != HOST && path != HOST) return null
+        } else {
+            val rest = withoutFragment.substring(schemeSep + 3)
+            val pathAndQuery = rest.substringBefore('?')
+            val path = pathAndQuery.substringAfter('/', missingDelimiterValue = "").trim('/').lowercase()
+            if (path != "invite" && path != HOST) return null
         }
-        if (host != HOST && path != HOST) return null
 
         val query = withoutFragment.substringAfter('?', missingDelimiterValue = "")
         if (query.isEmpty()) return null
@@ -43,6 +52,51 @@ object RelayConfigLinkParser {
     }
 
     fun build(url: String, secret: String, certSha256: String? = null): String {
+        val parts = queryParts(url, secret, certSha256)
+        return "$SCHEME://$HOST?${parts.joinToString("&")}"
+    }
+
+    /**
+     * WhatsApp / Chrome only auto-link https. Share this; the relay serves a page
+     * that opens [build] (`voxcrew://…`).
+     */
+    fun buildHttpsInvite(url: String, secret: String, certSha256: String? = null): String? {
+        val httpBase = wssToHttpOrigin(url) ?: return null
+        val parts = queryParts(url, secret, certSha256)
+        return "$httpBase/invite?${parts.joinToString("&")}"
+    }
+
+    fun buildShareText(url: String, secret: String, certSha256: String? = null): String {
+        val deep = build(url, secret, certSha256)
+        val https = buildHttpsInvite(url, secret, certSha256)
+        return if (https != null) {
+            "VoxCrew relay invite (open in Chrome, then tap Open in VoxCrew):\n$https\n\n" +
+                "Or paste in VoxCrew → Menu → Relay:\n$deep"
+        } else {
+            "Paste in VoxCrew → Menu → Relay:\n$deep"
+        }
+    }
+
+    private fun wssToHttpOrigin(url: String): String? {
+        val trimmed = url.trim()
+        val origin = when {
+            trimmed.startsWith("wss://", ignoreCase = true) ->
+                "https://" + trimmed.substring(6)
+            trimmed.startsWith("ws://", ignoreCase = true) ->
+                "http://" + trimmed.substring(5)
+            trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+            trimmed.startsWith("http://", ignoreCase = true) -> trimmed
+            else -> return null
+        }
+        // Keep host[:port] only — drop any path on the WSS URL.
+        val afterScheme = origin.substringAfter("://")
+        val hostPort = afterScheme.substringBefore('/').substringBefore('?')
+        if (hostPort.isBlank()) return null
+        val scheme = origin.substringBefore("://")
+        return "$scheme://$hostPort"
+    }
+
+    private fun queryParts(url: String, secret: String, certSha256: String?): List<String> {
         val parts = mutableListOf(
             "url=${encode(url)}",
             "secret=${encode(secret)}",
@@ -50,7 +104,7 @@ object RelayConfigLinkParser {
         if (!certSha256.isNullOrBlank()) {
             parts += "certSha256=${encode(certSha256.lowercase())}"
         }
-        return "$SCHEME://$HOST?${parts.joinToString("&")}"
+        return parts
     }
 
     private fun parseQuery(query: String): Map<String, String> {

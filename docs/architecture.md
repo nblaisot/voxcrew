@@ -40,6 +40,8 @@ Aucun serveur applicatif : la découverte reste sur le LAN / hotspot ; l’audio
 2. **VPN (Tailscale)** — repli de session si l’adresse overlay a été apprise transitoirement dans un beacon LAN (`overlayHost` : jamais persisté dans le roster)
 3. **Cloud (optionnel)** — dial par UUID via un relais TLS WebSocket auto-hébergé (`relay/`, ex. Mac Mini derrière Freebox). Pas de présence/WATCH ; échec = peer absent du Mini. Aucune IP peer stockée côté Mini. **Déploiement multi-OS (agents inclus) :** [`docs/relay-deploy.md`](relay-deploy.md).
 
+Sur un Hello **Local** (TCP LAN), un appareil déjà configuré peut piggybacker URL + secret (+ empreinte) dans des octets optionnels en fin de Hello. Les anciens clients ignorent ces octets. Le pair non configuré affiche une confirmation avant d’appliquer — jamais d’écrasement automatique, jamais sur beacon UDP, jamais sur Hello VPN/Cloud.
+
 Ordre de préférence : Local sain > VPN sain > tentative Cloud > clear. La découverte / NEARBY reste **LAN-only** — s’enregistrer sur le relais ne peint jamais « à proximité ».
 
 Un seul espace de séquence `PeerLink` survit au changement de chemin (make-before-break vers le LAN quand il revient).

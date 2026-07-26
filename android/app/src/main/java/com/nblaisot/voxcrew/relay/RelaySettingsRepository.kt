@@ -39,7 +39,7 @@ class RelaySettingsRepository(context: Context) {
             .putString(KEY_URL, next.url)
             .putString(KEY_SECRET, next.secret)
             .putString(KEY_CERT, next.certSha256)
-            .apply()
+            .commit()
         _settings.value = next
     }
 

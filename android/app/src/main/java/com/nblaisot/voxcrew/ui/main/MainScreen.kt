@@ -195,6 +195,38 @@ fun MainScreen(
         )
     }
 
+    state.pendingRelayOffer?.let { offer ->
+        AlertDialog(
+            onDismissRequest = viewModel::dismissRelayOffer,
+            title = { Text(stringResource(R.string.relay_offer_title)) },
+            text = {
+                Text(
+                    stringResource(
+                        R.string.relay_offer_body,
+                        offer.peerDisplayName,
+                        offer.link.url,
+                    ),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = viewModel::acceptRelayOffer,
+                    modifier = Modifier.testTag("relay_offer_accept"),
+                ) {
+                    Text(stringResource(R.string.relay_offer_accept))
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = viewModel::dismissRelayOffer,
+                    modifier = Modifier.testTag("relay_offer_dismiss"),
+                ) {
+                    Text(stringResource(R.string.relay_offer_decline))
+                }
+            },
+        )
+    }
+
     memberPendingForget?.let { member ->
         AlertDialog(
             onDismissRequest = { memberPendingForget = null },
