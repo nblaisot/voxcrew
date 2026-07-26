@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.platform.LocalConfiguration
@@ -85,6 +86,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -104,6 +107,8 @@ import com.nblaisot.voxcrew.ui.permissions.RequestAppPermissions
 import com.nblaisot.voxcrew.ui.theme.VoxOrangeLight
 import com.nblaisot.voxcrew.ui.theme.VoxPttActive
 import com.nblaisot.voxcrew.ui.theme.VoxPttIdle
+import com.nblaisot.voxcrew.ui.theme.VoxRelayIdle
+import com.nblaisot.voxcrew.ui.theme.VoxRelayReady
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import kotlin.math.roundToInt
@@ -294,6 +299,12 @@ fun MainScreen(
                         )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_relay)) },
+                            trailingIcon = {
+                                RelayStatusDot(
+                                    ready = state.relayReady,
+                                    modifier = Modifier.testTag("menu_relay_status"),
+                                )
+                            },
                             onClick = {
                                 menuExpanded = false
                                 onNavigateToRelay()
@@ -336,6 +347,25 @@ fun MainScreen(
                 actions = {
                     val routeMenuEnabled = state.audioRouteStatus != ManualRouteStatus.STARTING &&
                         state.audioRouteStatus != ManualRouteStatus.REQUESTING
+                    val relayStatusDesc = stringResource(
+                        if (state.relayReady) {
+                            R.string.relay_status_connected
+                        } else {
+                            R.string.relay_status_disconnected
+                        },
+                    )
+                    IconButton(
+                        onClick = onNavigateToRelay,
+                        modifier = Modifier
+                            .testTag("main_relay_status")
+                            .semantics { contentDescription = relayStatusDesc },
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Cloud,
+                            contentDescription = null,
+                            tint = if (state.relayReady) VoxRelayReady else VoxRelayIdle,
+                        )
+                    }
                     IconButton(
                         enabled = routeMenuEnabled,
                         onClick = { audioMenuExpanded = true },
@@ -765,6 +795,23 @@ private fun localizedPathLabel(pathLabel: String): String = when (pathLabel) {
     PathLabels.VPN -> stringResource(R.string.path_vpn)
     PathLabels.CLOUD -> stringResource(R.string.path_cloud)
     else -> pathLabel
+}
+
+@Composable
+private fun RelayStatusDot(
+    ready: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val desc = stringResource(
+        if (ready) R.string.relay_status_connected else R.string.relay_status_disconnected,
+    )
+    Box(
+        modifier = modifier
+            .size(10.dp)
+            .clip(CircleShape)
+            .background(if (ready) VoxRelayReady else VoxRelayIdle)
+            .semantics { contentDescription = desc },
+    )
 }
 
 @Composable

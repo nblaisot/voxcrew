@@ -61,6 +61,7 @@ data class MainUiState(
     val audioStartAllowed: Boolean = true,
     val permissionPrompt: AudioPermissionIssue? = null,
     val pendingRelayOffer: RelayOfferPolicy.Offer? = null,
+    val relayReady: Boolean = false,
     val audioRouteChoices: List<AudioRouteChoice> = emptyList(),
     val selectedAudioRoute: AudioRouteChoice = deviceAudioRouteChoice(),
     val audioRouteStatus: ManualRouteStatus = ManualRouteStatus.STARTING,
@@ -172,6 +173,11 @@ class MainViewModel(
         viewModelScope.launch {
             lanEngine.pendingRelayOffer.collect { offer ->
                 _uiState.update { it.copy(pendingRelayOffer = offer) }
+            }
+        }
+        viewModelScope.launch {
+            lanEngine.relayReady.collect { ready ->
+                _uiState.update { it.copy(relayReady = ready) }
             }
         }
         viewModelScope.launch {
