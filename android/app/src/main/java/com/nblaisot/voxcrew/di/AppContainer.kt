@@ -5,6 +5,7 @@ import com.nblaisot.voxcrew.audio.IntercomTelecomSession
 import com.nblaisot.voxcrew.auth.LocalProfileRepository
 import com.nblaisot.voxcrew.demo.DemoModeStore
 import com.nblaisot.voxcrew.lanlink.LanIntercomEngine
+import com.nblaisot.voxcrew.relay.RelaySettingsRepository
 import com.nblaisot.voxcrew.roster.CrewRosterRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,12 +27,15 @@ class AppContainer(context: Context) {
     val authRepository = LocalProfileRepository(appContext)
     val localProfileRepository: LocalProfileRepository get() = authRepository
 
+    val relaySettingsRepository = RelaySettingsRepository(appContext)
+
     val lanIntercomEngine = LanIntercomEngine(
         context = appContext,
         scope = scope,
         telecomSession = intercomTelecomSession,
         optInRecipients = true,
         overlayFallbackEnabled = true,
+        relaySettingsRepository = relaySettingsRepository,
     )
 
     val rosterRepository = CrewRosterRepository(

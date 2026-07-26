@@ -4,7 +4,7 @@
 
 - **Android** : Kotlin, Jetpack Compose, Material 3, Coroutines, StateFlow.
 - **Audio** : Opus sur sockets TCP natifs (LAN) avec bascule optionnelle Tailscale — jamais de flux audio HTTP, Firestore ou Cloud Storage.
-- **Pas de backend cloud** : pas de Cloud Run, Firebase, signaling serveur ni Terraform dans le produit.
+- **Pas de backend cloud managé** : pas de Cloud Run, Firebase, signaling serveur ni Terraform dans le produit. Un **relais TLS auto-hébergé** optionnel (`relay/`, Mac Mini / Ubuntu / PC) peut servir de 3ᵉ chemin de dial par UUID — la découverte reste LAN-only. **Install / deploy (agents) :** [`docs/relay-deploy.md`](docs/relay-deploy.md) et [`relay/AGENTS.md`](relay/AGENTS.md).
 
 ## Principes produit
 

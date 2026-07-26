@@ -1,0 +1,24 @@
+[Unit]
+Description=VoxCrew optional TLS WebSocket audio relay
+Documentation=https://github.com/nblaisot/voxcrew/blob/main/docs/relay-deploy.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=voxcrew
+Group=voxcrew
+WorkingDirectory=/opt/voxcrew/relay
+EnvironmentFile=-/etc/voxcrew/relay.env
+ExecStart=/usr/bin/node src/server.mjs
+Restart=on-failure
+RestartSec=3
+# Harden a bit (optional; adjust if node needs more)
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Create user once:  sudo useradd --system --home /opt/voxcrew --shell /usr/sbin/nologin voxcrew
+# Fix ownership:     sudo chown -R voxcrew:voxcrew /opt/voxcrew
+
+[Install]
+WantedBy=multi-user.target

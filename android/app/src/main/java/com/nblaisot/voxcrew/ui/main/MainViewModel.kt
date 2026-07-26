@@ -358,7 +358,6 @@ class MainViewModel(
         viewModelScope.launch {
             val user = authRepository.currentUser.value ?: return@launch
             rosterRepository.start(user.uid, user.label)
-            lanEngine.seedOverlayProbeHosts(rosterRepository.cachedOverlayHosts())
             lanEngine.start(user.uid, user.label)
         }
     }

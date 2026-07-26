@@ -1,0 +1,18 @@
+{
+  "name": "voxcrew-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional self-hosted TLS WebSocket audio relay for VoxCrew (LAN → Tailscale → Cloud dial path).",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test test/*.test.mjs",
+    "gen-cert": "bash scripts/gen-self-signed.sh"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

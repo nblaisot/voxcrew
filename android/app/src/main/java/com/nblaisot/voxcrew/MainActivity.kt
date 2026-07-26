@@ -9,18 +9,25 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.nblaisot.voxcrew.di.AppContainer
+import com.nblaisot.voxcrew.relay.RelayConfigLink
+import com.nblaisot.voxcrew.relay.RelayConfigLinkParser
 import com.nblaisot.voxcrew.ui.VoxCrewNavHost
 import com.nblaisot.voxcrew.ui.theme.VoxCrewTheme
 
 class MainActivity : ComponentActivity() {
     private val intercomEngine
         get() = (application as VoxCrewApp).container.lanIntercomEngine
+
+    private var pendingRelayConfig by mutableStateOf<RelayConfigLink?>(null)
 
     @OptIn(ExperimentalComposeUiApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -29,12 +36,15 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         val container = (application as VoxCrewApp).container
         applyAutomationIntent(intent, container)
+        pendingRelayConfig = RelayConfigLinkParser.parse(intent?.data?.toString())
         setContent {
             VoxCrewTheme {
                 Box(Modifier.semantics { testTagsAsResourceId = true }) {
                     VoxCrewNavHost(
                         container = container,
                         onQuitApplication = ::quitApplication,
+                        pendingRelayConfig = pendingRelayConfig,
+                        onRelayConfigConsumed = { pendingRelayConfig = null },
                     )
                 }
             }
@@ -45,6 +55,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         applyAutomationIntent(intent, (application as VoxCrewApp).container)
+        pendingRelayConfig = RelayConfigLinkParser.parse(intent.data?.toString())
     }
 
     /**

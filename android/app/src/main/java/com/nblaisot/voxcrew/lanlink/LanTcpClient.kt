@@ -65,9 +65,6 @@ class LanTcpClient(
     /** Fired after a *real* failed dial to a non-overlay (LAN) target (not intentional cancel). */
     @Volatile var onLanDialFailed: (() -> Unit)? = null
 
-    /** Fired when an overlay endpoint looks dead (ECONNREFUSED or enough consecutive failures). */
-    @Volatile var onOverlayEndpointDead: ((peerUid: String) -> Unit)? = null
-
     fun lastContiguousInSeq(): Long = peerLink.lastContiguousInSeq()
 
     fun hasOpenSession(): Boolean {
@@ -495,8 +492,6 @@ class LanTcpClient(
                 val failedLan = isLanTarget(target)
                 if (failedLan) {
                     onLanDialFailed?.invoke()
-                } else {
-                    maybeInvalidateOverlayEndpoint(target, e, failure.failures)
                 }
                 // Target may have switched to overlay inside the callback.
                 if (failedLan && targetPeer?.let { !isLanTarget(it) } == true) {
@@ -515,18 +510,6 @@ class LanTcpClient(
         return sessionDirection == SessionDirection.INBOUND &&
             route.path == target.route.path &&
             route.networkHandle == target.route.networkHandle
-    }
-
-    private fun maybeInvalidateOverlayEndpoint(
-        target: RoutedPeerTarget,
-        error: IOException,
-        failures: Int,
-    ) {
-        val msg = error.message.orEmpty()
-        val refused = msg.contains("ECONNREFUSED", ignoreCase = true)
-        if (refused || failures >= OVERLAY_INVALIDATE_AFTER_FAILURES) {
-            onOverlayEndpointDead?.invoke(target.peer.uid)
-        }
     }
 
     private suspend fun performHandshakeAndAdopt(
@@ -682,7 +665,6 @@ class LanTcpClient(
 
     private fun onSessionClosed(closedSession: LanTcpSession) {
         var failedTarget: RoutedPeerTarget? = null
-        var failureCount = 0
         val wasCurrent = synchronized(this) {
             if (session !== closedSession) return@synchronized false
             val route = sessionRoute
@@ -694,7 +676,7 @@ class LanTcpClient(
             }
             if (!closedSession.confirmed && target != null) {
                 failedTarget = target
-                failureCount = recordFailureLocked(target).failures
+                recordFailureLocked(target)
             }
             peerLink.onDisconnected(this, closedSession.peerUid)
             ensureDialingLocked()
@@ -715,8 +697,6 @@ class LanTcpClient(
         failedTarget?.let { target ->
             if (isLanTarget(target)) {
                 onLanDialFailed?.invoke()
-            } else if (failureCount >= OVERLAY_INVALIDATE_AFTER_FAILURES) {
-                onOverlayEndpointDead?.invoke(target.peer.uid)
             }
         }
     }
@@ -745,9 +725,6 @@ class LanTcpClient(
         private const val OVERLAY_RETRY_DELAY_MS = 250L
         internal const val MAX_RETRY_DELAY_MS = 30_000L
         private const val MAX_BACKOFF_EXPONENT = 7
-        /** Drop sticky overlay host:port after this many consecutive real dial failures. */
-        internal const val OVERLAY_INVALIDATE_AFTER_FAILURES = 5
-
         private fun logInfo(message: String) {
             runCatching { Log.i(TAG, message) }
         }

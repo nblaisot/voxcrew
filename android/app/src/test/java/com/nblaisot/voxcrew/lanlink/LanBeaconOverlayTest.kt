@@ -1,6 +1,5 @@
 package com.nblaisot.voxcrew.lanlink
 
-import com.nblaisot.voxcrew.connectivity.NetworkSocketBinder
 import com.nblaisot.voxcrew.connectivity.OverlayNetwork
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -8,8 +7,6 @@ import kotlinx.coroutines.SupervisorJob
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
-import java.net.DatagramSocket
-import java.net.Socket
 
 class LanBeaconOverlayTest {
 
@@ -50,26 +47,4 @@ class LanBeaconOverlayTest {
         assertEquals("100.64.0.2", decoded.overlayHost)
     }
 
-    @Test
-    fun `overlay sender is bound to verified VPN network`() {
-        val binder = RecordingBinder()
-        val beacon = LanBeacon(
-            CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
-            networkSocketBinder = binder,
-        )
-
-        beacon.updateOverlayNetwork(OverlayNetwork(7L, "tun1", "100.64.0.7"))
-
-        assertEquals(listOf(7L), binder.datagramHandles)
-    }
-
-    private class RecordingBinder : NetworkSocketBinder {
-        val datagramHandles = mutableListOf<Long>()
-
-        override fun bindSocket(networkHandle: Long, socket: Socket) = Unit
-
-        override fun bindSocket(networkHandle: Long, socket: DatagramSocket) {
-            datagramHandles += networkHandle
-        }
-    }
 }

@@ -12,9 +12,13 @@
 
     <!-- Menu / About -->
     <string name="menu_about">About</string>
+    <string name="menu_relay">Relay</string>
+    <string name="menu_connect_tailscale">Connect Tailscale</string>
     <string name="menu_quit">QUIT</string>
     <string name="menu_change_name">Change name</string>
     <string name="menu_content_description">Menu</string>
+    <string name="tailscale_connection_requested">Tailscale connection requested</string>
+    <string name="tailscale_action_failed">Could not open Tailscale or Google Play</string>
     <string name="about_title">About</string>
     <string name="about_intro">This app uses open-source software.</string>
     <string name="about_back">Back</string>
@@ -74,7 +78,21 @@
     <string name="audio_route_this_device">This device</string>
     <string name="path_local">Local</string>
     <string name="path_vpn">VPN</string>
+    <string name="path_cloud">Cloud</string>
     <string name="another_output">another output</string>
+
+    <!-- Optional self-hosted Mac Mini relay -->
+    <string name="relay_settings_title">Crew relay</string>
+    <string name="relay_settings_intro">Optional Cloud dial path via your Mac Mini. Discovery stays on LAN; Tailscale overlayHost stays session-only. Same URL and secret for the whole crew.</string>
+    <string name="relay_enabled">Enable relay</string>
+    <string name="relay_url_label">Relay URL</string>
+    <string name="relay_secret_label">Crew secret</string>
+    <string name="relay_cert_label">Cert SHA-256 (optional)</string>
+    <string name="relay_save">Save</string>
+    <string name="relay_share">Share invite link</string>
+    <string name="relay_status_connected">Relay connected</string>
+    <string name="relay_status_disconnected">Relay not connected</string>
+    <string name="relay_config_applied">Relay settings saved</string>
 
     <!-- Audio / route banners -->
     <string name="audio_session_unavailable">Android audio session unavailable</string>

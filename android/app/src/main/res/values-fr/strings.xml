@@ -12,9 +12,13 @@
 
     <!-- Menu / About -->
     <string name="menu_about">À propos</string>
+    <string name="menu_relay">Relais</string>
+    <string name="menu_connect_tailscale">Connecter Tailscale</string>
     <string name="menu_quit">QUITTER</string>
     <string name="menu_change_name">Changer de nom</string>
     <string name="menu_content_description">Menu</string>
+    <string name="tailscale_connection_requested">Connexion Tailscale demandée</string>
+    <string name="tailscale_action_failed">Impossible d’ouvrir Tailscale ou Google Play</string>
     <string name="about_title">À propos</string>
     <string name="about_intro">Cette application utilise des logiciels open source.</string>
     <string name="about_back">Retour</string>
@@ -74,7 +78,21 @@
     <string name="audio_route_this_device">Cet appareil</string>
     <string name="path_local">Local</string>
     <string name="path_vpn">VPN</string>
+    <string name="path_cloud">Cloud</string>
     <string name="another_output">une autre sortie</string>
+
+    <!-- Relais Mac Mini optionnel -->
+    <string name="relay_settings_title">Relais d\'équipe</string>
+    <string name="relay_settings_intro">Chemin Cloud optionnel via votre Mac Mini. La découverte reste en LAN ; l\'overlayHost Tailscale reste limité à la session. Même URL et secret pour toute l\'équipe.</string>
+    <string name="relay_enabled">Activer le relais</string>
+    <string name="relay_url_label">URL du relais</string>
+    <string name="relay_secret_label">Secret d\'équipe</string>
+    <string name="relay_cert_label">Empreinte cert SHA-256 (optionnel)</string>
+    <string name="relay_save">Enregistrer</string>
+    <string name="relay_share">Partager le lien</string>
+    <string name="relay_status_connected">Relais connecté</string>
+    <string name="relay_status_disconnected">Relais non connecté</string>
+    <string name="relay_config_applied">Paramètres du relais enregistrés</string>
 
     <!-- Audio / route banners -->
     <string name="audio_session_unavailable">Session audio Android indisponible</string>

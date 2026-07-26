@@ -20,13 +20,16 @@ Capture micro, Bluetooth, LAN réel : tests manuels sur appareil.
 ### Prérequis
 
 - [ ] APK debug installé sur les deux téléphones
-- [ ] Même Wi-Fi ou hotspot partagé (ou Tailscale pour le chemin VPN)
+- [ ] Même Wi-Fi ou hotspot partagé pour la découverte
 - [ ] Permissions micro accordées
 - [ ] Nom de profil configuré sur chaque appareil
 
 ### Roster et LAN
 
 - [ ] Équipiers visibles dans la liste après quelques secondes
+- [ ] Un même UUID ne crée jamais de doublon
+- [ ] Peer hors portée : passage hors ligne après environ 15 s
+- [ ] Retour du peer : la même ligne UUID redevient disponible au prochain beacon
 - [ ] Tap = inclure/muet · double tap = solo · appui long = oublier
 - [ ] Badge chemin **Local** (Wifi) une fois connecté
 
@@ -44,11 +47,13 @@ Capture micro, Bluetooth, LAN réel : tests manuels sur appareil.
 - [ ] USB avec micro : route + icône USB
 - [ ] Refus `RECORD_AUDIO` : message d’autorisation, reprise après accord
 - [ ] Refus `BLUETOOTH_CONNECT` (Android 12+) : message, reprise après accord
+- [ ] Installation propre avec permissions refusées : l’activité reste ouverte, sans crash du foreground service
 
 ### Tailscale (optionnel)
 
-- [ ] Peer hors LAN avec overlay annoncé → chemin **VPN**
+- [ ] Après rencontre LAN, perte du LAN avec overlay annoncé → chemin **VPN** pour la session en cours
 - [ ] Retour LAN → reprise **Local**
+- [ ] Deux démarrages uniquement via Tailscale ne se découvrent pas (limite connue, pas une régression)
 
 ### Foreground service
 

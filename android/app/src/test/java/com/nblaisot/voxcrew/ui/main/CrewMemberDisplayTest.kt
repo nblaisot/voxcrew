@@ -28,6 +28,16 @@ class CrewMemberDisplayTest {
     }
 
     @Test
+    fun connectedCloudShowsCloud() {
+        val result = displayAvailability(
+            rosterAvailability = MemberAvailability.OFFLINE,
+            pathLabel = PathLabels.CLOUD,
+            linkState = PeerLink.LinkState.Connected("peer-b", PathLabels.CLOUD),
+        )
+        assertEquals(MemberAvailability.ONLINE_CLOUD, result)
+    }
+
+    @Test
     fun connectedUnknownPathDefaultsToLocal() {
         val result = displayAvailability(
             rosterAvailability = MemberAvailability.OFFLINE,
