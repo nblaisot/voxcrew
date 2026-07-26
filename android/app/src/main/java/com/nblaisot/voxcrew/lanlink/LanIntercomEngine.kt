@@ -85,6 +85,8 @@ class LanIntercomEngine(
     private val receivingUntilMs = ConcurrentHashMap<String, Long>()
     private val latencyRemotePeers = ConcurrentHashMap.newKeySet<String>()
     private val receivingExpiryLock = Any()
+    /** Session-only peer Tailscale endpoints; cleared when local overlay is gone / shutdown. */
+    private val overlayEndpointCache = OverlayEndpointCache()
 
     private val pttPolicy = PushToTalkTransmissionPolicy()
     private val voxPolicy = VoiceActivatedTransmissionPolicy()
@@ -271,11 +273,20 @@ class LanIntercomEngine(
         localUid = uid
         this.displayName = displayName
 
+        lanServer.start(uid)
+        lanServer.onUnknownInboundPeer = { peerUid -> ensureKnownPeer(peerUid) }
+        beacon.start(uid, displayName, lanServer.localPort)
+
         val relay = RelayClient(
             scope = scope,
             localUid = uid,
-            displayNameProvider = { displayName },
+            displayNameProvider = { this.displayName },
             settingsRepository = relaySettingsRepository,
+            overlayEndpointProvider = {
+                val overlay = connectivitySnapshot.overlayNetwork
+                if (overlay == null || !overlayFallbackEnabled) null
+                else Pair(overlay.ipv4Address, lanServer.localPort)
+            },
         )
         relay.onInboundDial = { peerUid ->
             if (started && peerUid != localUid) {
@@ -283,19 +294,24 @@ class LanIntercomEngine(
                 connections[peerUid]?.acceptCloudInbound()
             }
         }
+        relay.onPeerOverlayHint = { peerUid, host, port ->
+            if (started && peerUid != localUid) {
+                overlayEndpointCache.put(peerUid, host, port)
+                requestPathReconciliation()
+            }
+        }
         relayClient = relay
         relayReadyWatchJob?.cancel()
         relayReadyWatchJob = scope.launch {
             relay.ready.collect { ready ->
                 _relayReady.value = ready
-                if (ready) requestPathReconciliation()
+                if (ready) {
+                    relay.announceOverlay()
+                    requestPathReconciliation()
+                }
             }
         }
         relay.start()
-
-        lanServer.start(uid)
-        lanServer.onUnknownInboundPeer = { peerUid -> ensureKnownPeer(peerUid) }
-        beacon.start(uid, displayName, lanServer.localPort)
 
         val restoreVoxEnabled = prefs.getBoolean(KEY_VOX_ENABLED, false)
         if (restoreVoxEnabled) {
@@ -313,7 +329,12 @@ class LanIntercomEngine(
             }
         }
         lifecycleJobs += scope.launch {
-            beacon.presence.collect { requestPathReconciliation() }
+            beacon.presence.collect { presence ->
+                presence.sightings.values.forEach { peer ->
+                    if (peer.uid != localUid) overlayEndpointCache.harvestFromBeacon(peer)
+                }
+                requestPathReconciliation()
+            }
         }
         lifecycleJobs += scope.launch {
             networkMonitor.connectivity.collect { onConnectivitySnapshot(it) }
@@ -796,8 +817,7 @@ class LanIntercomEngine(
                 isStillWanted = { peerUid in knownCrewUids || peerUid in _activeRecipientUids.value },
                 overlayPeerProvider = {
                     if (overlayFallbackEnabled) {
-                        beacon.presence.value.sightings[peerUid]
-                            ?.let(::transientOverlayPeer)
+                        resolveOverlayDialTarget(peerUid, beacon.presence.value.sightings[peerUid])
                             ?.let { routePeer(it, connectivitySnapshot) }
                     } else {
                         null
@@ -1175,7 +1195,9 @@ class LanIntercomEngine(
         } else {
             emptySet()
         }
-        val relevantUids = sightings.keys + connections.keys + cloudCandidates
+        val rememberedOverlayUids = overlayEndpointCache.uids
+        val relevantUids =
+            sightings.keys + connections.keys + cloudCandidates + rememberedOverlayUids
 
         relevantUids.forEach { uid ->
             if (uid == localUid) return@forEach
@@ -1184,7 +1206,7 @@ class LanIntercomEngine(
                 ?.takeUnless { it.viaOverlay }
                 ?.let { routePeer(it, connectivitySnapshot) }
             val overlay = if (overlayFallbackEnabled) {
-                sighting?.let(::transientOverlayPeer)
+                resolveOverlayDialTarget(uid, sighting)
                     ?.let { routePeer(it, connectivitySnapshot) }
             } else {
                 null
@@ -1192,14 +1214,14 @@ class LanIntercomEngine(
             val wantCloud = cloudReady && uid in cloudCandidates
             val conn = connections[uid]
                 ?: when {
-                    sighting != null || wantCloud -> ensureConnection(uid)
+                    sighting != null || overlay != null || wantCloud -> ensureConnection(uid)
                     else -> return@forEach
                 }
             if (lan != null || overlay != null || wantCloud) {
                 conn.start()
             }
             conn.applyPathTargets(lan, overlay, nowMs, cloudAvailable = wantCloud)
-            val keepWithoutSighting = wantCloud ||
+            val keepWithoutSighting = wantCloud || overlay != null ||
                 conn.linkState.value is PeerLink.LinkState.Connected
             if (sighting == null && !keepWithoutSighting) {
                 removeConnection(uid)
@@ -1207,10 +1229,17 @@ class LanIntercomEngine(
         }
     }
 
-    private fun transientOverlayPeer(peer: LanPeer): LanPeer? {
-        if (peer.viaOverlay) return peer.copy(overlayHost = peer.overlayHost ?: peer.host)
-        val overlayHost = peer.overlayHost?.takeIf { it.isNotBlank() } ?: return null
-        return peer.copy(host = overlayHost, overlayHost = overlayHost, viaOverlay = true)
+    private fun resolveOverlayDialTarget(uid: String, sighting: LanPeer?): LanPeer? {
+        val displayName = sighting?.displayName
+            ?: peers.value.firstOrNull { it.uid == uid }?.displayName
+            ?: uid
+        return overlayDialTarget(
+            uid = uid,
+            displayName = displayName,
+            sighting = sighting,
+            cached = overlayEndpointCache.get(uid),
+            overlayNetworkPresent = connectivitySnapshot.overlayNetwork != null,
+        )
     }
 
     private fun onConnectivitySnapshot(next: ConnectivitySnapshot) {
@@ -1224,15 +1253,26 @@ class LanIntercomEngine(
 
         beacon.updateOverlayNetwork(if (overlayFallbackEnabled) next.overlayNetwork else null)
         if (invalidation.lanHandles.isNotEmpty()) {
+            // Keep Tailscale 100.x before Wi‑Fi sightings are dropped.
+            beacon.presence.value.sightings.values.forEach { peer ->
+                if (peer.uid != localUid) overlayEndpointCache.harvestFromBeacon(peer)
+            }
             beacon.removeInvalidSightings { peer ->
                 peer.viaOverlay || routePeer(peer, next) != null
             }
         }
-        if (invalidation.overlayHandles.isNotEmpty()) beacon.clearOverlayEndpoints()
+        // Clear peer overlay cache only when local Tailscale is gone — not on tun replace.
+        if (previous.overlayNetwork != null && next.overlayNetwork == null) {
+            beacon.clearOverlayEndpoints()
+            overlayEndpointCache.clear()
+        }
         if (invalidatedHandles.isNotEmpty()) {
             connections.values.forEach { it.onNetworksInvalidated(invalidatedHandles) }
         }
         if (previous.lanNetworks != next.lanNetworks) beacon.requestAnnouncement()
+        if (next.overlayNetwork != null && next.overlayNetwork != previous.overlayNetwork) {
+            relayClient?.announceOverlay()
+        }
         requestPathReconciliation()
     }
 
@@ -1442,6 +1482,7 @@ class LanIntercomEngine(
         lanServer.stop()
         networkMonitor.stop()
         connectivitySnapshot = ConnectivitySnapshot()
+        overlayEndpointCache.clear()
         while (pathReconciliationSignal.tryReceive().isSuccess) Unit
 
         receivingUntilMs.clear()

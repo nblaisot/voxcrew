@@ -8,6 +8,7 @@ import {
   createRelayServer,
   decodeBinaryEnvelope,
   encodeBinaryEnvelope,
+  parseOverlayEndpoint,
   timingSafeEqualString,
 } from '../src/server.mjs';
 
@@ -71,8 +72,22 @@ test('hello rejects bad secret and dial bridges when both registered', async () 
     new Promise((r) => a.once('open', r)),
     new Promise((r) => b.once('open', r)),
   ]);
-  a.send(JSON.stringify({ type: 'hello', uid: 'uid-a', displayName: 'A', secret: 'test-secret' }));
-  b.send(JSON.stringify({ type: 'hello', uid: 'uid-b', displayName: 'B', secret: 'test-secret' }));
+  a.send(JSON.stringify({
+    type: 'hello',
+    uid: 'uid-a',
+    displayName: 'A',
+    secret: 'test-secret',
+    overlayHost: '100.64.0.1',
+    tcpPort: 47101,
+  }));
+  b.send(JSON.stringify({
+    type: 'hello',
+    uid: 'uid-b',
+    displayName: 'B',
+    secret: 'test-secret',
+    overlayHost: '100.64.0.2',
+    tcpPort: 47101,
+  }));
   assert.equal(JSON.parse(String((await onceMessage(a)).data)).type, 'hello_ok');
   assert.equal(JSON.parse(String((await onceMessage(b)).data)).type, 'hello_ok');
 
@@ -86,8 +101,24 @@ test('hello rejects bad secret and dial bridges when both registered', async () 
   const okB = JSON.parse(String((await bWait).data));
   assert.equal(okA.type, 'dial_ok');
   assert.equal(okA.peerUid, 'uid-b');
+  assert.equal(okA.peerOverlayHost, '100.64.0.2');
+  assert.equal(okA.peerTcpPort, 47101);
   assert.equal(okB.type, 'dial_ok');
   assert.equal(okB.peerUid, 'uid-a');
+  assert.equal(okB.peerOverlayHost, '100.64.0.1');
+  assert.equal(okB.peerTcpPort, 47101);
+
+  const peerOverlayWait = onceMessage(b);
+  a.send(JSON.stringify({
+    type: 'overlay_announce',
+    overlayHost: '100.64.0.9',
+    tcpPort: 47101,
+  }));
+  const peerOverlay = JSON.parse(String((await peerOverlayWait).data));
+  assert.equal(peerOverlay.type, 'peer_overlay');
+  assert.equal(peerOverlay.peerUid, 'uid-a');
+  assert.equal(peerOverlay.overlayHost, '100.64.0.9');
+  assert.equal(peerOverlay.tcpPort, 47101);
 
   const frame = Buffer.from([7, 8, 9]);
   const bFrame = onceMessage(b);
@@ -101,6 +132,14 @@ test('hello rejects bad secret and dial bridges when both registered', async () 
   a.close();
   b.close();
   await relay.close();
+});
+
+test('parseOverlayEndpoint rejects invalid ports', () => {
+  assert.equal(parseOverlayEndpoint({ overlayHost: '100.1.1.1', tcpPort: 0 }), null);
+  assert.deepEqual(
+    parseOverlayEndpoint({ overlayHost: '100.1.1.1', tcpPort: 47101 }),
+    { overlayHost: '100.1.1.1', tcpPort: 47101 },
+  );
 });
 
 // silence unused import in case tree-shaking complains in editors

@@ -8,7 +8,7 @@
 ## Réseau
 
 - Audio Opus en clair sur le LAN / Tailscale (réseau de confiance entre équipiers).
-- Relais Cloud optionnel (`relay/`) : TLS + secret d’équipe partagé ; pas d’IP peer stockée sur le Mini. Déploiement : [`docs/relay-deploy.md`](relay-deploy.md).
+- Relais Cloud optionnel (`relay/`) : TLS + secret d’équipe partagé ; pas d’IP peer **persistée** sur le Mini (hints Tailscale `100.x` uniquement en RAM pendant le WSS). Déploiement : [`docs/relay-deploy.md`](relay-deploy.md).
 - Pas d’upload audio vers un serveur VoxCrew managé.
 - Cleartext HTTP désactivé en release (`usesCleartextTraffic=false`).
 

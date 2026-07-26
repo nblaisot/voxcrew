@@ -35,18 +35,24 @@ import javax.net.ssl.X509TrustManager
 
 /**
  * Device-wide WSS to the optional Mac Mini relay. Per-peer audio rides on
- * [RelayFrameTransport] after a UUID dial bridge (no peer IPs on the Mini).
+ * [RelayFrameTransport] after a UUID dial bridge.
+ *
+ * Also carries ephemeral Tailscale endpoint gossip (own `100.x:port`) so peers can
+ * upgrade Cloud → direct VPN without roster persistence.
  */
 class RelayClient(
     private val scope: CoroutineScope,
     private val localUid: String,
     private val displayNameProvider: () -> String,
     private val settingsRepository: RelaySettingsRepository,
+    private val overlayEndpointProvider: () -> Pair<String, Int>? = { null },
 ) {
     private val _ready = MutableStateFlow(false)
     val ready: StateFlow<Boolean> = _ready.asStateFlow()
 
     private var webSocket: WebSocket? = null
+    /** Bumped on every [reconnect]/[stop] so stale socket callbacks cannot tear down a newer session. */
+    private var socketGeneration = 0
     private var reconnectJob: Job? = null
     private var settingsWatchJob: Job? = null
     private val sessions = ConcurrentHashMap<String, RelayFrameTransport>()
@@ -59,10 +65,19 @@ class RelayClient(
     /** Fired when a binary frame arrives for a peer we have not attached yet. */
     @Volatile var onUnattachedFrame: ((peerUid: String, frame: LanFrame) -> Unit)? = null
 
+    /** Ephemeral Tailscale dial hint for [peerUid] (session only). */
+    @Volatile var onPeerOverlayHint: ((peerUid: String, host: String, port: Int) -> Unit)? = null
+
     fun start() {
         if (settingsWatchJob?.isActive == true) return
         settingsWatchJob = scope.launch {
-            settingsRepository.settings.collect { reconnect() }
+            var lastConnectKey: String? = null
+            settingsRepository.settings.collect { settings ->
+                val key = connectKey(settings)
+                if (key == lastConnectKey) return@collect
+                lastConnectKey = key
+                reconnect()
+            }
         }
     }
 
@@ -73,6 +88,7 @@ class RelayClient(
         reconnectJob = null
         sessions.values.forEach { it.detach() }
         sessions.clear()
+        socketGeneration += 1
         webSocket?.close(1000, "stop")
         webSocket = null
         _ready.value = false
@@ -85,6 +101,20 @@ class RelayClient(
 
     fun closeSession(peerUid: String) {
         sessions.remove(peerUid)?.detach()
+    }
+
+    /** Publish local Tailscale endpoint to the Mini (and bridged peers). No-op if unavailable. */
+    fun announceOverlay() {
+        if (!_ready.value) return
+        val endpoint = overlayEndpointProvider() ?: return
+        val (host, port) = endpoint
+        if (host.isBlank() || port !in 1..65_535) return
+        sendControl(
+            JSONObject()
+                .put("type", "overlay_announce")
+                .put("overlayHost", host)
+                .put("tcpPort", port),
+        )
     }
 
     /**
@@ -114,6 +144,9 @@ class RelayClient(
     }
 
     private suspend fun reconnect() = mutex.withLock {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        val generation = ++socketGeneration
         webSocket?.close(1000, "reconfig")
         webSocket = null
         _ready.value = false
@@ -124,38 +157,59 @@ class RelayClient(
         val request = Request.Builder().url(settings.url).build()
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (generation != socketGeneration) return
                 maybeStoreCert(settings, response)
-                val hello = JSONObject()
-                    .put("type", "hello")
-                    .put("uid", localUid)
-                    .put("displayName", displayNameProvider())
-                    .put("secret", settings.secret)
-                webSocket.send(hello.toString())
+                webSocket.send(buildHello().toString())
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (generation != socketGeneration) return
                 handleControl(text)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (generation != socketGeneration) return
                 handleBinary(bytes.toByteArray())
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                webSocket.close(code, reason)
+                // Never echo reserved codes (1005/1006/…) — OkHttp throws and looks like a failure.
+                val reply = if (code in 1000..1014 && code != 1004 && code != 1005 && code != 1006) {
+                    code
+                } else {
+                    1000
+                }
+                webSocket.close(reply, reason.take(123))
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (generation != socketGeneration) return
                 _ready.value = false
-                scheduleReconnect()
+                scheduleReconnect(generation)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (generation != socketGeneration) return
                 Log.w(TAG, "relay failure: ${t.message}")
                 _ready.value = false
-                scheduleReconnect()
+                scheduleReconnect(generation)
             }
         })
+    }
+
+    private fun buildHello(): JSONObject {
+        val hello = JSONObject()
+            .put("type", "hello")
+            .put("uid", localUid)
+            .put("displayName", displayNameProvider())
+            .put("secret", settingsRepository.current().secret)
+        overlayEndpointProvider()?.let { (host, port) ->
+            if (host.isNotBlank() && port in 1..65_535) {
+                hello.put("overlayHost", host)
+                hello.put("tcpPort", port)
+            }
+        }
+        return hello
     }
 
     private fun handleControl(text: String) {
@@ -164,6 +218,7 @@ class RelayClient(
             "hello_ok" -> {
                 _ready.value = true
                 Log.i(TAG, "relay hello_ok")
+                announceOverlay()
             }
             "hello_reject" -> {
                 _ready.value = false
@@ -172,17 +227,35 @@ class RelayClient(
             "dial_ok" -> {
                 val peerUid = msg.optString("peerUid")
                 dialWaiters[peerUid]?.complete(true)
+                emitOverlayHint(
+                    peerUid = peerUid,
+                    host = msg.optString("peerOverlayHost"),
+                    port = msg.optInt("peerTcpPort", -1),
+                )
                 if (peerUid.isNotBlank() && peerUid != localUid) {
                     transportFor(peerUid)
                     onInboundDial?.invoke(peerUid)
                 }
             }
             "dial_fail" -> dialWaiters[msg.optString("peerUid")]?.complete(false)
+            "peer_overlay" -> {
+                emitOverlayHint(
+                    peerUid = msg.optString("peerUid"),
+                    host = msg.optString("overlayHost"),
+                    port = msg.optInt("tcpPort", -1),
+                )
+            }
             "peer_gone" -> {
                 val peerUid = msg.optString("peerUid")
                 sessions[peerUid]?.onPeerGone()
             }
         }
+    }
+
+    private fun emitOverlayHint(peerUid: String, host: String, port: Int) {
+        if (peerUid.isBlank() || peerUid == localUid) return
+        if (host.isBlank() || port !in 1..65_535) return
+        onPeerOverlayHint?.invoke(peerUid, host, port)
     }
 
     private fun handleBinary(bytes: ByteArray) {
@@ -196,11 +269,13 @@ class RelayClient(
         }
     }
 
-    private fun scheduleReconnect() {
+    private fun scheduleReconnect(generation: Int) {
+        if (generation != socketGeneration) return
         if (reconnectJob?.isActive == true) return
         reconnectJob = scope.launch {
             delay(RECONNECT_MS)
-            if (isActive) reconnect()
+            if (!isActive || generation != socketGeneration) return@launch
+            reconnect()
         }
     }
 
@@ -244,6 +319,10 @@ class RelayClient(
         private const val TAG = "RelayClient"
         private const val RECONNECT_MS = 3_000L
         private const val DIAL_TIMEOUT_MS = 5_000L
+
+        /** Settings that require opening a new socket (ignore TOFU cert-only updates). */
+        private fun connectKey(settings: RelaySettings): String =
+            "${settings.enabled}|${settings.url}|${settings.secret}"
 
         fun sha256Hex(bytes: ByteArray): String {
             val digest = MessageDigest.getInstance("SHA-256").digest(bytes)

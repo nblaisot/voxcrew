@@ -37,12 +37,12 @@ Aucun serveur applicatif : la découverte reste sur le LAN / hotspot ; l’audio
 ## Chemin audio
 
 1. **Local** — beacon UDP + TCP Opus sur le même réseau (ou hotspot)
-2. **VPN (Tailscale)** — repli de session si l’adresse overlay a été apprise transitoirement dans un beacon LAN (`overlayHost` : jamais persisté dans le roster)
-3. **Cloud (optionnel)** — dial par UUID via un relais TLS WebSocket auto-hébergé (`relay/`, ex. Mac Mini derrière Freebox). Pas de présence/WATCH ; échec = peer absent du Mini. Aucune IP peer stockée côté Mini. **Déploiement multi-OS (agents inclus) :** [`docs/relay-deploy.md`](relay-deploy.md).
+2. **VPN (Tailscale)** — TCP Opus lié au `Network` Tailscale vérifié. L’adresse peer `100.x` est apprise (1) via le champ `overlayHost` des beacons LAN, et/ou (2) via des *hints* éphémères sur le relais Cloud (`hello` / `overlay_announce` / `dial_ok` / `peer_overlay`) quand les deux appareils ont déjà un WSS authentifié. Cache **session-only** en RAM (`OverlayEndpointCache`) — jamais dans le roster / SharedPreferences. Quand le VPN local disparaît, le cache est vidé.
+3. **Cloud (optionnel)** — dial par UUID via un relais TLS WebSocket auto-hébergé (`relay/`, ex. Mac Mini derrière Freebox). Pas de présence/WATCH ; échec = peer absent du Mini. Aucune IP peer **persistée** côté Mini (hints overlay uniquement en RAM pendant le socket). **Déploiement multi-OS (agents inclus) :** [`docs/relay-deploy.md`](relay-deploy.md).
 
 Sur un Hello **Local** (TCP LAN), un appareil déjà configuré peut piggybacker URL + secret (+ empreinte) dans des octets optionnels en fin de Hello. Les anciens clients ignorent ces octets. Le pair non configuré affiche une confirmation avant d’appliquer — jamais d’écrasement automatique, jamais sur beacon UDP, jamais sur Hello VPN/Cloud.
 
-Ordre de préférence : Local sain > VPN sain > tentative Cloud > clear. La découverte / NEARBY reste **LAN-only** — s’enregistrer sur le relais ne peint jamais « à proximité ».
+Ordre de préférence : Local sain > VPN sain > tentative Cloud > clear. Un Cloud sain cède la place au VPN dès qu’un endpoint overlay session devient connu (make-before-break). La découverte / NEARBY reste **LAN-only** — s’enregistrer sur le relais ne peint jamais « à proximité ».
 
 Un seul espace de séquence `PeerLink` survit au changement de chemin (make-before-break vers le LAN quand il revient).
 
@@ -60,11 +60,12 @@ Invariant : l'audio est retardé jusqu'à 30 s, puis abandonné **proprement** �
 |------|------|
 | Présence UUID | Un enregistrement transitoire par UUID, remplacé par chaque beacon LAN |
 | Roster connu | UUID + dernier nom uniquement ; aucune donnée réseau persistée |
+| Overlay session | `100.x:port` en RAM pour la session (beacon + gossip relais) |
 | Session TCP | Lien audio ; santé = activité de frames (ACK/média). Ping = RTT seulement |
 
 `LanBeacon` annonce immédiatement puis toutes les 3 s. Un beacon d’un UUID connu met à jour le même enregistrement (nom, adresse source, port et éventuelle adresse Tailscale) ; un UUID nouveau ajoute une ligne. Il n’existe ni état « re-discovery », ni réponse directe, ni cadence adaptative. Après 15 s sans beacon, l’enregistrement transitoire expire, sauf si une session TCP saine maintient le peer en ligne. Le roster conserve alors seulement UUID + dernier nom avec l’état hors ligne.
 
-Le broadcast UDP n’est pas routé par Tailscale. Deux appareils qui démarrent hors du même LAN ne peuvent donc pas se découvrir sans futur mécanisme de pairing ou annuaire. L’adresse `100.x` éventuellement annoncée sur le LAN reste strictement en mémoire et peut servir de repli TCP dans la session en cours ; elle n’est jamais sondée ni restaurée au prochain démarrage.
+Le broadcast UDP n’est pas routé par Tailscale. Deux appareils hors LAN s’appuient sur le relais Cloud pour échanger des hints overlay (événementiel : montée Tailscale / hello / dial) — pas de sondage périodique, pas de MagicDNS. L’adresse `100.x` n’est jamais restaurée au prochain démarrage d’app.
 
 Dial sortant : `TCP_NODELAY` partout, backoff exponentiel plafonné à 30 s (remis à zéro seulement si l’identité host/port/route change, une action utilisateur, ou un succès — pas à chaque beacon). Les deux pairs peuvent dialer ; en cas de double Hello simultané, l’ordre stable des UUID désigne la direction conservée aux deux extrémités. Le listen TCP utilise le port fixe **47101** (UDP discovery : **47100**) ; en cas d’échec de bind, repli sur un port éphémère.
 

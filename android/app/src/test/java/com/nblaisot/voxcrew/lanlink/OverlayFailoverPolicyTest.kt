@@ -133,6 +133,18 @@ class OverlayFailoverPolicyTest {
     }
 
     @Test
+    fun `decide promotes healthy cloud to overlay when endpoint appears`() {
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = null,
+            hasOverlayEndpoint = true,
+            activeVia = PathLabels.CLOUD,
+            sessionHealthy = true,
+            hasCloudEndpoint = true,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_OVERLAY, decision.action)
+    }
+
+    @Test
     fun `decide uses cloud after LAN dial failed when no overlay`() {
         val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
         val decision = OverlayFailoverPolicy.decide(

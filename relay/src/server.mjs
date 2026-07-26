@@ -1,8 +1,10 @@
 /**
  * Minimal TLS WebSocket relay for VoxCrew.
  *
- * Protocol (plan): hello / dial / opaque LanFrame binary — no presence/WATCH.
- * Identity on the Mini is the peer UUID; no LAN/Tailscale IPs are stored.
+ * Protocol: hello / dial / overlay_announce / opaque LanFrame binary — no presence/WATCH.
+ * Identity on the Mini is the peer UUID. Peer Tailscale IPs are never written to disk;
+ * optional overlayHost/tcpPort may exist only in RAM for the live WebSocket session so
+ * clients can upgrade Cloud → direct VPN.
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -16,7 +18,16 @@ const CERT_PATH = process.env.RELAY_CERT || new URL('../certs/cert.pem', import.
 const KEY_PATH = process.env.RELAY_KEY || new URL('../certs/key.pem', import.meta.url).pathname;
 const ALLOW_INSECURE = process.env.RELAY_ALLOW_INSECURE === '1';
 
-/** @typedef {{ uid: string, displayName: string, ws: import('ws').WebSocket, bridges: Set<string> }} Client */
+/**
+ * @typedef {{
+ *   uid: string,
+ *   displayName: string,
+ *   ws: import('ws').WebSocket,
+ *   bridges: Set<string>,
+ *   overlayHost?: string,
+ *   tcpPort?: number,
+ * }} Client
+ */
 
 /** @type {Map<string, Client>} */
 const clients = new Map();
@@ -158,6 +169,48 @@ function sendJson(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
+/** @param {unknown} msg */
+export function parseOverlayEndpoint(msg) {
+  if (!msg || typeof msg !== 'object') return null;
+  const host = String(msg.overlayHost || '').trim();
+  const port = Number(msg.tcpPort);
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { overlayHost: host, tcpPort: port };
+}
+
+function dialOkPayload(peerUid, peer) {
+  /** @type {Record<string, unknown>} */
+  const payload = { type: 'dial_ok', peerUid };
+  if (peer?.overlayHost && peer?.tcpPort) {
+    payload.peerOverlayHost = peer.overlayHost;
+    payload.peerTcpPort = peer.tcpPort;
+  }
+  return payload;
+}
+
+function applyOverlay(client, endpoint) {
+  if (!endpoint) return false;
+  const changed =
+    client.overlayHost !== endpoint.overlayHost || client.tcpPort !== endpoint.tcpPort;
+  client.overlayHost = endpoint.overlayHost;
+  client.tcpPort = endpoint.tcpPort;
+  return changed;
+}
+
+function notifyBridgedPeersOfOverlay(client) {
+  if (!client.overlayHost || !client.tcpPort) return;
+  for (const peerUid of client.bridges) {
+    const peer = clients.get(peerUid);
+    if (!peer) continue;
+    sendJson(peer.ws, {
+      type: 'peer_overlay',
+      peerUid: client.uid,
+      overlayHost: client.overlayHost,
+      tcpPort: client.tcpPort,
+    });
+  }
+}
+
 function unregister(client) {
   if (!client?.uid) return;
   if (clients.get(client.uid) === client) {
@@ -213,13 +266,14 @@ export function attachClient(ws, expectedSecret) {
       const previous = clients.get(uid);
       if (previous && previous.ws !== ws) {
         try {
-          previous.ws.close();
+          previous.ws.close(1000, 'replaced');
         } catch {
           /* ignore */
         }
         unregister(previous);
       }
       client = { uid, displayName, ws, bridges: new Set() };
+      applyOverlay(client, parseOverlayEndpoint(msg));
       clients.set(uid, client);
       sendJson(ws, { type: 'hello_ok', uid });
       return;
@@ -227,6 +281,13 @@ export function attachClient(ws, expectedSecret) {
 
     if (!client) {
       sendJson(ws, { type: 'hello_reject', reason: 'hello_required' });
+      return;
+    }
+
+    if (msg.type === 'overlay_announce') {
+      if (applyOverlay(client, parseOverlayEndpoint(msg))) {
+        notifyBridgedPeersOfOverlay(client);
+      }
       return;
     }
 
@@ -243,9 +304,9 @@ export function attachClient(ws, expectedSecret) {
       }
       client.bridges.add(peerUid);
       peer.bridges.add(client.uid);
-      sendJson(ws, { type: 'dial_ok', peerUid });
+      sendJson(ws, dialOkPayload(peerUid, peer));
       // Peer learns we want a bridge so both sides can exchange Hello.
-      sendJson(peer.ws, { type: 'dial_ok', peerUid: client.uid });
+      sendJson(peer.ws, dialOkPayload(client.uid, client));
       return;
     }
   });
