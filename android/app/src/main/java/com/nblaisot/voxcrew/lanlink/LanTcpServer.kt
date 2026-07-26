@@ -109,8 +109,19 @@ class LanTcpServer(
                 return
             }
             // The dialer blocks on our Hello reply; both adoption paths must send it.
-            LanProtocol.writeFrame(out, LanFrame.Hello(localUid, client.lastContiguousInSeq()))
-            client.adoptInboundSession(peerUid, socket, out, input, hello.lastContiguousSeq)
+            val replyOffer = client.relayOfferIfLanInbound(socket)
+            LanProtocol.writeFrame(
+                out,
+                LanFrame.Hello(localUid, client.lastContiguousInSeq(), replyOffer),
+            )
+            client.adoptInboundSession(
+                peerUid,
+                socket,
+                out,
+                input,
+                hello.lastContiguousSeq,
+                incomingRelayOffer = hello.relayOffer,
+            )
         } catch (e: IOException) {
             runCatching { socket.close() }
             Log.d(TAG, "accept handling failed: ${e.message}")

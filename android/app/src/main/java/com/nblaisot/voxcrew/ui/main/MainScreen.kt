@@ -34,6 +34,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Headset
@@ -55,6 +56,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
@@ -69,6 +72,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -86,6 +90,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.nblaisot.voxcrew.R
+import com.nblaisot.voxcrew.connectivity.TailscaleLaunchResult
 import com.nblaisot.voxcrew.audio.AudioPermissionIssue
 import com.nblaisot.voxcrew.audio.CaptureInputKind
 import com.nblaisot.voxcrew.audio.DEVICE_AUDIO_ROUTE_KEY
@@ -102,12 +107,15 @@ import com.nblaisot.voxcrew.ui.theme.VoxPttIdle
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import kotlin.math.roundToInt
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
     viewModel: MainViewModel,
+    onConnectTailscale: () -> TailscaleLaunchResult,
     onNavigateToAbout: () -> Unit,
+    onNavigateToRelay: () -> Unit,
     onSignOut: () -> Unit,
     onQuitApplication: () -> Unit,
 ) {
@@ -119,6 +127,10 @@ fun MainScreen(
     var menuExpanded by remember { mutableStateOf(false) }
     var audioMenuExpanded by remember { mutableStateOf(false) }
     var memberPendingForget by remember { mutableStateOf<CrewMember?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
+    val connectionRequestedMessage = stringResource(R.string.tailscale_connection_requested)
+    val tailscaleFailedMessage = stringResource(R.string.tailscale_action_failed)
 
     RequestAppPermissions(onResult = viewModel::onPermissionsResult)
 
@@ -183,6 +195,38 @@ fun MainScreen(
         )
     }
 
+    state.pendingRelayOffer?.let { offer ->
+        AlertDialog(
+            onDismissRequest = viewModel::dismissRelayOffer,
+            title = { Text(stringResource(R.string.relay_offer_title)) },
+            text = {
+                Text(
+                    stringResource(
+                        R.string.relay_offer_body,
+                        offer.peerDisplayName,
+                        offer.link.url,
+                    ),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = viewModel::acceptRelayOffer,
+                    modifier = Modifier.testTag("relay_offer_accept"),
+                ) {
+                    Text(stringResource(R.string.relay_offer_accept))
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = viewModel::dismissRelayOffer,
+                    modifier = Modifier.testTag("relay_offer_dismiss"),
+                ) {
+                    Text(stringResource(R.string.relay_offer_decline))
+                }
+            },
+        )
+    }
+
     memberPendingForget?.let { member ->
         AlertDialog(
             onDismissRequest = { memberPendingForget = null },
@@ -207,6 +251,7 @@ fun MainScreen(
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 navigationIcon = {
@@ -220,6 +265,31 @@ fun MainScreen(
                         expanded = menuExpanded,
                         onDismissRequest = { menuExpanded = false },
                     ) {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.menu_connect_tailscale)) },
+                            onClick = {
+                                menuExpanded = false
+                                when (onConnectTailscale()) {
+                                    TailscaleLaunchResult.CONNECTION_REQUESTED -> coroutineScope.launch {
+                                        snackbarHostState.showSnackbar(connectionRequestedMessage)
+                                    }
+                                    TailscaleLaunchResult.FAILED -> coroutineScope.launch {
+                                        snackbarHostState.showSnackbar(tailscaleFailedMessage)
+                                    }
+                                    TailscaleLaunchResult.APP_OPENED,
+                                    TailscaleLaunchResult.STORE_OPENED -> Unit
+                                }
+                            },
+                            modifier = Modifier.testTag("menu_connect_tailscale"),
+                        )
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.menu_relay)) },
+                            onClick = {
+                                menuExpanded = false
+                                onNavigateToRelay()
+                            },
+                            modifier = Modifier.testTag("menu_relay"),
+                        )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_about)) },
                             onClick = {
@@ -693,6 +763,7 @@ private fun audioShimmerBrush(): Brush {
 private fun localizedPathLabel(pathLabel: String): String = when (pathLabel) {
     PathLabels.LOCAL -> stringResource(R.string.path_local)
     PathLabels.VPN -> stringResource(R.string.path_vpn)
+    PathLabels.CLOUD -> stringResource(R.string.path_cloud)
     else -> pathLabel
 }
 
@@ -712,6 +783,11 @@ private fun AvailabilityIcon(
             Icons.Filled.VpnLock,
             MaterialTheme.colorScheme.secondary,
             stringResource(R.string.path_vpn),
+        )
+        MemberAvailability.ONLINE_CLOUD -> Triple(
+            Icons.Filled.Cloud,
+            MaterialTheme.colorScheme.tertiary,
+            stringResource(R.string.path_cloud),
         )
         MemberAvailability.NEARBY -> Triple(
             Icons.Filled.Sensors,

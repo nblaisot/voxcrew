@@ -1,8 +1,8 @@
 package com.nblaisot.voxcrew.lanlink
 
 /**
- * Pure path preference for LAN ↔ Tailscale. Discovery feeds sightings; TCP dial
- * success/failure owns whether we stay on LAN or move to overlay.
+ * Pure path preference: Local → VPN (ephemeral overlayHost) → Cloud (UUID relay).
+ * Discovery remains LAN-only; Cloud never invents NEARBY.
  */
 object OverlayFailoverPolicy {
     enum class PathAction {
@@ -10,9 +10,11 @@ object OverlayFailoverPolicy {
         USE_LAN,
         /** Use overlay endpoint (LAN absent, or LAN dial already failed). */
         USE_OVERLAY,
-        /** Discovery quiet but TCP is healthy — leave the active session alone. */
+        /** Dial peer UUID via the optional self-hosted relay. */
+        USE_CLOUD,
+        /** Discovery quiet but TCP/relay session is healthy — leave it alone. */
         KEEP_SESSION,
-        /** No discovery path and no healthy session — clear dial target. */
+        /** No discovery path, no relay candidate, no healthy session — clear. */
         CLEAR,
     }
 
@@ -22,7 +24,8 @@ object OverlayFailoverPolicy {
 
     /**
      * @param lanDialFailed true after at least one failed dial to the LAN target while
-     *   an overlay endpoint was/is known — LAN beacon presence must not trap us there.
+     *   a better failover (overlay and/or cloud) is known.
+     * @param hasCloudEndpoint true when relay settings are up and our control WSS is hello_ok.
      */
     fun decide(
         lanSighting: LanPeer?,
@@ -30,21 +33,31 @@ object OverlayFailoverPolicy {
         activeVia: String?,
         sessionHealthy: Boolean,
         lanDialFailed: Boolean = false,
+        hasCloudEndpoint: Boolean = false,
     ): Decision {
-        // Healthy TCP is never torn down solely because UDP presence went quiet.
+        // Healthy path is never torn down solely because UDP presence went quiet.
         if (sessionHealthy && activeVia == PathLabels.LOCAL) {
             return Decision(PathAction.KEEP_SESSION)
         }
         if (sessionHealthy && activeVia == PathLabels.VPN && lanSighting == null) {
             return Decision(PathAction.KEEP_SESSION)
         }
+        if (sessionHealthy && activeVia == PathLabels.CLOUD &&
+            lanSighting == null && !hasOverlayEndpoint
+        ) {
+            return Decision(PathAction.KEEP_SESSION)
+        }
 
         val lan = lanSighting?.takeUnless { it.viaOverlay }
-        if (lan != null && !(lanDialFailed && hasOverlayEndpoint)) {
+        val failoverAvailable = hasOverlayEndpoint || hasCloudEndpoint
+        if (lan != null && !(lanDialFailed && failoverAvailable)) {
             return Decision(PathAction.USE_LAN)
         }
         if (hasOverlayEndpoint) {
             return Decision(PathAction.USE_OVERLAY)
+        }
+        if (hasCloudEndpoint) {
+            return Decision(PathAction.USE_CLOUD)
         }
         if (lan != null) {
             return Decision(PathAction.USE_LAN)

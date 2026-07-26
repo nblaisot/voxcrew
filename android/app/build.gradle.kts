@@ -96,6 +96,8 @@ dependencies {
     implementation(libs.android.vad.silero)
     // OSS license attribution screen (About → licenses). Scans release/debug runtime classpath at build time.
     implementation(libs.aboutlibraries.compose.m3)
+    // Self-hosted TLS WebSocket relay (optional Cloud path). See relay/README.md.
+    implementation(libs.okhttp)
 
     testImplementation(libs.junit)
     testImplementation(libs.concentus)

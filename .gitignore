@@ -43,6 +43,10 @@ render.experimental.xml
 *credentials*.json
 *service-account*.json
 
+# Optional Mac Mini relay TLS material (generate locally)
+relay/certs/
+relay/node_modules/
+
 # Log/OS
 *.log
 *.hprof

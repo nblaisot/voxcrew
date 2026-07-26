@@ -35,6 +35,7 @@ class LanTcpClient(
     private val inboundRouteResolver: (Socket) -> RoutedSocketPath?,
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val socketFactory: () -> Socket = ::Socket,
+    private val relayOfferProvider: () -> com.nblaisot.voxcrew.relay.RelayConfigLink? = { null },
 ) : FrameTransport {
     @Volatile private var sessionRoute: RoutedSocketPath? = null
     @Volatile private var sessionDirection: SessionDirection? = null
@@ -65,10 +66,19 @@ class LanTcpClient(
     /** Fired after a *real* failed dial to a non-overlay (LAN) target (not intentional cancel). */
     @Volatile var onLanDialFailed: (() -> Unit)? = null
 
-    /** Fired when an overlay endpoint looks dead (ECONNREFUSED or enough consecutive failures). */
-    @Volatile var onOverlayEndpointDead: ((peerUid: String) -> Unit)? = null
+    /** Peer offered crew relay settings on a Local Hello (UI may confirm). */
+    @Volatile var onRelayOffer: ((peerUid: String, offer: com.nblaisot.voxcrew.relay.RelayConfigLink) -> Unit)? = null
 
     fun lastContiguousInSeq(): Long = peerLink.lastContiguousInSeq()
+
+    /** Local-path Hello only: optional relay config to piggyback. */
+    fun relayOfferForLanHello(): com.nblaisot.voxcrew.relay.RelayConfigLink? = relayOfferProvider()
+
+    fun relayOfferIfLanInbound(socket: Socket): com.nblaisot.voxcrew.relay.RelayConfigLink? {
+        val route = inboundRouteResolver(socket) ?: return null
+        if (route.path != PeerPath.LAN) return null
+        return relayOfferProvider()
+    }
 
     fun hasOpenSession(): Boolean {
         val s = session
@@ -302,6 +312,7 @@ class LanTcpClient(
         out: DataOutputStream,
         input: DataInputStream,
         peerAnnouncedLastContiguousSeq: Long,
+        incomingRelayOffer: com.nblaisot.voxcrew.relay.RelayConfigLink? = null,
     ) {
         if (this.peerUid != peerUid) {
             runCatching { socket.close() }
@@ -312,6 +323,9 @@ class LanTcpClient(
             Log.w(TAG, "rejected inbound peer=$peerUid: socket path is not in connectivity snapshot")
             runCatching { socket.close() }
             return
+        }
+        if (route.path == PeerPath.LAN) {
+            incomingRelayOffer?.let { onRelayOffer?.invoke(peerUid, it) }
         }
         if (hasHealthyLocalSession() && route.path == PeerPath.OVERLAY) {
             replaceStandby(
@@ -495,8 +509,6 @@ class LanTcpClient(
                 val failedLan = isLanTarget(target)
                 if (failedLan) {
                     onLanDialFailed?.invoke()
-                } else {
-                    maybeInvalidateOverlayEndpoint(target, e, failure.failures)
                 }
                 // Target may have switched to overlay inside the callback.
                 if (failedLan && targetPeer?.let { !isLanTarget(it) } == true) {
@@ -517,18 +529,6 @@ class LanTcpClient(
             route.networkHandle == target.route.networkHandle
     }
 
-    private fun maybeInvalidateOverlayEndpoint(
-        target: RoutedPeerTarget,
-        error: IOException,
-        failures: Int,
-    ) {
-        val msg = error.message.orEmpty()
-        val refused = msg.contains("ECONNREFUSED", ignoreCase = true)
-        if (refused || failures >= OVERLAY_INVALIDATE_AFTER_FAILURES) {
-            onOverlayEndpointDead?.invoke(target.peer.uid)
-        }
-    }
-
     private suspend fun performHandshakeAndAdopt(
         target: RoutedPeerTarget,
         socket: Socket,
@@ -537,7 +537,11 @@ class LanTcpClient(
         val peerUid = target.peer.uid
         val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
         val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
-        LanProtocol.writeFrame(out, LanFrame.Hello(localUid, peerLink.lastContiguousInSeq()))
+        val offer = if (target.route.path == PeerPath.LAN) relayOfferProvider() else null
+        LanProtocol.writeFrame(
+            out,
+            LanFrame.Hello(localUid, peerLink.lastContiguousInSeq(), offer),
+        )
         val reply = withTimeoutOrNull(LanTcpServer.HANDSHAKE_TIMEOUT_MS) {
             withContext(Dispatchers.IO) { LanProtocol.readFrame(input) }
         }
@@ -545,6 +549,9 @@ class LanTcpClient(
             runCatching { socket.close() }
             if (isCancelledAttempt(generation)) return
             throw IOException("handshake failed")
+        }
+        if (target.route.path == PeerPath.LAN) {
+            reply.relayOffer?.let { onRelayOffer?.invoke(peerUid, it) }
         }
         adoptSession(
             peerUid,
@@ -682,7 +689,6 @@ class LanTcpClient(
 
     private fun onSessionClosed(closedSession: LanTcpSession) {
         var failedTarget: RoutedPeerTarget? = null
-        var failureCount = 0
         val wasCurrent = synchronized(this) {
             if (session !== closedSession) return@synchronized false
             val route = sessionRoute
@@ -694,7 +700,7 @@ class LanTcpClient(
             }
             if (!closedSession.confirmed && target != null) {
                 failedTarget = target
-                failureCount = recordFailureLocked(target).failures
+                recordFailureLocked(target)
             }
             peerLink.onDisconnected(this, closedSession.peerUid)
             ensureDialingLocked()
@@ -715,8 +721,6 @@ class LanTcpClient(
         failedTarget?.let { target ->
             if (isLanTarget(target)) {
                 onLanDialFailed?.invoke()
-            } else if (failureCount >= OVERLAY_INVALIDATE_AFTER_FAILURES) {
-                onOverlayEndpointDead?.invoke(target.peer.uid)
             }
         }
     }
@@ -745,9 +749,6 @@ class LanTcpClient(
         private const val OVERLAY_RETRY_DELAY_MS = 250L
         internal const val MAX_RETRY_DELAY_MS = 30_000L
         private const val MAX_BACKOFF_EXPONENT = 7
-        /** Drop sticky overlay host:port after this many consecutive real dial failures. */
-        internal const val OVERLAY_INVALIDATE_AFTER_FAILURES = 5
-
         private fun logInfo(message: String) {
             runCatching { Log.i(TAG, message) }
         }

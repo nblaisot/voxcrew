@@ -6,7 +6,7 @@ import org.junit.Test
 class ActiveRecipientPolicyTest {
 
     @Test
-    fun `opt-in mode keeps persisted recipients when crew roster is still empty`() {
+    fun `opt-in mode keeps session recipients when crew roster is briefly empty`() {
         val result = ActiveRecipientPolicy.recipientsAfterCrewSync(
             currentActive = setOf("peer-a"),
             crewUids = emptySet(),

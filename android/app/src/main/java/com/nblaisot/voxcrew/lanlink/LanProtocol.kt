@@ -1,5 +1,6 @@
 package com.nblaisot.voxcrew.lanlink
 
+import com.nblaisot.voxcrew.relay.RelayConfigLink
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
@@ -12,7 +13,15 @@ import java.io.IOException
  * duplicates (see [SendBuffer]).
  */
 sealed class LanFrame {
-    data class Hello(val uid: String, val lastContiguousSeq: Long) : LanFrame()
+    /**
+     * @param relayOffer optional crew relay settings (LAN Hello only). Older peers
+     *   ignore trailing bytes after [lastContiguousSeq].
+     */
+    data class Hello(
+        val uid: String,
+        val lastContiguousSeq: Long,
+        val relayOffer: RelayConfigLink? = null,
+    ) : LanFrame()
 
     /** [payload] is codec-encoded audio (Opus), not raw PCM — see [AudioCapture]/[AudioPlayback]. */
     data class Audio(val seq: Long, val payload: ByteArray) : LanFrame()
@@ -39,6 +48,9 @@ object LanProtocol {
     private const val TYPE_PONG = 5
     private const val TYPE_MEDIA_ACTIVITY = 6
     private const val TYPE_SKIP = 7
+
+    /** Trailing Hello block: version + url + secret + cert (empty cert = absent). */
+    const val HELLO_RELAY_OFFER_VERSION: Int = 1
 
     /** Guards against a corrupt/malicious length prefix causing an OOM allocation. */
     const val MAX_PAYLOAD_BYTES = 64 * 1024
@@ -102,6 +114,13 @@ object LanProtocol {
             is LanFrame.Hello -> {
                 data.writeUTF(frame.uid)
                 data.writeLong(frame.lastContiguousSeq)
+                val offer = frame.relayOffer
+                if (offer != null) {
+                    data.writeByte(HELLO_RELAY_OFFER_VERSION)
+                    data.writeUTF(offer.url)
+                    data.writeUTF(offer.secret)
+                    data.writeUTF(offer.certSha256.orEmpty())
+                }
             }
             is LanFrame.Audio -> {
                 data.writeLong(frame.seq)
@@ -123,7 +142,29 @@ object LanProtocol {
     private fun decodePayload(type: Int, payload: ByteArray): LanFrame {
         val data = DataInputStream(payload.inputStream())
         return when (type) {
-            TYPE_HELLO -> LanFrame.Hello(data.readUTF(), data.readLong())
+            TYPE_HELLO -> {
+                val uid = data.readUTF()
+                val seq = data.readLong()
+                val offer = if (data.available() > 0) {
+                    val version = data.readUnsignedByte()
+                    if (version != HELLO_RELAY_OFFER_VERSION) {
+                        // Unknown offer version: keep Hello, drop offer.
+                        null
+                    } else {
+                        val url = data.readUTF()
+                        val secret = data.readUTF()
+                        val cert = data.readUTF().takeIf { it.isNotEmpty() }
+                        if (url.isNotBlank() && secret.isNotBlank()) {
+                            RelayConfigLink(url = url, secret = secret, certSha256 = cert)
+                        } else {
+                            null
+                        }
+                    }
+                } else {
+                    null
+                }
+                LanFrame.Hello(uid, seq, offer)
+            }
             TYPE_AUDIO -> {
                 val seq = data.readLong()
                 val pcm = ByteArray(payload.size - 8)

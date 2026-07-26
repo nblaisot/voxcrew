@@ -4,4 +4,5 @@ object Routes {
     const val PROFILE = "profile"
     const val MAIN = "main"
     const val ABOUT = "about"
+    const val RELAY = "relay"
 }

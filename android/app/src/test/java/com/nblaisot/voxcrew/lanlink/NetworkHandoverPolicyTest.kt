@@ -96,31 +96,6 @@ class NetworkHandoverPolicyTest {
     }
 
     @Test
-    fun `disconnect transition immediately restores overlay probe target`() {
-        val connected = overlayProbeTargets(
-            overlayAvailable = true,
-            localUid = "local",
-            relevantUids = setOf("peer"),
-            lanVisibleUids = emptySet(),
-            connectedUids = setOf("peer"),
-            endpointHosts = mapOf("peer" to "100.65.176.46"),
-            seededHosts = emptyMap(),
-        )
-        val disconnected = overlayProbeTargets(
-            overlayAvailable = true,
-            localUid = "local",
-            relevantUids = setOf("peer"),
-            lanVisibleUids = emptySet(),
-            connectedUids = emptySet(),
-            endpointHosts = mapOf("peer" to "100.65.176.46"),
-            seededHosts = emptyMap(),
-        )
-
-        assertTrue(connected.isEmpty())
-        assertEquals(mapOf("peer" to "100.65.176.46"), disconnected)
-    }
-
-    @Test
     fun `same path dual dial converges on UID designated direction`() {
         assertTrue(
             shouldReplaceSession(
@@ -166,48 +141,6 @@ class NetworkHandoverPolicyTest {
                 SessionDirection.INBOUND,
             ),
         )
-    }
-
-    @Test
-    fun `pruned LAN sighting can fall back to retained LAN endpoint`() {
-        val retained = LanFallbackEndpoint(
-            host = lanPeer.host,
-            port = lanPeer.port,
-            displayName = lanPeer.displayName,
-        )
-
-        val fallback = lanPeerForFallback("peer", sighting = null, fallback = retained)
-
-        requireNotNull(fallback)
-        assertEquals(lanPeer.host, fallback.host)
-        assertEquals(PeerPath.LAN, routePeer(fallback, snapshot)?.route?.path)
-    }
-
-    @Test
-    fun `live LAN sighting wins over retained endpoint`() {
-        val stale = LanFallbackEndpoint(
-            host = "192.168.86.99",
-            port = lanPeer.port,
-            displayName = "Old",
-        )
-
-        val selected = lanPeerForFallback("peer", sighting = lanPeer, fallback = stale)
-
-        assertEquals(lanPeer.host, selected?.host)
-    }
-
-    @Test
-    fun `retained LAN endpoint is rejected when current LAN cannot route it`() {
-        val retained = LanFallbackEndpoint(
-            host = "192.168.99.12",
-            port = lanPeer.port,
-            displayName = lanPeer.displayName,
-        )
-
-        val fallback = lanPeerForFallback("peer", sighting = null, fallback = retained)
-
-        requireNotNull(fallback)
-        assertNull(routePeer(fallback, snapshot))
     }
 
     @Test

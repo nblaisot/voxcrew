@@ -15,9 +15,8 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 /**
- * Local (LAN / Tailscale) peers are merged directly from [LanPeer] discovery.
- * As soon as two devices see each other's beacon they show up as
- * [MemberAvailability.ONLINE_LOCAL] (or [MemberAvailability.ONLINE_OVERLAY]).
+ * UUID-keyed roster. Discovery supplies transient endpoints; disk stores only the UUID and last
+ * display name required to render an intelligible offline row after restart.
  */
 class CrewRosterRepository(
     context: Context,
@@ -33,15 +32,14 @@ class CrewRosterRepository(
     private var activeRecipientUids: Set<String> = emptySet()
     private var localUid: String? = null
     private var observeJob: Job? = null
-    /** Soft-forgotten UIDs not re-written to disk while still visible via discovery. */
-    private val skipCacheUids = mutableSetOf<String>()
+    private var knownPeers: Map<String, String> = loadOrMigrateKnownPeers()
 
     fun start(localUid: String, localDisplayName: String?) {
         observeJob?.cancel()
         this.localUid = localUid
         observeJob = scope.launch {
             lanPeers.collect { peers ->
-                _members.value = merge(localUid, peers, activeRecipientUids)
+                rematch(localUid, peers)
             }
         }
     }
@@ -50,111 +48,124 @@ class CrewRosterRepository(
         observeJob?.cancel()
         observeJob = null
         localUid = null
-        skipCacheUids.clear()
         _members.value = emptyList()
     }
-
-    /**
-     * Persisted overlay hosts for cold-start probing. Tailscale addresses are node-stable,
-     * so two peers that only ever meet on the overlay can re-find each other after a restart.
-     */
-    fun cachedOverlayHosts(): Map<String, String> =
-        loadCache().values.mapNotNull { cached ->
-            cached.overlayHost?.takeIf { it.isNotBlank() }?.let { cached.uid to it }
-        }.toMap()
 
     fun setActiveRecipients(uids: Set<String>) {
         activeRecipientUids = uids
         _members.update { list -> list.map { it.copy(isActiveRecipient = it.uid in uids) } }
     }
 
-    /**
-     * Soft forget: drop [uid] from the persisted roster. Peers still on the network
-     * remain visible (muted by the engine); they vanish once discovery loses them and
-     * can reappear later as a fresh discovery.
-     */
     fun forgetMember(uid: String) {
-        val cache = loadCache().toMutableMap()
-        cache.remove(uid)
-        saveCache(cache)
-        skipCacheUids.add(uid)
+        knownPeers = knownPeers - uid
+        saveKnownPeers(knownPeers)
         rematchNow()
     }
 
     private fun rematchNow() {
         val uid = localUid ?: return
-        _members.value = merge(uid, lanPeers.value, activeRecipientUids)
+        rematch(uid, lanPeers.value)
     }
 
-    private fun merge(
-        localUid: String,
-        lanPeers: List<LanPeer>,
-        activeUids: Set<String>,
-    ): List<CrewMember> {
-        val cache = loadCache().toMutableMap()
-        val byUid = linkedMapOf<String, CrewMember>()
-        val liveUids = lanPeers.map { it.uid }.toSet()
-        skipCacheUids.retainAll(SoftForgetPolicy.skipCacheAfterTick(skipCacheUids, liveUids))
-
-        lanPeers.filter { it.uid != localUid }.forEach { peer ->
-            if (SoftForgetPolicy.shouldPersistToCache(peer.uid, skipCacheUids)) {
-                // A LAN sighting without an overlay host must not erase a previously
-                // learned one — Tailscale addresses are node-stable and the cached
-                // value is the cold-start probe seed.
-                val overlayHost = peer.overlayHost?.takeIf { it.isNotBlank() }
-                    ?: cache[peer.uid]?.overlayHost
-                cache[peer.uid] = CachedMember(peer.uid, peer.displayName, peer.lastSeenMs, overlayHost)
-            }
-            byUid[peer.uid] = CrewMember(
-                uid = peer.uid,
-                displayName = peer.displayName,
-                availability = if (peer.viaOverlay) {
-                    MemberAvailability.ONLINE_OVERLAY
-                } else {
-                    MemberAvailability.ONLINE_LOCAL
-                },
-                lastSeenMs = peer.lastSeenMs,
-                isActiveRecipient = peer.uid in activeUids,
-            )
+    private fun rematch(localUid: String, peers: List<LanPeer>) {
+        val merged = mergeKnownPeers(
+            localUid = localUid,
+            knownPeers = knownPeers,
+            livePeers = peers,
+            activeUids = activeRecipientUids,
+        )
+        if (merged.knownPeers != knownPeers) {
+            knownPeers = merged.knownPeers
+            saveKnownPeers(knownPeers)
         }
+        _members.value = merged.members
+    }
 
-        cache.values.forEach { cached ->
-            if (cached.uid == localUid) return@forEach
-            if (byUid.containsKey(cached.uid)) return@forEach
-            byUid[cached.uid] = CrewMember(
-                uid = cached.uid,
-                displayName = cached.displayName,
-                availability = MemberAvailability.OFFLINE,
-                lastSeenMs = cached.lastSeenMs,
-                isActiveRecipient = cached.uid in activeUids,
-            )
+    private fun loadOrMigrateKnownPeers(): Map<String, String> {
+        val stored = prefs.getString(KEY_KNOWN_PEERS, null)?.let(::decodeKnownPeers)
+        if (stored != null) {
+            prefs.edit().remove(LEGACY_KEY_CACHE).apply()
+            return stored
         }
+        val migrated = decodeLegacyKnownPeers(prefs.getString(LEGACY_KEY_CACHE, null), json)
+        saveKnownPeers(migrated)
+        prefs.edit().remove(LEGACY_KEY_CACHE).apply()
+        return migrated
+    }
 
-        saveCache(cache)
-        return byUid.values
-            .filter { it.uid != localUid }
-            .sortedBy { it.displayName.lowercase() }
+    private fun decodeKnownPeers(raw: String): Map<String, String>? = runCatching {
+        json.decodeFromString<List<KnownPeer>>(raw)
+            .filter { it.uid.isNotBlank() && it.displayName.isNotBlank() }
+            .associate { it.uid to it.displayName }
+    }.getOrNull()
+
+    private fun saveKnownPeers(peers: Map<String, String>) {
+        val stored = peers.map { (uid, displayName) -> KnownPeer(uid, displayName) }
+        prefs.edit().putString(KEY_KNOWN_PEERS, json.encodeToString(stored)).apply()
     }
 
     @Serializable
-    private data class CachedMember(
+    private data class KnownPeer(
         val uid: String,
         val displayName: String,
-        val lastSeenMs: Long? = null,
-        val overlayHost: String? = null,
     )
-
-    private fun loadCache(): Map<String, CachedMember> = runCatching {
-        val raw = prefs.getString(KEY_CACHE, null) ?: return emptyMap()
-        json.decodeFromString<List<CachedMember>>(raw).associateBy { it.uid }
-    }.getOrElse { emptyMap() }
-
-    private fun saveCache(cache: Map<String, CachedMember>) {
-        prefs.edit().putString(KEY_CACHE, json.encodeToString(cache.values.toList())).apply()
-    }
 
     companion object {
         private const val PREFS = "voxcrew_roster"
-        private const val KEY_CACHE = "seen_members_v2"
+        private const val KEY_KNOWN_PEERS = "known_peer_names_v1"
+        private const val LEGACY_KEY_CACHE = "seen_members_v2"
     }
+}
+
+internal data class KnownPeerMerge(
+    val knownPeers: Map<String, String>,
+    val members: List<CrewMember>,
+)
+
+internal fun mergeKnownPeers(
+    localUid: String,
+    knownPeers: Map<String, String>,
+    livePeers: List<LanPeer>,
+    activeUids: Set<String>,
+): KnownPeerMerge {
+    val liveByUid = livePeers
+        .asSequence()
+        .filter { it.uid.isNotBlank() && it.uid != localUid }
+        .associateBy { it.uid }
+    val updatedKnown = knownPeers
+        .filterKeys { it != localUid }
+        .toMutableMap()
+        .apply {
+            liveByUid.forEach { (uid, peer) -> this[uid] = peer.displayName }
+        }
+    val members = updatedKnown.map { (uid, storedName) ->
+        val live = liveByUid[uid]
+        CrewMember(
+            uid = uid,
+            displayName = live?.displayName ?: storedName,
+            availability = when {
+                live == null -> MemberAvailability.OFFLINE
+                live.viaOverlay -> MemberAvailability.ONLINE_OVERLAY
+                else -> MemberAvailability.ONLINE_LOCAL
+            },
+            lastSeenMs = live?.lastSeenMs,
+            isActiveRecipient = uid in activeUids,
+        )
+    }.sortedBy { it.displayName.lowercase() }
+    return KnownPeerMerge(updatedKnown, members)
+}
+
+@Serializable
+private data class LegacyCachedMember(
+    val uid: String,
+    val displayName: String,
+)
+
+internal fun decodeLegacyKnownPeers(raw: String?, json: Json): Map<String, String> {
+    if (raw.isNullOrBlank()) return emptyMap()
+    return runCatching {
+        json.decodeFromString<List<LegacyCachedMember>>(raw)
+            .filter { it.uid.isNotBlank() && it.displayName.isNotBlank() }
+            .associate { it.uid to it.displayName }
+    }.getOrElse { emptyMap() }
 }

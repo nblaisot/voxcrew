@@ -57,39 +57,42 @@ class SessionForegroundService : Service() {
                 stopSelf()
             }
             ACTION_REFRESH_TYPES -> {
-                promoteForeground(buildNotification(lastStatusLabel, lastVoxEnabled))
+                if (!promoteForeground(buildNotification(lastStatusLabel, lastVoxEnabled))) {
+                    return START_NOT_STICKY
+                }
             }
             else -> {
                 lastStatusLabel = intent?.getStringExtra(EXTRA_TRANSPORT) ?: lastStatusLabel
-                promoteForeground(buildNotification(lastStatusLabel, lastVoxEnabled))
+                if (!promoteForeground(buildNotification(lastStatusLabel, lastVoxEnabled))) {
+                    return START_NOT_STICKY
+                }
                 observeEngine()
             }
         }
         return START_STICKY
     }
 
-    private fun promoteForeground(notification: Notification) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                startForeground(NOTIFICATION_ID, notification, foregroundServiceTypes())
-            } catch (e: SecurityException) {
-                Log.e(TAG, "startForeground with microphone type failed; using connectedDevice only", e)
-                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-            }
+    private fun promoteForeground(notification: Notification): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            tryForegroundPromotion(
+                types = foregroundServiceTypes(),
+                promote = { types -> startForeground(NOTIFICATION_ID, notification, types) },
+                onRejected = { error ->
+                    Log.e(TAG, "Foreground promotion rejected; stopping service", error)
+                    stopSelf()
+                },
+            )
         } else {
             startForeground(NOTIFICATION_ID, notification)
+            true
         }
     }
 
     private fun foregroundServiceTypes(): Int {
-        var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+        val microphoneGranted = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
-        ) {
-            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-        }
-        return types
+        return sessionForegroundServiceTypes(microphoneGranted)
     }
 
     override fun onDestroy() {
@@ -215,4 +218,22 @@ class SessionForegroundService : Service() {
             notifications.cancel(NOTIFICATION_ID)
         }
     }
+}
+
+internal fun sessionForegroundServiceTypes(microphoneGranted: Boolean): Int {
+    var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+    if (microphoneGranted) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+    return types
+}
+
+internal inline fun tryForegroundPromotion(
+    types: Int,
+    promote: (Int) -> Unit,
+    onRejected: (SecurityException) -> Unit,
+): Boolean = try {
+    promote(types)
+    true
+} catch (error: SecurityException) {
+    onRejected(error)
+    false
 }
