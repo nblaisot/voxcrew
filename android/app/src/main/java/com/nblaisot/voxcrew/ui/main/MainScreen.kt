@@ -266,6 +266,16 @@ fun MainScreen(
                         onDismissRequest = { menuExpanded = false },
                     ) {
                         DropdownMenuItem(
+                            text = {
+                                Text(stringResource(R.string.menu_change_name))
+                            },
+                            onClick = {
+                                menuExpanded = false
+                                viewModel.signOut()
+                                onSignOut()
+                            },
+                        )
+                        DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_connect_tailscale)) },
                             onClick = {
                                 menuExpanded = false
@@ -291,28 +301,18 @@ fun MainScreen(
                             modifier = Modifier.testTag("menu_relay"),
                         )
                         DropdownMenuItem(
-                            text = { Text(stringResource(R.string.menu_about)) },
-                            onClick = {
-                                menuExpanded = false
-                                onNavigateToAbout()
-                            },
-                        )
-                        DropdownMenuItem(
-                            text = {
-                                Text(stringResource(R.string.menu_change_name))
-                            },
-                            onClick = {
-                                menuExpanded = false
-                                viewModel.signOut()
-                                onSignOut()
-                            },
-                        )
-                        DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_quit)) },
                             onClick = {
                                 menuExpanded = false
                                 viewModel.quitApplication()
                                 onQuitApplication()
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.menu_about)) },
+                            onClick = {
+                                menuExpanded = false
+                                onNavigateToAbout()
                             },
                         )
                     }

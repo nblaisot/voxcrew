@@ -12,7 +12,7 @@
 
     <!-- Menu / About -->
     <string name="menu_about">À propos</string>
-    <string name="menu_relay">Relais</string>
+    <string name="menu_relay">Paramètres Gateway</string>
     <string name="menu_connect_tailscale">Connecter Tailscale</string>
     <string name="menu_quit">QUITTER</string>
     <string name="menu_change_name">Changer de nom</string>

@@ -12,7 +12,7 @@
 
     <!-- Menu / About -->
     <string name="menu_about">About</string>
-    <string name="menu_relay">Relay</string>
+    <string name="menu_relay">Gateway Settings</string>
     <string name="menu_connect_tailscale">Connect Tailscale</string>
     <string name="menu_quit">QUIT</string>
     <string name="menu_change_name">Change name</string>
