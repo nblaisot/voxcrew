@@ -58,7 +58,7 @@ class CrewMemberDisplayTest {
     }
 
     @Test
-    fun disconnectedDiscoveryBecomesNearbyNotPathGlyph() {
+    fun disconnectedSightingShowsConnectingNotPathGlyph() {
         val result = displayAvailability(
             rosterAvailability = MemberAvailability.ONLINE_LOCAL,
             pathLabel = PathLabels.LOCAL,
@@ -68,7 +68,7 @@ class CrewMemberDisplayTest {
     }
 
     @Test
-    fun connectingDiscoveryBecomesNearbyNotPathGlyph() {
+    fun connectingSightingShowsConnectingNotPathGlyph() {
         val result = displayAvailability(
             rosterAvailability = MemberAvailability.ONLINE_OVERLAY,
             pathLabel = null,

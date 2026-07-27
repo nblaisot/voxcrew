@@ -48,6 +48,54 @@ class NetworkHandoverPolicyTest {
     }
 
     @Test
+    fun `softAP interface subnet routes Local without ConnectivityManager LAN`() {
+        val softAp = setOf(
+            LanNetwork(
+                LocalLanNetworks.UNBOUND_NETWORK_HANDLE,
+                "ap0",
+                setOf(Ipv4Link("192.168.43.1", 24)),
+            ),
+        )
+        val emptySnapshot = ConnectivitySnapshot()
+        val peer = lanPeer.copy(host = "192.168.43.55")
+
+        val target = routePeer(peer, emptySnapshot, softAp)
+
+        assertEquals(LocalLanNetworks.UNBOUND_NETWORK_HANDLE, target?.route?.networkHandle)
+        assertEquals(PeerPath.LAN, target?.route?.path)
+        assertTrue(target!!.route.isUnbound)
+    }
+
+    @Test
+    fun `ConnectivityManager LAN wins over SoftAP fallback`() {
+        val softAp = setOf(
+            LanNetwork(
+                LocalLanNetworks.UNBOUND_NETWORK_HANDLE,
+                "ap0",
+                setOf(Ipv4Link("192.168.86.1", 24)),
+            ),
+        )
+        val target = routePeer(lanPeer, snapshot, softAp)
+        assertEquals(609L, target?.route?.networkHandle)
+        assertFalse(target!!.route.isUnbound)
+    }
+
+    @Test
+    fun `unbound Local dial skips NetworkSocketBinder`() {
+        val binder = RecordingBinder()
+        val socket = Socket()
+        val target = RoutedPeerTarget(
+            peer = lanPeer.copy(host = "192.168.43.10"),
+            route = RoutedSocketPath(PeerPath.LAN, LocalLanNetworks.UNBOUND_NETWORK_HANDLE),
+        )
+
+        bindTargetSocket(binder, target, socket)
+
+        assertTrue(binder.socketHandles.isEmpty())
+        socket.close()
+    }
+
+    @Test
     fun `overlapping LAN routes select deterministically`() {
         val overlapping = snapshot.copy(
             lanNetworks = setOf(

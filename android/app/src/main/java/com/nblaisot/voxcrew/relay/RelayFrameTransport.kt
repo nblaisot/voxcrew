@@ -82,14 +82,11 @@ class RelayFrameTransport(
 
     override fun stop() {
         handshakeJob?.cancel()
-        val wasOpen = open && handshakeDone
         open = false
         handshakeDone = false
         helloSent = false
-        val link = peerLink
-        if (wasOpen && link != null) {
-            link.onDisconnected(this, peerUid)
-        }
+        // Do not call onDisconnected on replace/stop — PeerLink owns link state.
+        // Real remote loss uses onPeerGone / dropAndRetry (matches LAN TCP stop).
     }
 
     private fun sendHello() {

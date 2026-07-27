@@ -47,21 +47,25 @@ class SessionForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                observeJob?.cancel()
-                wifiReleaseJob?.cancel()
-                releaseWifiLock()
-                // "Leave session" must stop the mesh too: without shutdown() the beacon,
-                // TCP server and dial loops keep running unprotected after the FGS dies.
-                (application as? VoxCrewApp)?.container?.lanIntercomEngine?.shutdown()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                performFullStop()
+                return START_NOT_STICKY
             }
             ACTION_REFRESH_TYPES -> {
+                if (!sessionDesired) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 if (!promoteForeground(buildNotification(lastStatusLabel, lastVoxEnabled))) {
                     return START_NOT_STICKY
                 }
             }
             else -> {
+                // Sticky restart after swipe-kill must not resurrect the session.
+                if (intent == null && !sessionDesired) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                sessionDesired = true
                 lastStatusLabel = intent?.getStringExtra(EXTRA_TRANSPORT) ?: lastStatusLabel
                 if (!promoteForeground(buildNotification(lastStatusLabel, lastVoxEnabled))) {
                     return START_NOT_STICKY
@@ -69,7 +73,25 @@ class SessionForegroundService : Service() {
                 observeEngine()
             }
         }
-        return START_STICKY
+        return if (sessionDesired) START_STICKY else START_NOT_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Swipe-away from recents is equivalent to Quitter / Leave.
+        performFullStop()
+        super.onTaskRemoved(rootIntent)
+    }
+
+    private fun performFullStop() {
+        sessionDesired = false
+        observeJob?.cancel()
+        observeJob = null
+        wifiReleaseJob?.cancel()
+        wifiReleaseJob = null
+        releaseWifiLock()
+        (application as? VoxCrewApp)?.container?.lanIntercomEngine?.shutdown()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     private fun promoteForeground(notification: Notification): Boolean {
@@ -201,22 +223,33 @@ class SessionForegroundService : Service() {
         private const val WIFI_LOCK_RELEASE_TAIL_MS = 1_000L
 
         fun start(context: Context, transportLabel: String? = null) {
+            sessionDesired = true
             val intent = Intent(context, SessionForegroundService::class.java)
             transportLabel?.let { intent.putExtra(EXTRA_TRANSPORT, it) }
             context.startForegroundService(intent)
         }
 
         fun refreshForegroundTypes(context: Context) {
+            if (!sessionDesired) return
             val intent = Intent(context, SessionForegroundService::class.java)
                 .setAction(ACTION_REFRESH_TYPES)
             context.startService(intent)
         }
 
         fun stop(context: Context) {
+            sessionDesired = false
             context.stopService(Intent(context, SessionForegroundService::class.java))
             val notifications = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             notifications.cancel(NOTIFICATION_ID)
         }
+
+        /**
+         * Cleared by Quit / Leave / swipe-kill; set by [start]. Prevents START_STICKY
+         * from resurrecting the notification after an intentional stop.
+         */
+        @Volatile
+        var sessionDesired: Boolean = false
+            private set
     }
 }
 

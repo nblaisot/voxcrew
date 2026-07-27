@@ -523,6 +523,7 @@ class MainViewModel(
     }
 
     fun quitApplication() {
+        intercomStarted = false
         lanEngine.shutdown()
         rosterRepository.stop()
         SessionForegroundService.stop(appContext)

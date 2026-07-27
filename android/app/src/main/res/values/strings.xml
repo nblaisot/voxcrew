@@ -56,7 +56,7 @@
     <string name="included_in_group">Included in group</string>
     <string name="muted_not_included">Muted (not included)</string>
     <string name="availability_offline">Offline</string>
-    <string name="availability_nearby">Nearby</string>
+    <string name="availability_nearby">Connecting</string>
     <string name="ptt_hold_to_talk">PTT — hold to talk</string>
     <string name="ptt_transmitting">Transmitting…</string>
     <string name="ptt_audio_unavailable">Audio unavailable — tap Retry</string>

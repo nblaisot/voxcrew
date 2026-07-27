@@ -815,5 +815,6 @@ internal fun bindTargetSocket(
     target: RoutedPeerTarget,
     socket: Socket,
 ) {
+    if (target.route.isUnbound) return
     binder.bindSocket(target.route.networkHandle, socket)
 }

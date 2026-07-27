@@ -97,6 +97,8 @@ class LanIntercomEngine(
 
     private val _activeRecipientUids = MutableStateFlow<Set<String>>(emptySet())
     val activeRecipientUids: StateFlow<Set<String>> = _activeRecipientUids.asStateFlow()
+    /** Session-only: UUIDs the user toggled off — Connected must not auto-reinclude them. */
+    private var userOptedOutUids: Set<String> = emptySet()
 
     private val _peerMetrics = MutableStateFlow<Map<String, PeerMetrics>>(emptyMap())
     val peerMetrics: StateFlow<Map<String, PeerMetrics>> = _peerMetrics.asStateFlow()
@@ -377,18 +379,25 @@ class LanIntercomEngine(
     fun toggleRecipient(uid: String) {
         if (uid == localUid) return
         val current = _activeRecipientUids.value
-        val updated = if (uid in current) current - uid else current + uid
-        setActiveRecipients(updated)
+        if (uid in current) {
+            userOptedOutUids = userOptedOutUids + uid
+            setActiveRecipients(current - uid)
+        } else {
+            userOptedOutUids = userOptedOutUids - uid
+            setActiveRecipients(current + uid)
+        }
     }
 
     fun soloRecipient(uid: String) {
         if (uid == localUid) return
+        userOptedOutUids = userOptedOutUids - uid
         setActiveRecipients(setOf(uid))
     }
 
     fun removeRecipient(uid: String) {
         if (uid == localUid) return
         if (uid !in _activeRecipientUids.value) return
+        userOptedOutUids = userOptedOutUids + uid
         setActiveRecipients(_activeRecipientUids.value - uid)
     }
 
@@ -818,7 +827,7 @@ class LanIntercomEngine(
                 overlayPeerProvider = {
                     if (overlayFallbackEnabled) {
                         resolveOverlayDialTarget(peerUid, beacon.presence.value.sightings[peerUid])
-                            ?.let { routePeer(it, connectivitySnapshot) }
+                            ?.let { routeDiscoveryPeer(it) }
                     } else {
                         null
                     }
@@ -826,7 +835,7 @@ class LanIntercomEngine(
                 lanPeerProvider = {
                     beacon.presence.value.sightings[peerUid]
                         ?.takeUnless { it.viaOverlay }
-                        ?.let { routePeer(it, connectivitySnapshot) }
+                        ?.let { routeDiscoveryPeer(it) }
                 },
                 relayClientProvider = { relayClient },
                 relayOfferProvider = ::localRelayOfferForLanHello,
@@ -915,7 +924,6 @@ class LanIntercomEngine(
             var previous = conn.linkState.value
             conn.linkState.collect { state ->
                 if (state == previous) return@collect
-                val activeRecipients = _activeRecipientUids.value
                 if (previous is PeerLink.LinkState.Connected &&
                     state is PeerLink.LinkState.Disconnected
                 ) {
@@ -926,13 +934,31 @@ class LanIntercomEngine(
                         refreshPendingLatencyMediaLocked()
                     }
                 }
+                if (state is PeerLink.LinkState.Connected && optInRecipients) {
+                    val next = ActiveRecipientPolicy.recipientsAfterConnected(
+                        currentActive = _activeRecipientUids.value,
+                        connectedUid = conn.peerUid,
+                        optedOut = userOptedOutUids,
+                    )
+                    if (next != _activeRecipientUids.value) {
+                        setActiveRecipients(next)
+                    }
+                }
+                val activeRecipients = _activeRecipientUids.value
+                val previousConnected = previous as? PeerLink.LinkState.Connected
                 if (conn.peerUid in activeRecipients) {
                     when {
-                        previous !is PeerLink.LinkState.Connected && state is PeerLink.LinkState.Connected ->
+                        previousConnected == null && state is PeerLink.LinkState.Connected ->
                             uiFeedback.playConnected().also {
                                 if (isOutboundMediaActive()) conn.sendMediaActivity(true)
                             }
-                        previous is PeerLink.LinkState.Connected && state is PeerLink.LinkState.Disconnected -> {
+                        previousConnected != null &&
+                            state is PeerLink.LinkState.Connected &&
+                            previousConnected.via != state.via -> {
+                            // Connected→Connected path switch: re-assert talkspurt for Telecom.
+                            if (isOutboundMediaActive()) conn.sendMediaActivity(true)
+                        }
+                        previousConnected != null && state is PeerLink.LinkState.Disconnected -> {
                             uiFeedback.playDisconnected()
                         }
                     }
@@ -1198,16 +1224,17 @@ class LanIntercomEngine(
         val rememberedOverlayUids = overlayEndpointCache.uids
         val relevantUids =
             sightings.keys + connections.keys + cloudCandidates + rememberedOverlayUids
+        val localIfaces = localInterfaceNetworks()
 
         relevantUids.forEach { uid ->
             if (uid == localUid) return@forEach
             val sighting = sightings[uid]
             val lan = sighting
                 ?.takeUnless { it.viaOverlay }
-                ?.let { routePeer(it, connectivitySnapshot) }
+                ?.let { routeDiscoveryPeer(it, connectivitySnapshot, localIfaces) }
             val overlay = if (overlayFallbackEnabled) {
                 resolveOverlayDialTarget(uid, sighting)
-                    ?.let { routePeer(it, connectivitySnapshot) }
+                    ?.let { routeDiscoveryPeer(it, connectivitySnapshot, localIfaces) }
             } else {
                 null
             }
@@ -1221,12 +1248,25 @@ class LanIntercomEngine(
                 conn.start()
             }
             conn.applyPathTargets(lan, overlay, nowMs, cloudAvailable = wantCloud)
+            conn.maybeRecoverStuckConnecting(nowMs)
             val keepWithoutSighting = wantCloud || overlay != null ||
                 conn.linkState.value is PeerLink.LinkState.Connected
             if (sighting == null && !keepWithoutSighting) {
                 removeConnection(uid)
             }
         }
+    }
+
+    private fun routeDiscoveryPeer(
+        peer: LanPeer,
+        snapshot: ConnectivitySnapshot = connectivitySnapshot,
+        localIfaces: Collection<com.nblaisot.voxcrew.connectivity.LanNetwork> =
+            localInterfaceNetworks(),
+    ): RoutedPeerTarget? = routePeer(peer, snapshot, localIfaces)
+
+    private fun localInterfaceNetworks(): Set<com.nblaisot.voxcrew.connectivity.LanNetwork> {
+        val exclude = connectivitySnapshot.overlayNetwork?.ipv4Address?.let { setOf(it) }.orEmpty()
+        return LocalLanNetworks.enumerate(excludeIpv4Addresses = exclude)
     }
 
     private fun resolveOverlayDialTarget(uid: String, sighting: LanPeer?): LanPeer? {
@@ -1258,7 +1298,7 @@ class LanIntercomEngine(
                 if (peer.uid != localUid) overlayEndpointCache.harvestFromBeacon(peer)
             }
             beacon.removeInvalidSightings { peer ->
-                peer.viaOverlay || routePeer(peer, next) != null
+                peer.viaOverlay || routeDiscoveryPeer(peer, next) != null
             }
         }
         // Clear peer overlay cache only when local Tailscale is gone — not on tun replace.
@@ -1494,6 +1534,7 @@ class LanIntercomEngine(
         _latencyCritical.value = false
         knownCrewUids = emptySet()
         _activeRecipientUids.value = emptySet()
+        userOptedOutUids = emptySet()
         _pendingRelayOffer.value = null
         dismissedRelayOfferPeers.clear()
     }

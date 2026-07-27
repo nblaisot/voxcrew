@@ -56,7 +56,7 @@
     <string name="included_in_group">Inclus dans le groupe</string>
     <string name="muted_not_included">Muet (non inclus)</string>
     <string name="availability_offline">Hors ligne</string>
-    <string name="availability_nearby">À proximité</string>
+    <string name="availability_nearby">Connexion…</string>
     <string name="ptt_hold_to_talk">PTT — maintenir pour parler</string>
     <string name="ptt_transmitting">Transmission…</string>
     <string name="ptt_audio_unavailable">Audio indisponible — touchez Réessayer</string>

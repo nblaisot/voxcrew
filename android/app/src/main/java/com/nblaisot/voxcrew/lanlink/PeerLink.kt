@@ -178,10 +178,13 @@ class PeerLink(
     @Synchronized
     fun onHandshakeComplete(transport: FrameTransport, peerUid: String, peerAnnouncedLastContiguousSeq: Long) {
         if (currentPeerUid != peerUid) return
-        if (activeTransport !== transport) {
-            activeTransport?.stop()
-        }
+        // Assign the new transport before stopping the old one so Cloud stop()'s
+        // onDisconnected (if any) is ignored and we never flicker Disconnected mid-cutover.
+        val previous = activeTransport
         activeTransport = transport
+        if (previous != null && previous !== transport) {
+            previous.stop()
+        }
         lastActivityMs = clockMs()
         awaitingPongSinceMs = null
         lastPingSentMs = lastActivityMs - PING_INTERVAL_MS

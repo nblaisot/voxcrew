@@ -39,13 +39,30 @@ class ActiveRecipientPolicyTest {
     }
 
     @Test
-    fun `legacy mode selects all crew when active set is empty`() {
-        val result = ActiveRecipientPolicy.recipientsAfterCrewSync(
-            currentActive = emptySet(),
-            crewUids = setOf("peer-a", "peer-b"),
-            previousKnownCrew = emptySet(),
-            optInMode = false,
+    fun `connected peer is auto-included unless opted out`() {
+        assertEquals(
+            setOf("peer-a"),
+            ActiveRecipientPolicy.recipientsAfterConnected(
+                currentActive = emptySet(),
+                connectedUid = "peer-a",
+                optedOut = emptySet(),
+            ),
         )
-        assertEquals(setOf("peer-a", "peer-b"), result)
+        assertEquals(
+            emptySet<String>(),
+            ActiveRecipientPolicy.recipientsAfterConnected(
+                currentActive = emptySet(),
+                connectedUid = "peer-a",
+                optedOut = setOf("peer-a"),
+            ),
+        )
+        assertEquals(
+            setOf("peer-a"),
+            ActiveRecipientPolicy.recipientsAfterConnected(
+                currentActive = setOf("peer-a"),
+                connectedUid = "peer-a",
+                optedOut = emptySet(),
+            ),
+        )
     }
 }

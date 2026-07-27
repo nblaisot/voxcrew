@@ -5,10 +5,10 @@ import com.nblaisot.voxcrew.lanlink.PeerLink
 import com.nblaisot.voxcrew.roster.MemberAvailability
 
 /**
- * Roster icon combines discovery hints with live audio-link state.
+ * Roster icon combines presence hints with live audio-link state.
  * - Connected audio → show the live path (Local / VPN / Cloud).
- * - Discovery without Connected → [MemberAvailability.NEARBY], not a path glyph.
- * - Offline discovery → [MemberAvailability.OFFLINE].
+ * - Sighted / dialing without Connected → [MemberAvailability.NEARBY] (UI: Connecting).
+ * - Offline → [MemberAvailability.OFFLINE].
  * Cloud registration alone never paints NEARBY.
  */
 internal fun displayAvailability(

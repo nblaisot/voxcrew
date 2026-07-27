@@ -49,6 +49,10 @@ class PeerConnection(
     /** After a *real* LAN dial failure, prefer overlay/cloud until a network reset or LAN Connected. */
     @Volatile private var lanDialFailed = false
     @Volatile private var cloudDialFailed = false
+    /** Host|handle of the last LAN target — identity change clears [lanDialFailed]. */
+    @Volatile private var lastLanRouteKey: String? = null
+    @Volatile private var connectingSinceMs: Long? = null
+    private val clockMs: () -> Long = System::currentTimeMillis
 
     fun start() {
         if (started) return
@@ -89,6 +93,8 @@ class PeerConnection(
         peerLink.clear()
         lanDialFailed = false
         cloudDialFailed = false
+        lastLanRouteKey = null
+        connectingSinceMs = null
     }
 
     /**
@@ -102,6 +108,7 @@ class PeerConnection(
             peerLink.state.collect { state ->
                 when (state) {
                     is PeerLink.LinkState.Connected -> {
+                        connectingSinceMs = null
                         lastConnectedVia = state.via
                         if (state.via == PathLabels.LOCAL) {
                             lanDialFailed = false
@@ -110,7 +117,11 @@ class PeerConnection(
                             cloudDialFailed = false
                         }
                     }
+                    is PeerLink.LinkState.Connecting -> {
+                        if (connectingSinceMs == null) connectingSinceMs = clockMs()
+                    }
                     is PeerLink.LinkState.Disconnected -> {
+                        connectingSinceMs = null
                         val diedVia = lastConnectedVia
                         lastConnectedVia = null
                         if (diedVia == PathLabels.LOCAL && started) {
@@ -135,7 +146,9 @@ class PeerConnection(
                             cloudDialFailed = true
                         }
                     }
-                    else -> Unit
+                    PeerLink.LinkState.Idle -> {
+                        connectingSinceMs = null
+                    }
                 }
             }
         }
@@ -171,6 +184,14 @@ class PeerConnection(
     ) {
         if (!started) return
         val lan = lanPeer?.takeIf { it.route.path == PeerPath.LAN }
+        val lanKey = lan?.let { "${it.peer.host}|${it.route.networkHandle}" }
+        if (lanKey != null && lanKey != lastLanRouteKey) {
+            // Fresh LAN route (new host or Network handle after eviction) — retry Local.
+            lanDialFailed = false
+            lastLanRouteKey = lanKey
+        } else if (lanKey == null) {
+            lastLanRouteKey = null
+        }
         val connected = peerLink.state.value as? PeerLink.LinkState.Connected
         val sessionHealthy = connected != null && (
             lanTcpClient.hasOpenSession() || connected.via == PathLabels.CLOUD
@@ -227,6 +248,35 @@ class PeerConnection(
                 }
             }
         }
+    }
+
+    /**
+     * If we have been [PeerLink.LinkState.Connecting] longer than [CONNECTING_STALL_MS],
+     * clear dial suppression and force a new dial generation.
+     */
+    fun maybeRecoverStuckConnecting(nowMs: Long = clockMs()): Boolean {
+        if (!started) return false
+        if (peerLink.state.value !is PeerLink.LinkState.Connecting) return false
+        val since = connectingSinceMs ?: return false
+        if (nowMs - since < CONNECTING_STALL_MS) return false
+        Log.i(TAG, "connecting stall peer=$peerUid after ${nowMs - since}ms; forcing redial")
+        connectingSinceMs = nowMs
+        lanDialFailed = false
+        val lan = lanPeerProvider()
+        if (lan != null) {
+            lanTcpClient.setTarget(lan, forceRestart = true)
+            return true
+        }
+        val overlay = overlayPeerProvider()
+        if (overlay != null) {
+            lanTcpClient.setTarget(overlay, forceRestart = true)
+            return true
+        }
+        if (relayClientProvider()?.isReady() == true) {
+            promoteToCloud()
+            return true
+        }
+        return false
     }
 
     /**
@@ -311,14 +361,28 @@ class PeerConnection(
         }
         when (invalidation.affectedPath) {
             PeerPath.LAN -> {
-                lanDialFailed = true
-                val overlay = overlayPeerProvider()
-                if (overlay != null) {
-                    logInfo("LAN_INVALIDATED peer=$peerUid fallback=overlay host=${overlay.peer.host}:${overlay.peer.port}")
-                    promoteToOverlay(overlay)
-                } else if (relayClientProvider()?.isReady() == true) {
-                    logInfo("LAN_INVALIDATED peer=$peerUid fallback=cloud")
-                    promoteToCloud()
+                // Stale Network handle (EPERM) or Wi‑Fi loss: prefer a fresh Local route
+                // (including SoftAP unbound) before locking onto overlay.
+                lanDialFailed = false
+                lastLanRouteKey = null
+                val lan = lanPeerProvider()
+                if (lan != null) {
+                    logInfo(
+                        "LAN_INVALIDATED peer=$peerUid fallback=lan " +
+                            "network=${lan.route.networkHandle} host=${lan.peer.host}:${lan.peer.port}",
+                    )
+                    lanTcpClient.setTarget(lan, forceRestart = true)
+                } else {
+                    val overlay = overlayPeerProvider()
+                    if (overlay != null) {
+                        lanDialFailed = true
+                        logInfo("LAN_INVALIDATED peer=$peerUid fallback=overlay host=${overlay.peer.host}:${overlay.peer.port}")
+                        promoteToOverlay(overlay)
+                    } else if (relayClientProvider()?.isReady() == true) {
+                        lanDialFailed = true
+                        logInfo("LAN_INVALIDATED peer=$peerUid fallback=cloud")
+                        promoteToCloud()
+                    }
                 }
             }
             PeerPath.OVERLAY -> {
@@ -351,6 +415,8 @@ class PeerConnection(
 
     private companion object {
         const val TAG = "PeerConnection"
+        /** Force a redial if we sit in Connecting without reaching Connected. */
+        internal const val CONNECTING_STALL_MS = 15_000L
 
         fun logInfo(message: String) {
             runCatching { Log.i(TAG, message) }

@@ -54,6 +54,7 @@ class RelayClient(
     /** Bumped on every [reconnect]/[stop] so stale socket callbacks cannot tear down a newer session. */
     private var socketGeneration = 0
     private var reconnectJob: Job? = null
+    private var reconnectAttempt = 0
     private var settingsWatchJob: Job? = null
     private val sessions = ConcurrentHashMap<String, RelayFrameTransport>()
     private val dialWaiters = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
@@ -86,6 +87,7 @@ class RelayClient(
         settingsWatchJob = null
         reconnectJob?.cancel()
         reconnectJob = null
+        reconnectAttempt = 0
         sessions.values.forEach { it.detach() }
         sessions.clear()
         socketGeneration += 1
@@ -185,12 +187,20 @@ class RelayClient(
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 if (generation != socketGeneration) return
                 _ready.value = false
+                if (code == 1005 || code == 1006) {
+                    Log.i(TAG, "relay closed with reserved code=$code; backing off")
+                }
                 scheduleReconnect(generation)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (generation != socketGeneration) return
-                Log.w(TAG, "relay failure: ${t.message}")
+                val message = t.message.orEmpty()
+                if (message.contains("1005") || message.contains("1006")) {
+                    Log.i(TAG, "relay reserved close: $message")
+                } else {
+                    Log.w(TAG, "relay failure: $message")
+                }
                 _ready.value = false
                 scheduleReconnect(generation)
             }
@@ -217,6 +227,7 @@ class RelayClient(
         when (msg.optString("type")) {
             "hello_ok" -> {
                 _ready.value = true
+                reconnectAttempt = 0
                 Log.i(TAG, "relay hello_ok")
                 announceOverlay()
             }
@@ -272,8 +283,12 @@ class RelayClient(
     private fun scheduleReconnect(generation: Int) {
         if (generation != socketGeneration) return
         if (reconnectJob?.isActive == true) return
+        val attempt = reconnectAttempt
+        reconnectAttempt = (attempt + 1).coerceAtMost(MAX_RECONNECT_ATTEMPT)
+        val delayMs = (RECONNECT_BASE_MS shl attempt.coerceAtMost(MAX_RECONNECT_SHIFT))
+            .coerceAtMost(RECONNECT_MAX_MS)
         reconnectJob = scope.launch {
-            delay(RECONNECT_MS)
+            delay(delayMs)
             if (!isActive || generation != socketGeneration) return@launch
             reconnect()
         }
@@ -317,7 +332,10 @@ class RelayClient(
 
     companion object {
         private const val TAG = "RelayClient"
-        private const val RECONNECT_MS = 3_000L
+        private const val RECONNECT_BASE_MS = 3_000L
+        private const val RECONNECT_MAX_MS = 60_000L
+        private const val MAX_RECONNECT_SHIFT = 4
+        private const val MAX_RECONNECT_ATTEMPT = 8
         private const val DIAL_TIMEOUT_MS = 5_000L
 
         /** Settings that require opening a new socket (ignore TOFU cert-only updates). */

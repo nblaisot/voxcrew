@@ -41,7 +41,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Headset
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PhoneAndroid
-import androidx.compose.material.icons.filled.Sensors
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.VpnLock
 import androidx.compose.material.icons.filled.Wifi
@@ -837,7 +837,7 @@ private fun AvailabilityIcon(
             stringResource(R.string.path_cloud),
         )
         MemberAvailability.NEARBY -> Triple(
-            Icons.Filled.Sensors,
+            Icons.Filled.Sync,
             MaterialTheme.colorScheme.tertiary,
             stringResource(R.string.availability_nearby),
         )

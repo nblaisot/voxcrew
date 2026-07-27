@@ -4,7 +4,7 @@ enum class MemberAvailability {
     ONLINE_LOCAL,
     ONLINE_OVERLAY,
     ONLINE_CLOUD,
-    /** Discovered nearby but no live audio link yet. */
+    /** Sighted / dialing — UI shows Connecting until audio link is Connected. */
     NEARBY,
     OFFLINE,
 }

@@ -147,13 +147,34 @@ class NetworkMonitor(context: Context) : NetworkSocketBinder {
     override fun bindSocket(networkHandle: Long, socket: Socket) {
         val network = networks[networkHandle]
             ?: throw IOException("Android network $networkHandle is no longer available")
-        network.bindSocket(socket)
+        try {
+            network.bindSocket(socket)
+        } catch (error: IOException) {
+            evictStaleNetwork(networkHandle, error)
+            throw error
+        }
     }
 
     override fun bindSocket(networkHandle: Long, socket: DatagramSocket) {
         val network = networks[networkHandle]
             ?: throw IOException("Android network $networkHandle is no longer available")
-        network.bindSocket(socket)
+        try {
+            network.bindSocket(socket)
+        } catch (error: IOException) {
+            evictStaleNetwork(networkHandle, error)
+            throw error
+        }
+    }
+
+    /** Drop a Network that rejected bind (EPERM / gone) so reconcile can clear lanDialFailed. */
+    private fun evictStaleNetwork(networkHandle: Long, error: IOException) {
+        Log.w(TAG, "evicting stale network handle=$networkHandle: ${error.message}")
+        networks.remove(networkHandle)
+        synchronized(lock) {
+            lanProperties.remove(networkHandle)
+            vpnProperties.remove(networkHandle)
+            publishLocked()
+        }
     }
 
     private fun publishLocked() {

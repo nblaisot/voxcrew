@@ -84,6 +84,31 @@ class PeerConnectionPromoteTest {
     }
 
     @Test
+    fun `new LAN route identity clears lanDialFailed after prior failure`() {
+        val conn = PeerConnection(
+            peerUid = "peer",
+            scope = scope,
+            localUid = "local",
+            lanServer = server,
+            networkSocketBinder = NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
+            isStillWanted = { true },
+            overlayPeerProvider = { overlayTarget },
+            lanPeerProvider = { lanTarget },
+        )
+        conn.start()
+        // Fail Local then lock onto overlay.
+        conn.applyPathTargets(lanPeer = lanTarget, overlayPeer = overlayTarget)
+        conn.onNetworksInvalidated(setOf(lanTarget.route.networkHandle))
+        // SoftAP-style unbound route for same host must clear suppression and prefer Local.
+        val unbound = lan.copy(host = "192.168.1.5").routed(LocalLanNetworks.UNBOUND_NETWORK_HANDLE)
+        conn.applyPathTargets(lanPeer = unbound, overlayPeer = overlayTarget)
+        assertFalse(conn.lanDialFailedForTest())
+        assertEquals(PeerPath.LAN, conn.targetPathForTest())
+        conn.stop()
+    }
+
+    @Test
     fun `overlay invalidation immediately selects LAN fallback target`() {
         val conn = PeerConnection(
             peerUid = "peer",

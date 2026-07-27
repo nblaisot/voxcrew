@@ -2,6 +2,7 @@ package com.nblaisot.voxcrew.lanlink
 
 import com.nblaisot.voxcrew.connectivity.ConnectivitySnapshot
 import com.nblaisot.voxcrew.connectivity.Ipv4Link
+import com.nblaisot.voxcrew.connectivity.LanNetwork
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.Socket
@@ -17,6 +18,10 @@ data class RoutedSocketPath(
 ) {
     val label: String
         get() = if (path == PeerPath.OVERLAY) PathLabels.VPN else PathLabels.LOCAL
+
+    /** SoftAP / interface-fallback Local dial — no ConnectivityManager Network to bind. */
+    val isUnbound: Boolean
+        get() = networkHandle == LocalLanNetworks.UNBOUND_NETWORK_HANDLE
 }
 
 data class RoutedPeerTarget(
@@ -24,7 +29,11 @@ data class RoutedPeerTarget(
     val route: RoutedSocketPath,
 )
 
-internal fun routePeer(peer: LanPeer, snapshot: ConnectivitySnapshot): RoutedPeerTarget? {
+internal fun routePeer(
+    peer: LanPeer,
+    snapshot: ConnectivitySnapshot,
+    localInterfaceNetworks: Collection<LanNetwork> = emptyList(),
+): RoutedPeerTarget? {
     if (peer.viaOverlay) {
         val overlay = snapshot.overlayNetwork ?: return null
         return RoutedPeerTarget(
@@ -37,10 +46,20 @@ internal fun routePeer(peer: LanPeer, snapshot: ConnectivitySnapshot): RoutedPee
             network.ipv4Links.any { link -> ipv4PrefixContains(link, peer.host) }
         }
         .minWithOrNull(compareBy({ it.interfaceName }, { it.networkHandle }))
-        ?: return null
+    if (lan != null) {
+        return RoutedPeerTarget(
+            peer = peer,
+            route = RoutedSocketPath(PeerPath.LAN, lan.networkHandle),
+        )
+    }
+    // Hotspot AP host: peer is on a local SoftAP/tether subnet with no STA Network.
+    val softApMatch = localInterfaceNetworks.any { network ->
+        network.ipv4Links.any { link -> ipv4PrefixContains(link, peer.host) }
+    }
+    if (!softApMatch) return null
     return RoutedPeerTarget(
         peer = peer,
-        route = RoutedSocketPath(PeerPath.LAN, lan.networkHandle),
+        route = RoutedSocketPath(PeerPath.LAN, LocalLanNetworks.UNBOUND_NETWORK_HANDLE),
     )
 }
 

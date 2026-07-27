@@ -24,4 +24,18 @@ object ActiveRecipientPolicy {
         }
         return active
     }
+
+    /**
+     * When a peer reaches Connected, include them for outbound fan-out unless the user
+     * explicitly deselected them this session. No disk persistence.
+     */
+    fun recipientsAfterConnected(
+        currentActive: Set<String>,
+        connectedUid: String,
+        optedOut: Set<String>,
+    ): Set<String> {
+        if (connectedUid in optedOut) return currentActive
+        if (connectedUid in currentActive) return currentActive
+        return currentActive + connectedUid
+    }
 }

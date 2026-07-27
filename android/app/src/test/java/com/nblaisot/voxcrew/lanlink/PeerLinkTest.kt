@@ -180,6 +180,29 @@ class PeerLinkTest {
     }
 
     @Test
+    fun `transport replace never flickers Disconnected when old stop calls onDisconnected`() {
+        val peerLink = newPeerLink()
+        peerLink.resetFor("peer-b")
+        val transportA = object : FrameTransport {
+            override val label = PathLabels.CLOUD
+            override fun sendFrame(frame: LanFrame) = Unit
+            override fun dropAndRetry() = Unit
+            override fun stop() {
+                peerLink.onDisconnected(this, "peer-b")
+            }
+        }
+        peerLink.onHandshakeComplete(transportA, "peer-b", -1)
+        assertEquals(PeerLink.LinkState.Connected("peer-b", PathLabels.CLOUD), peerLink.state.value)
+
+        val transportB = FakeTransport(PathLabels.LOCAL)
+        peerLink.onHandshakeComplete(transportB, "peer-b", -1)
+
+        // Must stay Connected to Local — Cloud stop()'s onDisconnected must not win.
+        assertEquals(PeerLink.LinkState.Connected("peer-b", PathLabels.LOCAL), peerLink.state.value)
+        peerLink.clear()
+    }
+
+    @Test
     fun `markUnreachable transitions connected link to disconnected`() {
         val peerLink = newPeerLink()
         peerLink.resetFor("peer-b")
