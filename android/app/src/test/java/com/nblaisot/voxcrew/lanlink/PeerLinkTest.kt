@@ -339,6 +339,34 @@ class PeerLinkTest {
     }
 
     @Test
+    fun `disconnected buffer ages out automatically past TTL without further sends`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val peerLink = PeerLink(
+            this,
+            healthDispatcher = dispatcher,
+            clockMs = { testScheduler.currentTime },
+        )
+        peerLink.resetFor("peer-b")
+        peerLink.send(byteArrayOf(1))
+        peerLink.send(byteArrayOf(2))
+        testScheduler.runCurrent()
+        assertEquals(40L, peerLink.backlogMs.value)
+        assertEquals(2, peerLink.unacknowledgedFrames().size)
+
+        // Exactly at max age frames are kept; one ms past they must drop without a new send.
+        testScheduler.advanceTimeBy(SendBuffer.DEFAULT_MAX_AGE_MS)
+        testScheduler.runCurrent()
+        assertEquals(40L, peerLink.backlogMs.value)
+
+        testScheduler.advanceTimeBy(1)
+        testScheduler.runCurrent()
+
+        assertEquals(0L, peerLink.backlogMs.value)
+        assertTrue(peerLink.unacknowledgedFrames().isEmpty())
+        peerLink.clear()
+    }
+
+    @Test
     fun `health loop restarts after a disconnect and reconnect`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val peerLink = PeerLink(

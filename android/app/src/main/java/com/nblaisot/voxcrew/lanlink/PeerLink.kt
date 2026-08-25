@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -71,6 +72,7 @@ class PeerLink(
     private var currentPeerUid: String? = null
     private var activeTransport: FrameTransport? = null
     private var healthLoopJob: Job? = null
+    private var expiryLoopJob: Job? = null
     private val healthSignal = Channel<Unit>(Channel.CONFLATED)
 
     private val sendBuffer = SendBuffer()
@@ -108,6 +110,7 @@ class PeerLink(
         activeTransport?.stop()
         activeTransport = null
         stopHealthLoop()
+        stopExpiryLoop()
         currentPeerUid = peerUid
         sendBuffer.clear()
         outSeq = 0
@@ -126,6 +129,7 @@ class PeerLink(
 
     fun clear() {
         stopHealthLoop()
+        stopExpiryLoop()
         activeTransport?.stop()
         activeTransport = null
         currentPeerUid = null
@@ -154,11 +158,14 @@ class PeerLink(
     fun send(payload: ByteArray) {
         expireStaleFrames()
         val seq = outSeq++
-        sendBuffer.add(seq, payload)
+        sendBuffer.add(seq, payload, enqueuedAtMs = clockMs())
         updateBacklog()
-        activeTransport?.let { transport ->
+        val transport = activeTransport
+        if (transport != null) {
             maybeSendSkip(transport)
             transport.sendFrame(LanFrame.Audio(seq, payload))
+        } else {
+            ensureExpiryLoop()
         }
     }
 
@@ -167,10 +174,13 @@ class PeerLink(
         expireStaleFrames()
         val seq = outSeq++
         val kind = if (active) SendBuffer.Kind.MEDIA_ACTIVE else SendBuffer.Kind.MEDIA_INACTIVE
-        sendBuffer.add(seq, ByteArray(0), kind = kind)
-        activeTransport?.let { transport ->
+        sendBuffer.add(seq, ByteArray(0), enqueuedAtMs = clockMs(), kind = kind)
+        val transport = activeTransport
+        if (transport != null) {
             maybeSendSkip(transport)
             transport.sendFrame(LanFrame.MediaActivity(seq, active))
+        } else {
+            ensureExpiryLoop()
         }
     }
 
@@ -182,9 +192,13 @@ class PeerLink(
         // onDisconnected (if any) is ignored and we never flicker Disconnected mid-cutover.
         val previous = activeTransport
         activeTransport = transport
+<<<<<<< HEAD
         if (previous != null && previous !== transport) {
             previous.stop()
         }
+=======
+        stopExpiryLoop()
+>>>>>>> f7891a4 (Restore automatic 30s send-buffer TTL while peers are disconnected.)
         lastActivityMs = clockMs()
         awaitingPongSinceMs = null
         lastPingSentMs = lastActivityMs - PING_INTERVAL_MS
@@ -239,6 +253,7 @@ class PeerLink(
         awaitingPongSinceMs = null
         _rttMs.value = null
         _state.value = LinkState.Disconnected(peerUid)
+        if (sendBuffer.size() > 0) ensureExpiryLoop()
     }
 
     /**
@@ -289,8 +304,9 @@ class PeerLink(
 
     /**
      * ACK/ping loop runs only while a transport is attached (started on handshake,
-     * stopped on detach). Buffer expiry happens at event points ([send],
-     * [onHandshakeComplete]) so nothing polls per peer while disconnected.
+     * stopped on detach). While disconnected with a non-empty send buffer, a separate
+     * deadline-driven [ensureExpiryLoop] sweeps frames past [SendBuffer.DEFAULT_MAX_AGE_MS]
+     * so backlog ages out without ACK/ping polling.
      */
     @Synchronized
     private fun ensureHealthLoop() {
@@ -360,9 +376,61 @@ class PeerLink(
         healthLoopJob = null
     }
 
+    /**
+     * Runs only while disconnected with buffered frames. Sleeps until the oldest
+     * frame's TTL deadline, expires, then reschedules or exits.
+     * Caller must hold the [PeerLink] monitor (or be a @Synchronized member).
+     */
+    @Synchronized
+    private fun ensureExpiryLoop() {
+        if (expiryLoopJob?.isActive == true) return
+        if (activeTransport != null || sendBuffer.size() == 0) return
+        expiryLoopJob = scope.launch(healthDispatcher) { runExpiryLoop() }
+    }
+
+    private suspend fun runExpiryLoop() {
+        while (currentCoroutineContext().isActive) {
+            val waitMs = synchronized(this@PeerLink) {
+                if (activeTransport != null || sendBuffer.size() == 0) {
+                    expiryLoopJob = null
+                    return@synchronized null
+                }
+                val oldest = sendBuffer.oldestEnqueuedAtMs() ?: run {
+                    expiryLoopJob = null
+                    return@synchronized null
+                }
+                // expireOlderThan keeps frames at exactly max age; wake one ms past that.
+                (oldest + SendBuffer.DEFAULT_MAX_AGE_MS + 1L - clockMs()).coerceAtLeast(1L)
+            } ?: return
+
+            delay(waitMs)
+
+            val shouldContinue = synchronized(this@PeerLink) {
+                if (activeTransport != null) {
+                    expiryLoopJob = null
+                    return@synchronized false
+                }
+                expireStaleFrames()
+                if (sendBuffer.size() == 0) {
+                    expiryLoopJob = null
+                    false
+                } else {
+                    true
+                }
+            }
+            if (!shouldContinue) return
+        }
+    }
+
+    @Synchronized
+    private fun stopExpiryLoop() {
+        expiryLoopJob?.cancel()
+        expiryLoopJob = null
+    }
+
     /** Caller must hold the [PeerLink] monitor (or be a @Synchronized member). */
     private fun expireStaleFrames() {
-        val dropped = sendBuffer.expireOlderThan(SendBuffer.DEFAULT_MAX_AGE_MS)
+        val dropped = sendBuffer.expireOlderThan(SendBuffer.DEFAULT_MAX_AGE_MS, nowMs = clockMs())
         if (dropped > 0) {
             updateBacklog()
             _bufferExpired.tryEmit(dropped)
