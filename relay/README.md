@@ -17,8 +17,10 @@ Ready-made units: [`deploy/`](./deploy/) (`env.example`, systemd, launchd).
 ## Path order on the phone
 
 1. Local (LAN TCP)
-2. VPN (Tailscale TCP, if `overlayHost` is on the current sighting)
-3. Cloud (this relay) — dial peer UUID; bridge fails if peer is not registered
+2. Cloud (this relay) — when control WSS is `hello_ok`; dial peer UUID
+3. VPN (Tailscale TCP) — when Cloud is not configured/ready, or as fallback
+
+Discovery / NEARBY stays **LAN-only**.
 
 ## Quick smoke test
 

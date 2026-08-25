@@ -1,14 +1,15 @@
 package com.nblaisot.voxcrew.lanlink
 
 /**
- * Pure path preference: Local → VPN (ephemeral overlayHost) → Cloud (UUID relay).
- * Discovery remains LAN-only; Cloud never invents NEARBY.
+ * Pure path preference when choosing a dial target:
+ * Local → Cloud (UUID relay, when control WSS is ready) → VPN (ephemeral overlayHost).
+ * Discovery remains LAN-only; Cloud never invents NEARBY without a link attempt.
  */
 object OverlayFailoverPolicy {
     enum class PathAction {
         /** Prefer / keep LAN as the active dial target. */
         USE_LAN,
-        /** Use overlay endpoint (LAN absent, or LAN dial already failed). */
+        /** Use overlay endpoint (LAN absent, or LAN dial already failed; Cloud not ready). */
         USE_OVERLAY,
         /** Dial peer UUID via the optional self-hosted relay. */
         USE_CLOUD,
@@ -35,15 +36,17 @@ object OverlayFailoverPolicy {
         lanDialFailed: Boolean = false,
         hasCloudEndpoint: Boolean = false,
     ): Decision {
-        // Healthy path is never torn down solely because UDP presence went quiet.
+        // Healthy Local is never torn down solely because UDP presence went quiet.
         if (sessionHealthy && activeVia == PathLabels.LOCAL) {
             return Decision(PathAction.KEEP_SESSION)
         }
-        if (sessionHealthy && activeVia == PathLabels.VPN && lanSighting == null) {
+        // Healthy Cloud stays even if an overlay endpoint appears (no Cloud → VPN steal).
+        if (sessionHealthy && activeVia == PathLabels.CLOUD && lanSighting == null) {
             return Decision(PathAction.KEEP_SESSION)
         }
-        if (sessionHealthy && activeVia == PathLabels.CLOUD &&
-            lanSighting == null && !hasOverlayEndpoint
+        // Healthy VPN only when Cloud is not available (Cloud preferred off-LAN).
+        if (sessionHealthy && activeVia == PathLabels.VPN &&
+            lanSighting == null && !hasCloudEndpoint
         ) {
             return Decision(PathAction.KEEP_SESSION)
         }
@@ -53,11 +56,12 @@ object OverlayFailoverPolicy {
         if (lan != null && !(lanDialFailed && failoverAvailable)) {
             return Decision(PathAction.USE_LAN)
         }
-        if (hasOverlayEndpoint) {
-            return Decision(PathAction.USE_OVERLAY)
-        }
+        // Off-LAN (or LAN dial failed): Cloud before overlay when relay is ready.
         if (hasCloudEndpoint) {
             return Decision(PathAction.USE_CLOUD)
+        }
+        if (hasOverlayEndpoint) {
+            return Decision(PathAction.USE_OVERLAY)
         }
         if (lan != null) {
             return Decision(PathAction.USE_LAN)

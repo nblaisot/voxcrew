@@ -177,6 +177,14 @@ function sendJson(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
+/** One-line ops log — never secrets or audio payloads. */
+function opsLog(event, fields = {}) {
+  const parts = Object.entries(fields)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${k}=${v}`);
+  console.log(`[relay] ${event}${parts.length ? ` ${parts.join(' ')}` : ''}`);
+}
+
 /** @param {unknown} msg */
 export function parseOverlayEndpoint(msg) {
   if (!msg || typeof msg !== 'object') return null;
@@ -249,6 +257,7 @@ export function evaluateRosterMatches(client) {
       peerUid: client.uid,
       displayName: client.displayName,
     });
+    opsLog('roster_match', { a: client.uid, b: peerUid });
   }
 }
 
@@ -270,6 +279,7 @@ function unregister(client) {
     if (peer) {
       peer.bridges.delete(client.uid);
       sendJson(peer.ws, { type: 'peer_gone', peerUid: client.uid });
+      opsLog('peer_gone', { uid: client.uid, to: peerUid });
     }
   }
   client.bridges.clear();
@@ -287,6 +297,7 @@ export function applyRosterInterest(client, uids) {
     }
   }
   client.interest = next;
+  opsLog('roster_interest', { uid: client.uid, n: next.size });
   evaluateRosterMatches(client);
 }
 
@@ -340,6 +351,7 @@ export function attachClient(ws, expectedSecret) {
       applyOverlay(client, parseOverlayEndpoint(msg));
       clients.set(uid, client);
       sendJson(ws, { type: 'hello_ok', uid });
+      opsLog('hello_ok', { uid });
       // Interest is empty until roster_interest; still evaluate in case of replace races.
       evaluateRosterMatches(client);
       return;
@@ -366,11 +378,13 @@ export function attachClient(ws, expectedSecret) {
       const peerUid = String(msg.peerUid || '').trim();
       if (!peerUid || peerUid === client.uid) {
         sendJson(ws, { type: 'dial_fail', peerUid, reason: 'invalid_peer' });
+        opsLog('dial_fail', { from: client.uid, peerUid, reason: 'invalid_peer' });
         return;
       }
       const peer = clients.get(peerUid);
       if (!peer) {
         sendJson(ws, { type: 'dial_fail', peerUid, reason: 'peer_absent' });
+        opsLog('dial_fail', { from: client.uid, peerUid, reason: 'peer_absent' });
         return;
       }
       client.bridges.add(peerUid);
@@ -378,6 +392,7 @@ export function attachClient(ws, expectedSecret) {
       sendJson(ws, dialOkPayload(peerUid, peer));
       // Peer learns we want a bridge so both sides can exchange Hello.
       sendJson(peer.ws, dialOkPayload(client.uid, client));
+      opsLog('dial_ok', { from: client.uid, peerUid });
       return;
     }
   });

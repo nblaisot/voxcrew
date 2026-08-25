@@ -66,6 +66,9 @@ class LanTcpClient(
     /** Fired after a *real* failed dial to a non-overlay (LAN) target (not intentional cancel). */
     @Volatile var onLanDialFailed: (() -> Unit)? = null
 
+    /** Fired after a *real* failed dial to an overlay/VPN target (not intentional cancel). */
+    @Volatile var onOverlayDialFailed: (() -> Unit)? = null
+
     /** Peer offered crew relay settings on a Local Hello (UI may confirm). */
     @Volatile var onRelayOffer: ((peerUid: String, offer: com.nblaisot.voxcrew.relay.RelayConfigLink) -> Unit)? = null
 
@@ -509,8 +512,10 @@ class LanTcpClient(
                 val failedLan = isLanTarget(target)
                 if (failedLan) {
                     onLanDialFailed?.invoke()
+                } else if (target.route.path == PeerPath.OVERLAY) {
+                    onOverlayDialFailed?.invoke()
                 }
-                // Target may have switched to overlay inside the callback.
+                // Target may have switched to overlay/cloud inside the callback.
                 if (failedLan && targetPeer?.let { !isLanTarget(it) } == true) {
                     continue
                 }
@@ -721,6 +726,8 @@ class LanTcpClient(
         failedTarget?.let { target ->
             if (isLanTarget(target)) {
                 onLanDialFailed?.invoke()
+            } else if (target.route.path == PeerPath.OVERLAY) {
+                onOverlayDialFailed?.invoke()
             }
         }
     }

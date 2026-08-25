@@ -37,12 +37,15 @@ Aucun serveur applicatif : la découverte reste sur le LAN / hotspot ; l’audio
 ## Chemin audio
 
 1. **Local** — beacon UDP + TCP Opus sur le même réseau (ou hotspot)
-2. **VPN (Tailscale)** — TCP Opus lié au `Network` Tailscale vérifié. L’adresse peer `100.x` est apprise (1) via le champ `overlayHost` des beacons LAN, et/ou (2) via des *hints* éphémères sur le relais Cloud (`hello` / `overlay_announce` / `dial_ok` / `peer_overlay`) quand les deux appareils ont déjà un WSS authentifié. Cache **session-only** en RAM (`OverlayEndpointCache`) — jamais dans le roster / SharedPreferences. Quand le VPN local disparaît, le cache est vidé.
-3. **Cloud (optionnel)** — dial par UUID via un relais TLS WebSocket auto-hébergé (`relay/`, ex. Mac Mini derrière Freebox). Pas d’annuaire public ni de flux WATCH/FCM : uniquement une **intersection mutuelle de roster** en RAM (`roster_interest` / `roster_match`) quand les deux appareils sont `hello_ok` et se connaissent déjà, plus le dial explicite. Échec de dial = peer absent du Mini. Aucune IP peer **persistée** côté Mini (hints overlay + interest uniquement en RAM pendant le socket). **Déploiement multi-OS (agents inclus) :** [`docs/relay-deploy.md`](relay-deploy.md).
-
+2. **Cloud (optionnel)** — dial par UUID via un relais TLS WebSocket auto-hébergé (`relay/`, ex. Mac Mini derrière Freebox). Pas d’annuaire public ni de flux WATCH/FCM : uniquement une **intersection mutuelle de roster** en RAM (`roster_interest` / `roster_match`) quand les deux appareils sont `hello_ok` et se connaissent déjà, plus le dial explicite. Échec de dial = peer absent du Mini. Aucune IP peer **persistée** côté Mini (hints overlay + interest uniquement en RAM pendant le socket). **Déploiement multi-OS (agents inclus) :** [`docs/relay-deploy.md`](relay-deploy.md).
+3. **VPN (Tailscale)** — TCP Opus lié au `Network` Tailscale vérifié, quand le relais n’est pas prêt ou comme secours. L’adresse peer `100.x` est apprise (1) via le champ `overlayHost` des beacons LAN, et/ou (2) via des *hints* éphémères sur le relais Cloud (`hello` / `overlay_announce` / `dial_ok` / `peer_overlay`) quand les deux appareils ont déjà un WSS authentifié. Cache **session-only** en RAM (`OverlayEndpointCache`) — jamais dans le roster / SharedPreferences. Quand le VPN local disparaît, le cache est vidé.
 Sur un Hello **Local** (TCP LAN), un appareil déjà configuré peut piggybacker URL + secret (+ empreinte) dans des octets optionnels en fin de Hello. Les anciens clients ignorent ces octets. Le pair non configuré affiche une confirmation avant d’appliquer — jamais d’écrasement automatique, jamais sur beacon UDP, jamais sur Hello VPN/Cloud.
 
-Ordre de préférence : Local sain > VPN sain > tentative Cloud > clear. Un Cloud sain cède la place au VPN dès qu’un endpoint overlay session devient connu (make-before-break). La découverte / NEARBY reste **LAN-only** — s’enregistrer sur le relais ne peint jamais « à proximité ».
+Ordre de préférence : Local sain > Cloud (relais `hello_ok`) > VPN (Tailscale) > clear.
+Un Cloud sain **ne** cède **pas** la place au VPN si un endpoint overlay apparaît — le VPN
+reste une option quand le relais n’est pas configuré / prêt, ou comme chemin de secours
+après échec Cloud. La découverte / NEARBY reste **LAN-only** — s’enregistrer sur le relais
+ne peint jamais « à proximité » ; un dial Cloud en cours peut afficher Connecting.
 
 Un seul espace de séquence `PeerLink` survit au changement de chemin (make-before-break vers le LAN quand il revient).
 

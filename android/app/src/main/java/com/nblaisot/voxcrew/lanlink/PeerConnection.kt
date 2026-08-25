@@ -63,17 +63,25 @@ class PeerConnection(
         lanTcpClient.onLanDialFailed = {
             if (started) {
                 lanDialFailed = true
-                val overlay = overlayPeerProvider()
-                if (overlay != null) {
-                    Log.i(
-                        TAG,
-                        "LAN dial failed for $peerUid; switching to overlay ${overlay.peer.host}",
-                    )
-                    promoteToOverlay(overlay)
-                } else if (relayClientProvider()?.isReady() == true) {
-                    Log.i(TAG, "LAN dial failed for $peerUid; switching to cloud")
+                // Local > Cloud > VPN: prefer Cloud when relay is ready.
+                if (relayClientProvider()?.isReady() == true) {
+                    logInfo("LAN dial failed for $peerUid; switching to cloud")
                     promoteToCloud()
+                } else {
+                    val overlay = overlayPeerProvider()
+                    if (overlay != null) {
+                        logInfo(
+                            "LAN dial failed for $peerUid; switching to overlay ${overlay.peer.host}",
+                        )
+                        promoteToOverlay(overlay)
+                    }
                 }
+            }
+        }
+        lanTcpClient.onOverlayDialFailed = {
+            if (started && relayClientProvider()?.isReady() == true) {
+                logInfo("overlay dial failed for $peerUid; switching to cloud")
+                promoteToCloud()
             }
         }
         watchLinkDeath()
@@ -87,6 +95,7 @@ class PeerConnection(
         cloudDialJob?.cancel()
         cloudDialJob = null
         lanTcpClient.onLanDialFailed = null
+        lanTcpClient.onOverlayDialFailed = null
         lanTcpClient.stop()
         lanTcpClient.setTarget(null)
         relayClientProvider()?.closeSession(peerUid)
@@ -129,11 +138,13 @@ class PeerConnection(
                             val lan = lanPeerProvider()
                             if (LocalLinkDeathPolicy.shouldPromoteOverlay(lan?.peer)) {
                                 lanDialFailed = true
-                                val overlay = overlayPeerProvider()
-                                if (overlay != null) {
-                                    promoteToOverlay(overlay)
-                                } else if (relayClientProvider()?.isReady() == true) {
+                                if (relayClientProvider()?.isReady() == true) {
                                     promoteToCloud()
+                                } else {
+                                    val overlay = overlayPeerProvider()
+                                    if (overlay != null) {
+                                        promoteToOverlay(overlay)
+                                    }
                                 }
                             } else if (lan != null) {
                                 lanDialFailed = false
