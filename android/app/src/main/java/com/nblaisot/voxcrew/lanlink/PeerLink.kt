@@ -192,13 +192,10 @@ class PeerLink(
         // onDisconnected (if any) is ignored and we never flicker Disconnected mid-cutover.
         val previous = activeTransport
         activeTransport = transport
-<<<<<<< HEAD
         if (previous != null && previous !== transport) {
             previous.stop()
         }
-=======
         stopExpiryLoop()
->>>>>>> f7891a4 (Restore automatic 30s send-buffer TTL while peers are disconnected.)
         lastActivityMs = clockMs()
         awaitingPongSinceMs = null
         lastPingSentMs = lastActivityMs - PING_INTERVAL_MS
