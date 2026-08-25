@@ -134,6 +134,70 @@ test('hello rejects bad secret and dial bridges when both registered', async () 
   await relay.close();
 });
 
+test('mutual roster interest notifies both sides; one-way does not', async () => {
+  const relay = createRelayServer({
+    secret: 'test-secret',
+    port: 0,
+    allowInsecure: true,
+  });
+  const addr = await relay.listen();
+  const port = typeof addr === 'object' && addr ? addr.port : 0;
+  const url = `ws://127.0.0.1:${port}`;
+
+  const a = new WebSocket(url);
+  const b = new WebSocket(url);
+  await Promise.all([
+    new Promise((r) => a.once('open', r)),
+    new Promise((r) => b.once('open', r)),
+  ]);
+  a.send(JSON.stringify({ type: 'hello', uid: 'uid-a', displayName: 'A', secret: 'test-secret' }));
+  b.send(JSON.stringify({ type: 'hello', uid: 'uid-b', displayName: 'B', secret: 'test-secret' }));
+  assert.equal(JSON.parse(String((await onceMessage(a)).data)).type, 'hello_ok');
+  assert.equal(JSON.parse(String((await onceMessage(b)).data)).type, 'hello_ok');
+
+  // One-way: A knows B, B has not declared interest — no match.
+  const noMatchWait = Promise.race([
+    onceMessage(a).then(() => 'a'),
+    onceMessage(b).then(() => 'b'),
+    new Promise((r) => setTimeout(() => r('timeout'), 200)),
+  ]);
+  a.send(JSON.stringify({ type: 'roster_interest', uids: ['uid-b'] }));
+  assert.equal(await noMatchWait, 'timeout');
+
+  // Mutual: both know each other → both get roster_match.
+  const matchA = onceMessage(a);
+  const matchB = onceMessage(b);
+  b.send(JSON.stringify({ type: 'roster_interest', uids: ['uid-a'] }));
+  const msgA = JSON.parse(String((await matchA).data));
+  const msgB = JSON.parse(String((await matchB).data));
+  assert.equal(msgA.type, 'roster_match');
+  assert.equal(msgA.peerUid, 'uid-b');
+  assert.equal(msgA.displayName, 'B');
+  assert.equal(msgB.type, 'roster_match');
+  assert.equal(msgB.peerUid, 'uid-a');
+  assert.equal(msgB.displayName, 'A');
+
+  // Disconnect clears the departed peer's interest. A still lists B; fresh B has none → no rematch.
+  b.close();
+  await new Promise((r) => setTimeout(r, 50));
+
+  const b2 = new WebSocket(url);
+  await new Promise((r) => b2.once('open', r));
+  b2.send(JSON.stringify({ type: 'hello', uid: 'uid-b', displayName: 'B', secret: 'test-secret' }));
+  assert.equal(JSON.parse(String((await onceMessage(b2)).data)).type, 'hello_ok');
+
+  const noRematch = Promise.race([
+    onceMessage(a).then(() => 'a'),
+    onceMessage(b2).then(() => 'b'),
+    new Promise((r) => setTimeout(() => r('timeout'), 200)),
+  ]);
+  assert.equal(await noRematch, 'timeout');
+
+  a.close();
+  b2.close();
+  await relay.close();
+});
+
 test('parseOverlayEndpoint rejects invalid ports', () => {
   assert.equal(parseOverlayEndpoint({ overlayHost: '100.1.1.1', tcpPort: 0 }), null);
   assert.deepEqual(

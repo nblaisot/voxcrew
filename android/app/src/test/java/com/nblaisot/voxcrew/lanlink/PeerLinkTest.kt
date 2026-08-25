@@ -446,4 +446,59 @@ class PeerLinkTest {
         assertNull(peerLink.rttMs.value)
         peerLink.clear()
     }
+
+    @Test
+    fun `peer announced sequence higher than local outSeq fast forwards outSeq for next transmission`() {
+        val peerLink = newPeerLink()
+        peerLink.resetFor("peer-b")
+        val transport = FakeTransport("A")
+        peerLink.onHandshakeComplete(transport, "peer-b", 50)
+
+        peerLink.send(byteArrayOf(42))
+        assertEquals(listOf(51L), transport.sentAudio().map { it.seq })
+        peerLink.clear()
+    }
+
+    @Test
+    fun `reconnected peer after sequence reset can transmit audio without remote drop`() {
+        val senderLink = newPeerLink()
+        senderLink.resetFor("peer-b")
+        val senderTransport = FakeTransport("A")
+        senderLink.onHandshakeComplete(senderTransport, "peer-b", -1)
+
+        val receiverLink = newPeerLink()
+        receiverLink.resetFor("peer-a")
+        val receiverTransport = FakeTransport("B")
+        receiverLink.onHandshakeComplete(receiverTransport, "peer-a", -1)
+
+        // Sender sends 3 frames (0, 1, 2)
+        senderLink.send(byteArrayOf(1))
+        senderLink.send(byteArrayOf(2))
+        senderLink.send(byteArrayOf(3))
+
+        // Receiver receives them
+        receiverLink.onFrameReceived(receiverTransport, LanFrame.Audio(0, byteArrayOf(1)))
+        receiverLink.onFrameReceived(receiverTransport, LanFrame.Audio(1, byteArrayOf(2)))
+        receiverLink.onFrameReceived(receiverTransport, LanFrame.Audio(2, byteArrayOf(3)))
+        assertEquals(2L, receiverLink.lastContiguousInSeq())
+
+        // Sender resets (e.g. connection recreated)
+        senderLink.resetFor("peer-b")
+
+        // Sender reconnects and handshake receives peer's last contiguous seq (2)
+        val newSenderTransport = FakeTransport("A2")
+        senderLink.onHandshakeComplete(newSenderTransport, "peer-b", 2)
+
+        // Sender produces a new audio frame
+        senderLink.send(byteArrayOf(4))
+        val newAudio = newSenderTransport.sentAudio().last()
+        assertEquals(3L, newAudio.seq)
+
+        // Receiver receives the new frame without dropping it
+        receiverLink.onFrameReceived(receiverTransport, newAudio)
+        assertEquals(3L, receiverLink.lastContiguousInSeq())
+
+        senderLink.clear()
+        receiverLink.clear()
+    }
 }

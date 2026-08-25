@@ -184,6 +184,9 @@ class PeerLink(
         }
     }
 
+    /** True when [transport] is the live media pipe (same object the UI Connected.via came from). */
+    fun isActiveTransport(transport: FrameTransport): Boolean = activeTransport === transport
+
     /** Called by a transport once its own Hello/resume exchange with [peerUid] has succeeded. */
     @Synchronized
     fun onHandshakeComplete(transport: FrameTransport, peerUid: String, peerAnnouncedLastContiguousSeq: Long) {
@@ -202,6 +205,9 @@ class PeerLink(
         lastAckSentSeq = lastContiguousInSeq
         lastAckSentMs = lastActivityMs
         peerAckedSeq = peerAnnouncedLastContiguousSeq
+        if (peerAnnouncedLastContiguousSeq >= 0 && outSeq <= peerAnnouncedLastContiguousSeq) {
+            outSeq = peerAnnouncedLastContiguousSeq + 1
+        }
         sendBuffer.trimTo(peerAnnouncedLastContiguousSeq)
         expireStaleFrames()
         updateBacklog()

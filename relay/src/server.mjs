@@ -1,10 +1,12 @@
 /**
  * Minimal TLS WebSocket relay for VoxCrew.
  *
- * Protocol: hello / dial / overlay_announce / opaque LanFrame binary — no presence/WATCH.
+ * Protocol: hello / dial / roster_interest / opaque LanFrame binary.
+ * No public online directory or FCM/WATCH stream — only session-scoped mutual roster
+ * intersection (both peers already know each other and are hello_ok).
  * Identity on the Mini is the peer UUID. Peer Tailscale IPs are never written to disk;
  * optional overlayHost/tcpPort may exist only in RAM for the live WebSocket session so
- * clients can upgrade Cloud → direct VPN.
+ * clients can upgrade Cloud → direct VPN. Interest sets are RAM-only and cleared on disconnect.
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -24,6 +26,7 @@ const ALLOW_INSECURE = process.env.RELAY_ALLOW_INSECURE === '1';
  *   displayName: string,
  *   ws: import('ws').WebSocket,
  *   bridges: Set<string>,
+ *   interest: Set<string>,
  *   overlayHost?: string,
  *   tcpPort?: number,
  * }} Client
@@ -31,6 +34,11 @@ const ALLOW_INSECURE = process.env.RELAY_ALLOW_INSECURE === '1';
 
 /** @type {Map<string, Client>} */
 const clients = new Map();
+
+/** Dedupe roster_match storms on reconnect (pairKey → last notify ms). */
+/** @type {Map<string, number>} */
+const lastMatchNotifyMs = new Map();
+const MATCH_NOTIFY_COOLDOWN_MS = 3_000;
 
 export function timingSafeEqualString(a, b) {
   const ba = Buffer.from(String(a), 'utf8');
@@ -169,6 +177,14 @@ function sendJson(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
+/** One-line ops log — never secrets or audio payloads. */
+function opsLog(event, fields = {}) {
+  const parts = Object.entries(fields)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${k}=${v}`);
+  console.log(`[relay] ${event}${parts.length ? ` ${parts.join(' ')}` : ''}`);
+}
+
 /** @param {unknown} msg */
 export function parseOverlayEndpoint(msg) {
   if (!msg || typeof msg !== 'object') return null;
@@ -211,6 +227,48 @@ function notifyBridgedPeersOfOverlay(client) {
   }
 }
 
+function pairKey(a, b) {
+  return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+/**
+ * Notify both sides when A∈B.interest ∧ B∈A.interest and both are registered.
+ * Never emits for one-way knowledge. Rate-limited per pair.
+ * @param {Client} client
+ */
+export function evaluateRosterMatches(client) {
+  if (!client?.interest?.size) return;
+  const now = Date.now();
+  for (const peerUid of client.interest) {
+    if (!peerUid || peerUid === client.uid) continue;
+    const peer = clients.get(peerUid);
+    if (!peer?.interest?.has(client.uid)) continue;
+    const key = pairKey(client.uid, peerUid);
+    const last = lastMatchNotifyMs.get(key) || 0;
+    if (now - last < MATCH_NOTIFY_COOLDOWN_MS) continue;
+    lastMatchNotifyMs.set(key, now);
+    sendJson(client.ws, {
+      type: 'roster_match',
+      peerUid,
+      displayName: peer.displayName,
+    });
+    sendJson(peer.ws, {
+      type: 'roster_match',
+      peerUid: client.uid,
+      displayName: client.displayName,
+    });
+    opsLog('roster_match', { a: client.uid, b: peerUid });
+  }
+}
+
+function clearMatchNotifyFor(uid) {
+  for (const key of [...lastMatchNotifyMs.keys()]) {
+    if (key === uid || key.startsWith(`${uid}|`) || key.endsWith(`|${uid}`)) {
+      lastMatchNotifyMs.delete(key);
+    }
+  }
+}
+
 function unregister(client) {
   if (!client?.uid) return;
   if (clients.get(client.uid) === client) {
@@ -221,9 +279,26 @@ function unregister(client) {
     if (peer) {
       peer.bridges.delete(client.uid);
       sendJson(peer.ws, { type: 'peer_gone', peerUid: client.uid });
+      opsLog('peer_gone', { uid: client.uid, to: peerUid });
     }
   }
   client.bridges.clear();
+  client.interest?.clear();
+  clearMatchNotifyFor(client.uid);
+}
+
+/** Replace the client's known-crew interest set (RAM only). */
+export function applyRosterInterest(client, uids) {
+  const next = new Set();
+  if (Array.isArray(uids)) {
+    for (const raw of uids) {
+      const uid = String(raw || '').trim();
+      if (uid && uid !== client.uid) next.add(uid);
+    }
+  }
+  client.interest = next;
+  opsLog('roster_interest', { uid: client.uid, n: next.size });
+  evaluateRosterMatches(client);
 }
 
 /**
@@ -272,10 +347,13 @@ export function attachClient(ws, expectedSecret) {
         }
         unregister(previous);
       }
-      client = { uid, displayName, ws, bridges: new Set() };
+      client = { uid, displayName, ws, bridges: new Set(), interest: new Set() };
       applyOverlay(client, parseOverlayEndpoint(msg));
       clients.set(uid, client);
       sendJson(ws, { type: 'hello_ok', uid });
+      opsLog('hello_ok', { uid });
+      // Interest is empty until roster_interest; still evaluate in case of replace races.
+      evaluateRosterMatches(client);
       return;
     }
 
@@ -291,15 +369,22 @@ export function attachClient(ws, expectedSecret) {
       return;
     }
 
+    if (msg.type === 'roster_interest') {
+      applyRosterInterest(client, msg.uids);
+      return;
+    }
+
     if (msg.type === 'dial') {
       const peerUid = String(msg.peerUid || '').trim();
       if (!peerUid || peerUid === client.uid) {
         sendJson(ws, { type: 'dial_fail', peerUid, reason: 'invalid_peer' });
+        opsLog('dial_fail', { from: client.uid, peerUid, reason: 'invalid_peer' });
         return;
       }
       const peer = clients.get(peerUid);
       if (!peer) {
         sendJson(ws, { type: 'dial_fail', peerUid, reason: 'peer_absent' });
+        opsLog('dial_fail', { from: client.uid, peerUid, reason: 'peer_absent' });
         return;
       }
       client.bridges.add(peerUid);
@@ -307,6 +392,7 @@ export function attachClient(ws, expectedSecret) {
       sendJson(ws, dialOkPayload(peerUid, peer));
       // Peer learns we want a bridge so both sides can exchange Hello.
       sendJson(peer.ws, dialOkPayload(client.uid, client));
+      opsLog('dial_ok', { from: client.uid, peerUid });
       return;
     }
   });

@@ -296,6 +296,15 @@ class LanIntercomEngine(
                 connections[peerUid]?.acceptCloudInbound()
             }
         }
+        relay.onRosterMatch = { peerUid, _displayName ->
+            // Mutual interest only drives Cloud dial — never LAN/NEARBY presence.
+            // PeerConnection path-locks: no-op while LAN sighting / Local Connected.
+            if (started && peerUid != localUid) {
+                val conn = ensureConnection(peerUid)
+                conn.start()
+                conn.promoteToCloud(force = true)
+            }
+        }
         relay.onPeerOverlayHint = { peerUid, host, port ->
             if (started && peerUid != localUid) {
                 overlayEndpointCache.put(peerUid, host, port)
@@ -309,12 +318,13 @@ class LanIntercomEngine(
                 _relayReady.value = ready
                 if (ready) {
                     relay.announceOverlay()
+                    publishRosterInterest()
                     requestPathReconciliation()
                 }
             }
         }
         relay.start()
-
+        publishRosterInterest()
         val restoreVoxEnabled = prefs.getBoolean(KEY_VOX_ENABLED, false)
         if (restoreVoxEnabled) {
             pttPolicy.cancel()
@@ -373,6 +383,7 @@ class LanIntercomEngine(
         if (prunedActive != _activeRecipientUids.value) {
             setActiveRecipients(prunedActive)
         }
+        publishRosterInterest()
         requestPathReconciliation()
     }
 
@@ -736,13 +747,15 @@ class LanIntercomEngine(
         var deliveredImmediately = 0
         var queuedForConnection = 0
         val queuedUids = mutableListOf<String>()
+        val viaParts = mutableListOf<String>()
         active.forEach { uid ->
             val conn = ensureConnection(uid)
             conn.start()
-            val connected = conn.linkState.value is PeerLink.LinkState.Connected
+            val connected = conn.linkState.value as? PeerLink.LinkState.Connected
             conn.send(payload)
-            if (connected) {
+            if (connected != null) {
                 deliveredImmediately++
+                viaParts.add("$uid=${connected.via}")
             } else {
                 queuedForConnection++
                 queuedUids.add(uid)
@@ -754,7 +767,8 @@ class LanIntercomEngine(
             Log.i(
                 TAG,
                 "fanOut: recipients=${active.size} deliveredImmediately=$deliveredImmediately " +
-                    "queuedForConnection=$queuedForConnection bytes=${payload.size} queuedUids=$queuedUids",
+                    "queuedForConnection=$queuedForConnection bytes=${payload.size} " +
+                    "via=[${viaParts.joinToString(",")}] queuedUids=$queuedUids",
             )
         }
     }
@@ -894,7 +908,12 @@ class LanIntercomEngine(
         knownCrewUids = knownCrewUids + peerUid
         val conn = ensureConnection(peerUid)
         conn.start()
+        publishRosterInterest()
         requestPathReconciliation()
+    }
+
+    private fun publishRosterInterest() {
+        relayClient?.publishRosterInterest(knownCrewUids)
     }
 
     private fun removeConnection(peerUid: String) {
@@ -1216,19 +1235,17 @@ class LanIntercomEngine(
         val sightings = beacon.presence.value.sightings.filterKeys { it != localUid }
         val nowMs = System.currentTimeMillis()
         val cloudReady = relayClient?.isReady() == true
-        val cloudCandidates = if (cloudReady) {
-            knownCrewUids + _activeRecipientUids.value
-        } else {
-            emptySet()
-        }
+        val wantedUids = knownCrewUids + _activeRecipientUids.value
+        val cloudCandidates = if (cloudReady) wantedUids else emptySet()
         val rememberedOverlayUids = overlayEndpointCache.uids
         val relevantUids =
-            sightings.keys + connections.keys + cloudCandidates + rememberedOverlayUids
+            sightings.keys + connections.keys + wantedUids + rememberedOverlayUids
         val localIfaces = localInterfaceNetworks()
 
         relevantUids.forEach { uid ->
             if (uid == localUid) return@forEach
             val sighting = sightings[uid]
+            val isWantedPeer = uid in wantedUids
             val lan = sighting
                 ?.takeUnless { it.viaOverlay }
                 ?.let { routeDiscoveryPeer(it, connectivitySnapshot, localIfaces) }
@@ -1238,10 +1255,10 @@ class LanIntercomEngine(
             } else {
                 null
             }
-            val wantCloud = cloudReady && uid in cloudCandidates
+            val wantCloud = cloudReady && isWantedPeer
             val conn = connections[uid]
                 ?: when {
-                    sighting != null || overlay != null || wantCloud -> ensureConnection(uid)
+                    sighting != null || overlay != null || wantCloud || isWantedPeer -> ensureConnection(uid)
                     else -> return@forEach
                 }
             if (lan != null || overlay != null || wantCloud) {
@@ -1249,7 +1266,7 @@ class LanIntercomEngine(
             }
             conn.applyPathTargets(lan, overlay, nowMs, cloudAvailable = wantCloud)
             conn.maybeRecoverStuckConnecting(nowMs)
-            val keepWithoutSighting = wantCloud || overlay != null ||
+            val keepWithoutSighting = isWantedPeer || wantCloud || overlay != null ||
                 conn.linkState.value is PeerLink.LinkState.Connected
             if (sighting == null && !keepWithoutSighting) {
                 removeConnection(uid)

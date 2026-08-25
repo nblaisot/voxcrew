@@ -22,8 +22,8 @@ android {
         applicationId = "com.nblaisot.voxcrew"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "2.0.1"
+        versionCode = 10
+        versionName = "2.0.8"
     }
 
     signingConfigs {

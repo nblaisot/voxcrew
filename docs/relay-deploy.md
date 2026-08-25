@@ -7,7 +7,8 @@ any always-on host: Ubuntu/Debian, macOS (Mac Mini or Mac), or a Windows PC.
 Phones keep LAN discovery; Tailscale stays session-scoped; this relay is a third
 **Cloud** dial path keyed by peer **UUID** only (no peer LAN/Tailscale IPs).
 
-**Non-goals:** no FCM/wake, no presence API, no managed cloud (Firebase/Cloud Run).
+**Non-goals:** no FCM/wake, no public presence/WATCH directory, no Firebase.
+(Session-scoped mutual roster interest is allowed — see protocol table below.)
 
 ---
 
@@ -369,11 +370,12 @@ See also `docs/security.md` and `docs/architecture.md` (Cloud path notes).
 | Message | Role |
 |---------|------|
 | `hello` | Auth + bind socket to `uid` |
+| `roster_interest` / `roster_match` | Mutual known-crew nudge (RAM only; not a public online list) |
 | `dial` | Bridge by peer UUID |
 | binary | Opaque LanProtocol frames |
 | `peer_gone` | Peer control socket dropped |
 
-No `WATCH` / `PRESENCE` / online list. Discovery on phones remains **LAN-only**.
+No public `WATCH` / online directory. Discovery / NEARBY on phones remains **LAN-only**.
 
 ---
 

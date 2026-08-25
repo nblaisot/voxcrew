@@ -28,7 +28,7 @@ class OverlayFailoverPolicyTest {
     }
 
     @Test
-    fun `decide uses overlay when LAN dial failed even if LAN beacon still present`() {
+    fun `decide keeps trying Local when LAN dial failed even if overlay known`() {
         val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = lan,
@@ -37,7 +37,21 @@ class OverlayFailoverPolicyTest {
             sessionHealthy = false,
             lanDialFailed = true,
         )
-        assertEquals(OverlayFailoverPolicy.PathAction.USE_OVERLAY, decision.action)
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_LAN, decision.action)
+    }
+
+    @Test
+    fun `decide keeps Local over Cloud when LAN dial failed and relay ready`() {
+        val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = lan,
+            hasOverlayEndpoint = true,
+            activeVia = null,
+            sessionHealthy = false,
+            lanDialFailed = true,
+            hasCloudEndpoint = true,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_LAN, decision.action)
     }
 
     @Test
@@ -87,7 +101,7 @@ class OverlayFailoverPolicyTest {
     }
 
     @Test
-    fun `decide keeps healthy overlay session when discovery is quiet`() {
+    fun `decide keeps healthy overlay session when discovery is quiet and cloud unavailable`() {
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = null,
             hasOverlayEndpoint = false,
@@ -95,6 +109,18 @@ class OverlayFailoverPolicyTest {
             sessionHealthy = true,
         )
         assertEquals(OverlayFailoverPolicy.PathAction.KEEP_SESSION, decision.action)
+    }
+
+    @Test
+    fun `decide promotes healthy VPN to cloud when relay becomes ready`() {
+        val decision = OverlayFailoverPolicy.decide(
+            lanSighting = null,
+            hasOverlayEndpoint = true,
+            activeVia = PathLabels.VPN,
+            sessionHealthy = true,
+            hasCloudEndpoint = true,
+        )
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_CLOUD, decision.action)
     }
 
     @Test
@@ -121,7 +147,7 @@ class OverlayFailoverPolicyTest {
     }
 
     @Test
-    fun `decide prefers overlay over cloud`() {
+    fun `decide prefers cloud over overlay when relay ready`() {
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = null,
             hasOverlayEndpoint = true,
@@ -129,11 +155,11 @@ class OverlayFailoverPolicyTest {
             sessionHealthy = false,
             hasCloudEndpoint = true,
         )
-        assertEquals(OverlayFailoverPolicy.PathAction.USE_OVERLAY, decision.action)
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_CLOUD, decision.action)
     }
 
     @Test
-    fun `decide promotes healthy cloud to overlay when endpoint appears`() {
+    fun `decide keeps healthy cloud even when overlay endpoint appears`() {
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = null,
             hasOverlayEndpoint = true,
@@ -141,11 +167,11 @@ class OverlayFailoverPolicyTest {
             sessionHealthy = true,
             hasCloudEndpoint = true,
         )
-        assertEquals(OverlayFailoverPolicy.PathAction.USE_OVERLAY, decision.action)
+        assertEquals(OverlayFailoverPolicy.PathAction.KEEP_SESSION, decision.action)
     }
 
     @Test
-    fun `decide uses cloud after LAN dial failed when no overlay`() {
+    fun `decide keeps Local when LAN dial failed even with cloud and no overlay`() {
         val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = lan,
@@ -155,7 +181,7 @@ class OverlayFailoverPolicyTest {
             lanDialFailed = true,
             hasCloudEndpoint = true,
         )
-        assertEquals(OverlayFailoverPolicy.PathAction.USE_CLOUD, decision.action)
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_LAN, decision.action)
     }
 
     @Test
@@ -181,6 +207,41 @@ class OverlayFailoverPolicyTest {
             hasCloudEndpoint = true,
         )
         assertEquals(OverlayFailoverPolicy.PathAction.USE_LAN, decision.action)
+    }
+
+    @Test
+    fun `path order is Local then Cloud then VPN when relay ready`() {
+        val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
+        assertEquals(
+            OverlayFailoverPolicy.PathAction.USE_LAN,
+            OverlayFailoverPolicy.decide(
+                lanSighting = lan,
+                hasOverlayEndpoint = true,
+                activeVia = null,
+                sessionHealthy = false,
+                hasCloudEndpoint = true,
+            ).action,
+        )
+        assertEquals(
+            OverlayFailoverPolicy.PathAction.USE_CLOUD,
+            OverlayFailoverPolicy.decide(
+                lanSighting = null,
+                hasOverlayEndpoint = true,
+                activeVia = null,
+                sessionHealthy = false,
+                hasCloudEndpoint = true,
+            ).action,
+        )
+        assertEquals(
+            OverlayFailoverPolicy.PathAction.USE_OVERLAY,
+            OverlayFailoverPolicy.decide(
+                lanSighting = null,
+                hasOverlayEndpoint = true,
+                activeVia = null,
+                sessionHealthy = false,
+                hasCloudEndpoint = false,
+            ).action,
+        )
     }
 
     @Test

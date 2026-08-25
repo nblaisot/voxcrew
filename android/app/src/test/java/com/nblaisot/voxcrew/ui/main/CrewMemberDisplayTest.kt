@@ -76,4 +76,24 @@ class CrewMemberDisplayTest {
         )
         assertEquals(MemberAvailability.NEARBY, result)
     }
+
+    @Test
+    fun connectingWhileOfflineRosterShowsConnecting() {
+        val result = displayAvailability(
+            rosterAvailability = MemberAvailability.OFFLINE,
+            pathLabel = null,
+            linkState = PeerLink.LinkState.Connecting("peer-b"),
+        )
+        assertEquals(MemberAvailability.NEARBY, result)
+    }
+
+    @Test
+    fun idleOfflineDoesNotInventNearbyFromCloudRegistrationAlone() {
+        val result = displayAvailability(
+            rosterAvailability = MemberAvailability.OFFLINE,
+            pathLabel = PathLabels.CLOUD,
+            linkState = PeerLink.LinkState.Idle,
+        )
+        assertEquals(MemberAvailability.OFFLINE, result)
+    }
 }
