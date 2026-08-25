@@ -43,12 +43,16 @@ voxcrew://relay-config?url=wss%3A%2F%2FYOUR_HOST%3A8443&secret=your-crew-passphr
 |---------|-----------|---------|
 | `hello` | C→S | `{uid, displayName, secret}` |
 | `hello_ok` / `hello_reject` | S→C | Auth result |
+| `roster_interest` | C→S | `{uids: string[]}` — replace known-crew set (RAM only) |
+| `roster_match` | S→C | `{peerUid, displayName?}` — mutual interest + peer registered |
 | `dial` | C→S | `{peerUid}` request bridge |
 | `dial_ok` / `dial_fail` | S→C | Peer registered or not |
 | `peer_gone` | S→C | Peer control socket dropped |
 | binary | C↔S | `[uidLen u16be][uid utf8][LanProtocol datagram frame]` |
 
-No presence / WATCH API.
+No public presence / WATCH / FCM API. The only “who’s online” signal is
+**mutual roster interest** (both peers already know each other and are `hello_ok`),
+session-scoped and cleared on disconnect. Discovery / NEARBY stays LAN-only on phones.
 
 ## Env
 

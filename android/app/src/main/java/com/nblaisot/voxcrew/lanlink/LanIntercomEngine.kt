@@ -296,6 +296,14 @@ class LanIntercomEngine(
                 connections[peerUid]?.acceptCloudInbound()
             }
         }
+        relay.onRosterMatch = { peerUid, _displayName ->
+            // Mutual interest only drives Cloud dial — never LAN/NEARBY presence.
+            if (started && peerUid != localUid) {
+                val conn = ensureConnection(peerUid)
+                conn.start()
+                conn.promoteToCloud()
+            }
+        }
         relay.onPeerOverlayHint = { peerUid, host, port ->
             if (started && peerUid != localUid) {
                 overlayEndpointCache.put(peerUid, host, port)
@@ -309,12 +317,13 @@ class LanIntercomEngine(
                 _relayReady.value = ready
                 if (ready) {
                     relay.announceOverlay()
+                    publishRosterInterest()
                     requestPathReconciliation()
                 }
             }
         }
         relay.start()
-
+        publishRosterInterest()
         val restoreVoxEnabled = prefs.getBoolean(KEY_VOX_ENABLED, false)
         if (restoreVoxEnabled) {
             pttPolicy.cancel()
@@ -373,6 +382,7 @@ class LanIntercomEngine(
         if (prunedActive != _activeRecipientUids.value) {
             setActiveRecipients(prunedActive)
         }
+        publishRosterInterest()
         requestPathReconciliation()
     }
 
@@ -894,7 +904,12 @@ class LanIntercomEngine(
         knownCrewUids = knownCrewUids + peerUid
         val conn = ensureConnection(peerUid)
         conn.start()
+        publishRosterInterest()
         requestPathReconciliation()
+    }
+
+    private fun publishRosterInterest() {
+        relayClient?.publishRosterInterest(knownCrewUids)
     }
 
     private fun removeConnection(peerUid: String) {

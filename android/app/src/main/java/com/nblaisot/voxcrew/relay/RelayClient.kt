@@ -22,6 +22,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.security.cert.CertificateException
@@ -38,7 +39,8 @@ import javax.net.ssl.X509TrustManager
  * [RelayFrameTransport] after a UUID dial bridge.
  *
  * Also carries ephemeral Tailscale endpoint gossip (own `100.x:port`) so peers can
- * upgrade Cloud → direct VPN without roster persistence.
+ * upgrade Cloud → direct VPN without roster persistence, and session-scoped mutual
+ * roster interest so the Mini can nudge Cloud dials without a public presence API.
  */
 class RelayClient(
     private val scope: CoroutineScope,
@@ -59,6 +61,7 @@ class RelayClient(
     private val sessions = ConcurrentHashMap<String, RelayFrameTransport>()
     private val dialWaiters = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
     private val mutex = Mutex()
+    private var lastPublishedInterest: Set<String> = emptySet()
 
     /** Fired when the Mini reports an inbound dial (peer wants a bridge to us). */
     @Volatile var onInboundDial: ((peerUid: String) -> Unit)? = null
@@ -68,6 +71,12 @@ class RelayClient(
 
     /** Ephemeral Tailscale dial hint for [peerUid] (session only). */
     @Volatile var onPeerOverlayHint: ((peerUid: String, host: String, port: Int) -> Unit)? = null
+
+    /**
+     * Mutual roster interest: peer is hello_ok on the Mini and both sides already know
+     * each other. Drive Cloud dial only — never LAN/NEARBY presence.
+     */
+    @Volatile var onRosterMatch: ((peerUid: String, displayName: String?) -> Unit)? = null
 
     fun start() {
         if (settingsWatchJob?.isActive == true) return
@@ -88,12 +97,11 @@ class RelayClient(
         reconnectJob?.cancel()
         reconnectJob = null
         reconnectAttempt = 0
-        sessions.values.forEach { it.detach() }
-        sessions.clear()
         socketGeneration += 1
         webSocket?.close(1000, "stop")
         webSocket = null
-        _ready.value = false
+        dropControlPlane(notifySessions = false)
+        lastPublishedInterest = emptySet()
     }
 
     fun isReady(): Boolean = _ready.value
@@ -117,6 +125,26 @@ class RelayClient(
                 .put("overlayHost", host)
                 .put("tcpPort", port),
         )
+    }
+
+    /**
+     * Replace the known-crew UUID set on the Mini (RAM only). Sent after hello_ok and
+     * whenever the local roster of known peers changes.
+     */
+    fun publishRosterInterest(uids: Collection<String>) {
+        val cleaned = uids.asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it != localUid }
+            .toSet()
+        if (!_ready.value) {
+            lastPublishedInterest = cleaned
+            return
+        }
+        if (cleaned == lastPublishedInterest) return
+        lastPublishedInterest = cleaned
+        val arr = JSONArray()
+        cleaned.forEach { arr.put(it) }
+        sendControl(JSONObject().put("type", "roster_interest").put("uids", arr))
     }
 
     /**
@@ -151,7 +179,8 @@ class RelayClient(
         val generation = ++socketGeneration
         webSocket?.close(1000, "reconfig")
         webSocket = null
-        _ready.value = false
+        // Drop Cloud PeerLinks immediately so KEEP_SESSION cannot zombie across WSS blips.
+        dropControlPlane(notifySessions = true)
         val settings = settingsRepository.current()
         if (!settings.isConfigured) return@withLock
 
@@ -186,7 +215,7 @@ class RelayClient(
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 if (generation != socketGeneration) return
-                _ready.value = false
+                dropControlPlane(notifySessions = true)
                 if (code == 1005 || code == 1006) {
                     Log.i(TAG, "relay closed with reserved code=$code; backing off")
                 }
@@ -201,7 +230,7 @@ class RelayClient(
                 } else {
                     Log.w(TAG, "relay failure: $message")
                 }
-                _ready.value = false
+                dropControlPlane(notifySessions = true)
                 scheduleReconnect(generation)
             }
         })
@@ -230,6 +259,10 @@ class RelayClient(
                 reconnectAttempt = 0
                 Log.i(TAG, "relay hello_ok")
                 announceOverlay()
+                // Re-publish after every hello so a Mini restart still sees mutual interest.
+                val interest = lastPublishedInterest
+                lastPublishedInterest = emptySet()
+                if (interest.isNotEmpty()) publishRosterInterest(interest)
             }
             "hello_reject" -> {
                 _ready.value = false
@@ -237,13 +270,16 @@ class RelayClient(
             }
             "dial_ok" -> {
                 val peerUid = msg.optString("peerUid")
-                dialWaiters[peerUid]?.complete(true)
                 emitOverlayHint(
                     peerUid = peerUid,
                     host = msg.optString("peerOverlayHost"),
                     port = msg.optInt("peerTcpPort", -1),
                 )
-                if (peerUid.isNotBlank() && peerUid != localUid) {
+                val waiter = dialWaiters[peerUid]
+                if (!RelayClient.isInboundDialOk(hasLocalWaiter = waiter != null)) {
+                    // Outbound dialer: complete waiter only — caller starts Hello.
+                    waiter?.complete(true)
+                } else if (peerUid.isNotBlank() && peerUid != localUid) {
                     transportFor(peerUid)
                     onInboundDial?.invoke(peerUid)
                 }
@@ -260,7 +296,34 @@ class RelayClient(
                 val peerUid = msg.optString("peerUid")
                 sessions[peerUid]?.onPeerGone()
             }
+            "roster_match" -> {
+                val peerUid = msg.optString("peerUid")
+                if (peerUid.isBlank() || peerUid == localUid) return
+                val displayName = msg.optString("displayName").takeIf { it.isNotBlank() }
+                onRosterMatch?.invoke(peerUid, displayName)
+            }
         }
+    }
+
+    /**
+     * Tear down Cloud transports when the control plane is gone so PeerLink cannot look
+     * Connected (KEEP_SESSION) across a WSS blip.
+     */
+    private fun dropControlPlane(notifySessions: Boolean) {
+        _ready.value = false
+        if (notifySessions) {
+            sessions.values.forEach { transport ->
+                transport.onPeerGone()
+                transport.detach()
+            }
+        } else {
+            sessions.values.forEach { it.detach() }
+        }
+        sessions.clear()
+        dialWaiters.values.forEach { deferred ->
+            if (!deferred.isCompleted) deferred.complete(false)
+        }
+        dialWaiters.clear()
     }
 
     private fun emitOverlayHint(peerUid: String, host: String, port: Int) {
@@ -337,6 +400,12 @@ class RelayClient(
         private const val MAX_RECONNECT_SHIFT = 4
         private const val MAX_RECONNECT_ATTEMPT = 8
         private const val DIAL_TIMEOUT_MS = 5_000L
+
+        /**
+         * Outbound dialers hold a [dialWaiters] entry; inbound [dial_ok] does not.
+         * Used so the dialer never also runs [onInboundDial] (double Hello).
+         */
+        internal fun isInboundDialOk(hasLocalWaiter: Boolean): Boolean = !hasLocalWaiter
 
         /** Settings that require opening a new socket (ignore TOFU cert-only updates). */
         private fun connectKey(settings: RelaySettings): String =

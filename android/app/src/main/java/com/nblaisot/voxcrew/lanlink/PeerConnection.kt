@@ -5,6 +5,7 @@ import com.nblaisot.voxcrew.connectivity.NetworkSocketBinder
 import com.nblaisot.voxcrew.relay.RelayClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
@@ -143,7 +144,8 @@ class PeerConnection(
                                 promoteToCloud()
                             }
                         } else if (diedVia == PathLabels.CLOUD && started) {
-                            cloudDialFailed = true
+                            // Brief cooldown (same spirit as dial_fail), then clear sticky and redial.
+                            scheduleCloudRedialAfterCooldown()
                         }
                     }
                     PeerLink.LinkState.Idle -> {
@@ -311,13 +313,21 @@ class PeerConnection(
             return
         }
         if (cloudDialJob?.isActive == true) return
+        peerLink.markConnecting(peerUid)
         cloudDialJob = scope.launch {
             val ok = relay.dial(peerUid)
             if (!ok) {
                 cloudDialFailed = true
-                Log.i(TAG, "cloud dial failed for $peerUid")
-                kotlinx.coroutines.delay(5_000L)
+                logInfo("cloud dial failed for $peerUid")
+                delay(CLOUD_DIAL_COOLDOWN_MS)
+                if (!started || !isStillWanted()) return@launch
                 cloudDialFailed = false
+                cloudDialJob = null
+                if (relayClientProvider()?.isReady() == true &&
+                    peerLink.state.value !is PeerLink.LinkState.Connected
+                ) {
+                    promoteToCloud()
+                }
                 return@launch
             }
             cloudDialFailed = false
@@ -331,9 +341,30 @@ class PeerConnection(
     fun acceptCloudInbound() {
         if (!started) return
         val relay = relayClientProvider() ?: return
+        peerLink.markConnecting(peerUid)
         val transport = relay.transportFor(peerUid)
         transport.attach(peerLink)
         transport.startHandshake(peerLink)
+    }
+
+    /**
+     * After Cloud link death: suppress Cloud briefly, then clear sticky and redial.
+     * Must not be called from inside [cloudDialJob] (would self-cancel).
+     */
+    private fun scheduleCloudRedialAfterCooldown() {
+        cloudDialFailed = true
+        cloudDialJob?.cancel()
+        cloudDialJob = scope.launch {
+            delay(CLOUD_DIAL_COOLDOWN_MS)
+            if (!started || !isStillWanted()) return@launch
+            cloudDialFailed = false
+            cloudDialJob = null
+            if (relayClientProvider()?.isReady() == true &&
+                peerLink.state.value !is PeerLink.LinkState.Connected
+            ) {
+                promoteToCloud()
+            }
+        }
     }
 
     /** LAN sighting expired — switch to overlay if available; never kill healthy overlay TCP. */
@@ -408,6 +439,9 @@ class PeerConnection(
     /** Test/observe: whether LAN dials are currently suppressed in favour of overlay. */
     internal fun lanDialFailedForTest(): Boolean = lanDialFailed
 
+    /** Test/observe: sticky Cloud dial suppression after fail/death. */
+    internal fun cloudDialFailedForTest(): Boolean = cloudDialFailed
+
     internal fun targetPathForTest(): PeerPath? = lanTcpClient.targetPathForTest()
 
     @Suppress("UNUSED")
@@ -417,6 +451,8 @@ class PeerConnection(
         const val TAG = "PeerConnection"
         /** Force a redial if we sit in Connecting without reaching Connected. */
         internal const val CONNECTING_STALL_MS = 15_000L
+        /** After dial_fail or Cloud link death, wait before clearing sticky and redialing. */
+        internal const val CLOUD_DIAL_COOLDOWN_MS = 5_000L
 
         fun logInfo(message: String) {
             runCatching { Log.i(TAG, message) }
