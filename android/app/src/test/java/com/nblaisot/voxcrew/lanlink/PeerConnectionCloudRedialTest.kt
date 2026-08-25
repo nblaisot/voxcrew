@@ -29,7 +29,7 @@ class PeerConnectionCloudRedialTest {
     }
 
     @Test
-    fun `cloud link death clears sticky fail and redials after cooldown`() = runTest {
+    fun `cloud link death force dials immediately`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val peerScope = CoroutineScope(dispatcher + SupervisorJob())
         val relay = mockk<RelayClient>(relaxed = true)
@@ -56,18 +56,14 @@ class PeerConnectionCloudRedialTest {
             conn.peerLink.onHandshakeComplete(transport, "peer", -1)
             runCurrent()
             assertTrue(conn.linkState.value is PeerLink.LinkState.Connected)
-            assertFalse(conn.cloudDialFailedForTest())
+            assertFalse(conn.cloudAwaitMatchForTest())
 
             conn.peerLink.onDisconnected(transport, "peer")
             runCurrent()
-            assertTrue(conn.cloudDialFailedForTest())
-            coVerify(exactly = 0) { relay.dial(any()) }
 
-            advanceTimeBy(5_000L)
-            runCurrent()
-
+            // Immediate force dial — no 5s sticky suppress.
             coVerify(atLeast = 1) { relay.dial("peer") }
-            assertTrue(conn.cloudDialFailedForTest())
+            assertTrue(conn.cloudAwaitMatchForTest())
         } finally {
             conn.stop()
             peerScope.cancel()
@@ -75,7 +71,7 @@ class PeerConnectionCloudRedialTest {
     }
 
     @Test
-    fun `cloud dial fail clears sticky and redials after cooldown`() = runTest {
+    fun `after dial_fail unforced promote is parked but force dials again`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val peerScope = CoroutineScope(dispatcher + SupervisorJob())
         val relay = mockk<RelayClient>(relaxed = true)
@@ -98,15 +94,108 @@ class PeerConnectionCloudRedialTest {
         try {
             conn.start()
             runCurrent()
-            conn.promoteToCloud()
+            conn.promoteToCloud(force = true)
             runCurrent()
-            assertTrue(conn.cloudDialFailedForTest())
+            assertTrue(conn.cloudAwaitMatchForTest())
             coVerify(exactly = 1) { relay.dial("peer") }
 
-            advanceTimeBy(5_000L)
+            // USE_CLOUD-style unforced tick must not spam.
+            conn.promoteToCloud(force = false)
             runCurrent()
+            coVerify(exactly = 1) { relay.dial("peer") }
 
+            // roster_match-style force wakes immediately.
+            conn.promoteToCloud(force = true)
+            runCurrent()
+            coVerify(exactly = 2) { relay.dial("peer") }
+        } finally {
+            conn.stop()
+            peerScope.cancel()
+        }
+    }
+
+    @Test
+    fun `safety net force dials every 3s while parked`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val peerScope = CoroutineScope(dispatcher + SupervisorJob())
+        val relay = mockk<RelayClient>(relaxed = true)
+        every { relay.isReady() } returns true
+        coEvery { relay.dial(any()) } returns false
+
+        val server = LanTcpServer(peerScope)
+        val conn = PeerConnection(
+            peerUid = "peer",
+            scope = peerScope,
+            localUid = "local",
+            lanServer = server,
+            networkSocketBinder = NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
+            isStillWanted = { true },
+            overlayPeerProvider = { null },
+            lanPeerProvider = { null },
+            relayClientProvider = { relay },
+        )
+        try {
+            conn.start()
+            runCurrent()
+            conn.promoteToCloud(force = true)
+            runCurrent()
+            coVerify(exactly = 1) { relay.dial("peer") }
+            assertTrue(conn.cloudAwaitMatchForTest())
+
+            advanceTimeBy(3_000L)
+            runCurrent()
             coVerify(atLeast = 2) { relay.dial("peer") }
+        } finally {
+            conn.stop()
+            peerScope.cancel()
+        }
+    }
+
+    @Test
+    fun `applyPathTargets with cloud available uses cloud not sticky clear`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val peerScope = CoroutineScope(dispatcher + SupervisorJob())
+        val relay = mockk<RelayClient>(relaxed = true)
+        every { relay.isReady() } returns true
+        coEvery { relay.dial(any()) } returns false
+
+        val server = LanTcpServer(peerScope)
+        val conn = PeerConnection(
+            peerUid = "peer",
+            scope = peerScope,
+            localUid = "local",
+            lanServer = server,
+            networkSocketBinder = NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
+            isStillWanted = { true },
+            overlayPeerProvider = { null },
+            lanPeerProvider = { null },
+            relayClientProvider = { relay },
+        )
+        try {
+            conn.start()
+            runCurrent()
+            // First dial fails and parks.
+            conn.promoteToCloud(force = true)
+            runCurrent()
+            assertTrue(conn.cloudAwaitMatchForTest())
+
+            // Policy still sees Cloud endpoint (no sticky hasCloudEndpoint=false).
+            conn.applyPathTargets(
+                lanPeer = null,
+                overlayPeer = null,
+                cloudAvailable = true,
+            )
+            runCurrent()
+            // Unforced USE_CLOUD respects park — still one dial.
+            coVerify(exactly = 1) { relay.dial("peer") }
+            assertTrue(conn.cloudAwaitMatchForTest())
+
+            // Event wake still works.
+            conn.promoteToCloud(force = true)
+            runCurrent()
+            coVerify(exactly = 2) { relay.dial("peer") }
         } finally {
             conn.stop()
             peerScope.cancel()

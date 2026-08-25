@@ -300,6 +300,7 @@ class RelayClient(
                 val peerUid = msg.optString("peerUid")
                 if (peerUid.isBlank() || peerUid == localUid) return
                 val displayName = msg.optString("displayName").takeIf { it.isNotBlank() }
+                Log.i(TAG, "roster_match peerUid=$peerUid")
                 onRosterMatch?.invoke(peerUid, displayName)
             }
         }

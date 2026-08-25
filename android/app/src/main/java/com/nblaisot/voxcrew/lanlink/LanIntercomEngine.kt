@@ -301,7 +301,7 @@ class LanIntercomEngine(
             if (started && peerUid != localUid) {
                 val conn = ensureConnection(peerUid)
                 conn.start()
-                conn.promoteToCloud()
+                conn.promoteToCloud(force = true)
             }
         }
         relay.onPeerOverlayHint = { peerUid, host, port ->
