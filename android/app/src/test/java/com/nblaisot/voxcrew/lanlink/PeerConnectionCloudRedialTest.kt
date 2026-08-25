@@ -15,6 +15,7 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -146,6 +147,145 @@ class PeerConnectionCloudRedialTest {
             advanceTimeBy(3_000L)
             runCurrent()
             coVerify(atLeast = 2) { relay.dial("peer") }
+        } finally {
+            conn.stop()
+            peerScope.cancel()
+        }
+    }
+
+    @Test
+    fun `LAN sighting blocks cloud dial so Local and Cloud never race`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val peerScope = CoroutineScope(dispatcher + SupervisorJob())
+        val relay = mockk<RelayClient>(relaxed = true)
+        every { relay.isReady() } returns true
+        coEvery { relay.dial(any()) } returns true
+
+        val lanSighting = RoutedPeerTarget(
+            peer = LanPeer("peer", "Peer", "192.168.1.2", 47101, 0L),
+            route = RoutedSocketPath(PeerPath.LAN, 1L),
+        )
+        val server = LanTcpServer(peerScope)
+        val conn = PeerConnection(
+            peerUid = "peer",
+            scope = peerScope,
+            localUid = "local",
+            lanServer = server,
+            networkSocketBinder = NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
+            isStillWanted = { true },
+            overlayPeerProvider = { null },
+            lanPeerProvider = { lanSighting },
+            relayClientProvider = { relay },
+        )
+        try {
+            conn.start()
+            runCurrent()
+            conn.promoteToCloud(force = true)
+            runCurrent()
+            coVerify(exactly = 0) { relay.dial(any()) }
+            conn.acceptCloudInbound()
+            runCurrent()
+            coVerify(exactly = 0) { relay.dial(any()) }
+        } finally {
+            conn.stop()
+            peerScope.cancel()
+        }
+    }
+
+    @Test
+    fun `healthy Local suppresses cloud dial so Cloud cannot steal the mesh`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val peerScope = CoroutineScope(dispatcher + SupervisorJob())
+        val relay = mockk<RelayClient>(relaxed = true)
+        every { relay.isReady() } returns true
+        coEvery { relay.dial(any()) } returns true
+
+        val server = LanTcpServer(peerScope)
+        val conn = PeerConnection(
+            peerUid = "peer",
+            scope = peerScope,
+            localUid = "local",
+            lanServer = server,
+            networkSocketBinder = NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
+            isStillWanted = { true },
+            overlayPeerProvider = { null },
+            lanPeerProvider = { null },
+            relayClientProvider = { relay },
+        )
+        try {
+            conn.start()
+            runCurrent()
+            val local = object : FrameTransport {
+                override val label: String = PathLabels.LOCAL
+                override fun sendFrame(frame: LanFrame) = Unit
+                override fun dropAndRetry() = Unit
+                override fun stop() = Unit
+            }
+            conn.peerLink.onHandshakeComplete(local, "peer", -1)
+            runCurrent()
+            assertTrue(conn.linkState.value is PeerLink.LinkState.Connected)
+
+            conn.promoteToCloud(force = true)
+            runCurrent()
+            coVerify(exactly = 0) { relay.dial(any()) }
+            assertEquals(PathLabels.LOCAL, (conn.linkState.value as PeerLink.LinkState.Connected).via)
+        } finally {
+            conn.stop()
+            peerScope.cancel()
+        }
+    }
+
+    @Test
+    fun `force during in-flight dial retries immediately when that dial fails`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val peerScope = CoroutineScope(dispatcher + SupervisorJob())
+        val relay = mockk<RelayClient>(relaxed = true)
+        every { relay.isReady() } returns true
+        val firstDialGate = kotlinx.coroutines.CompletableDeferred<Boolean>()
+        var dialCount = 0
+        coEvery { relay.dial(any()) } coAnswers {
+            dialCount++
+            if (dialCount == 1) {
+                firstDialGate.await()
+            } else {
+                false
+            }
+        }
+
+        val server = LanTcpServer(peerScope)
+        val conn = PeerConnection(
+            peerUid = "peer",
+            scope = peerScope,
+            localUid = "local",
+            lanServer = server,
+            networkSocketBinder = NoOpTestNetworkBinder,
+            inboundRouteResolver = { null },
+            isStillWanted = { true },
+            overlayPeerProvider = { null },
+            lanPeerProvider = { null },
+            relayClientProvider = { relay },
+        )
+        try {
+            conn.start()
+            runCurrent()
+            // Unforced USE_CLOUD starts dial and suspends.
+            conn.promoteToCloud(force = false)
+            runCurrent()
+            coVerify(exactly = 1) { relay.dial("peer") }
+            assertFalse(conn.pendingForceCloudDialForTest())
+
+            // roster_match while in flight — must not be a silent skip.
+            conn.promoteToCloud(force = true)
+            runCurrent()
+            assertTrue(conn.pendingForceCloudDialForTest())
+            coVerify(exactly = 1) { relay.dial("peer") }
+
+            // First dial fails → pending force retries immediately.
+            firstDialGate.complete(false)
+            runCurrent()
+            coVerify(exactly = 2) { relay.dial("peer") }
         } finally {
             conn.stop()
             peerScope.cancel()

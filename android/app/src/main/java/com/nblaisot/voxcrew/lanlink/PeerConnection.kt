@@ -57,6 +57,11 @@ class PeerConnection(
      * an event forces dial ([force]=true) or the 3s safety net runs.
      */
     @Volatile private var cloudAwaitMatch = false
+    /**
+     * [roster_match] / path-failover asked for a force dial while one was already in flight.
+     * Retried immediately if that dial fails (do not drop the event).
+     */
+    @Volatile private var pendingForceCloudDial = false
     /** Host|handle of the last LAN target — identity change clears [lanDialFailed]. */
     @Volatile private var lastLanRouteKey: String? = null
     @Volatile private var connectingSinceMs: Long? = null
@@ -109,6 +114,7 @@ class PeerConnection(
         peerLink.clear()
         lanDialFailed = false
         cloudAwaitMatch = false
+        pendingForceCloudDial = false
         lastLanRouteKey = null
         connectingSinceMs = null
     }
@@ -128,9 +134,12 @@ class PeerConnection(
                         lastConnectedVia = state.via
                         if (state.via == PathLabels.LOCAL) {
                             lanDialFailed = false
+                            // Local lock: abandon Cloud dials/sessions so they cannot steal PeerLink.
+                            lockLocalMediaPipe()
                         }
                         if (state.via == PathLabels.CLOUD) {
                             cloudAwaitMatch = false
+                            pendingForceCloudDial = false
                             stopCloudSafetyJob()
                         }
                     }
@@ -252,17 +261,24 @@ class PeerConnection(
             OverlayFailoverPolicy.PathAction.USE_CLOUD -> {
                 if (!cloudAvailable) return
                 if (connected?.via == PathLabels.CLOUD) return
+                // Path lock: never Cloud while Seeking Local (LAN sighting / Local TCP).
+                if (cloudBlockedByLanPreference()) return
                 // Stop LAN/VPN dial loops; Cloud Hello attaches via PeerLink.
                 if (!lanTcpClient.hasOpenSession()) {
                     lanTcpClient.setTarget(null)
                 }
                 promoteToCloud(force = false)
             }
-            OverlayFailoverPolicy.PathAction.KEEP_SESSION -> Unit
+            OverlayFailoverPolicy.PathAction.KEEP_SESSION -> {
+                if (connected?.via == PathLabels.LOCAL) {
+                    lockLocalMediaPipe()
+                }
+            }
             OverlayFailoverPolicy.PathAction.CLEAR -> {
                 // Real teardown (no Cloud available). Do not leave sticky that blocks future Cloud.
                 stopCloudJobs()
                 cloudAwaitMatch = false
+                pendingForceCloudDial = false
                 lanTcpClient.setTarget(null)
                 relayClientProvider()?.closeSession(peerUid)
                 if (connected != null) {
@@ -327,18 +343,33 @@ class PeerConnection(
      * Dial peer UUID via the relay.
      * @param force true for event wakes (roster_match, path death/failover); false for
      *   periodic USE_CLOUD ticks that must respect [cloudAwaitMatch] after dial_fail.
+     *
+     * If [force] arrives while a dial is already in flight, we do **not** cancel mid-dial
+     * (avoids dialWaiter races). Instead [pendingForceCloudDial] retries immediately if
+     * that dial fails — so roster_match is never a silent no-op.
      */
     fun promoteToCloud(force: Boolean = false) {
         if (!started) return
         val relay = relayClientProvider() ?: return
         if (!relay.isReady()) return
-        if (peerLink.state.value is PeerLink.LinkState.Connected &&
-            (peerLink.state.value as PeerLink.LinkState.Connected).via == PathLabels.CLOUD
-        ) {
+        // Path lock: Local preference blocks Cloud while LAN is in play or Local is up.
+        if (cloudBlockedByLanPreference()) {
+            pendingForceCloudDial = false
+            cloudAwaitMatch = false
+            logInfo("cloud dial skip peer=$peerUid reason=lan_preferred force=$force")
+            return
+        }
+        if (isConnectedVia(PathLabels.CLOUD)) {
+            pendingForceCloudDial = false
             return
         }
         if (cloudDialJob?.isActive == true) {
-            logInfo("cloud dial skip peer=$peerUid reason=in_flight force=$force")
+            if (force) {
+                pendingForceCloudDial = true
+                logInfo("cloud dial pending force peer=$peerUid (in_flight)")
+            } else {
+                logInfo("cloud dial skip peer=$peerUid reason=in_flight force=false")
+            }
             return
         }
         if (cloudAwaitMatch && !force) {
@@ -347,20 +378,44 @@ class PeerConnection(
         }
         if (force) {
             cloudAwaitMatch = false
+            pendingForceCloudDial = false
         }
         peerLink.markConnecting(peerUid)
         logInfo("cloud dial start peer=$peerUid force=$force")
         cloudDialJob = scope.launch {
             val ok = relay.dial(peerUid)
+            cloudDialJob = null
             if (!ok) {
                 logInfo("cloud dial failed for $peerUid")
+                if (cloudBlockedByLanPreference()) {
+                    pendingForceCloudDial = false
+                    cloudAwaitMatch = false
+                    return@launch
+                }
                 cloudAwaitMatch = true
-                cloudDialJob = null
+                val retryForce = pendingForceCloudDial
+                pendingForceCloudDial = false
+                if (retryForce && started && isStillWanted() &&
+                    relayClientProvider()?.isReady() == true &&
+                    peerLink.state.value !is PeerLink.LinkState.Connected &&
+                    !cloudBlockedByLanPreference()
+                ) {
+                    logInfo("cloud dial retry after pending force peer=$peerUid")
+                    promoteToCloud(force = true)
+                    return@launch
+                }
                 ensureCloudSafetyNet()
                 return@launch
             }
+            pendingForceCloudDial = false
             cloudAwaitMatch = false
             stopCloudSafetyJob()
+            // Dial raced Local: discard Cloud attach so audio stays on the LAN mesh.
+            if (cloudBlockedByLanPreference()) {
+                logInfo("cloud dial discarded after ok; Local preferred peer=$peerUid")
+                relayClientProvider()?.closeSession(peerUid)
+                return@launch
+            }
             val transport = relay.transportFor(peerUid)
             transport.attach(peerLink)
             transport.startHandshake(peerLink)
@@ -370,13 +425,42 @@ class PeerConnection(
     /** Accept an inbound cloud bridge (peer dialed us on the Mini). */
     fun acceptCloudInbound() {
         if (!started) return
+        if (cloudBlockedByLanPreference()) {
+            logInfo("ignore inbound cloud; lan preferred peer=$peerUid")
+            relayClientProvider()?.closeSession(peerUid)
+            return
+        }
         val relay = relayClientProvider() ?: return
         cloudAwaitMatch = false
+        pendingForceCloudDial = false
         stopCloudSafetyJob()
         peerLink.markConnecting(peerUid)
         val transport = relay.transportFor(peerUid)
         transport.attach(peerLink)
         transport.startHandshake(peerLink)
+    }
+
+    /**
+     * True while Local should own media: Locked Local, open LAN TCP, or Seeking with a
+     * LAN beacon. Blocks Cloud dials so icon and audio stay on one pipe.
+     */
+    private fun cloudBlockedByLanPreference(): Boolean {
+        if (isConnectedVia(PathLabels.LOCAL)) return true
+        if (lanTcpClient.hasHealthyLocalSession()) return true
+        if (lanPeerProvider() != null) return true
+        return false
+    }
+
+    private fun isConnectedVia(via: String): Boolean {
+        val connected = peerLink.state.value as? PeerLink.LinkState.Connected ?: return false
+        return connected.via == via
+    }
+
+    /** Cancel Cloud work and drop any relay peer session — Local is the media path. */
+    private fun lockLocalMediaPipe() {
+        stopCloudJobs()
+        cloudAwaitMatch = false
+        relayClientProvider()?.closeSession(peerUid)
     }
 
     private fun ensureCloudSafetyNet() {
@@ -386,6 +470,10 @@ class PeerConnection(
                 delay(CLOUD_SAFETY_INTERVAL_MS)
                 if (!started || !isStillWanted() || !cloudAwaitMatch) return@launch
                 if (peerLink.state.value is PeerLink.LinkState.Connected) {
+                    cloudAwaitMatch = false
+                    return@launch
+                }
+                if (cloudBlockedByLanPreference()) {
                     cloudAwaitMatch = false
                     return@launch
                 }
@@ -404,6 +492,7 @@ class PeerConnection(
     private fun stopCloudJobs() {
         cloudDialJob?.cancel()
         cloudDialJob = null
+        pendingForceCloudDial = false
         stopCloudSafetyJob()
     }
 
@@ -481,6 +570,9 @@ class PeerConnection(
 
     /** Test/observe: parked after dial_fail awaiting event / safety net. */
     internal fun cloudAwaitMatchForTest(): Boolean = cloudAwaitMatch
+
+    /** Test/observe: force dial queued while another dial is in flight. */
+    internal fun pendingForceCloudDialForTest(): Boolean = pendingForceCloudDial
 
     internal fun targetPathForTest(): PeerPath? = lanTcpClient.targetPathForTest()
 

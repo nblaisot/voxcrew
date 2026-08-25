@@ -9,6 +9,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
+import kotlin.coroutines.CoroutineContext
+
 /**
  * Per-peer Cloud [FrameTransport] over the shared [RelayClient] WebSocket.
  * Hello/resume semantics match LAN TCP: both sides may dial; first Hello wins.
@@ -16,7 +18,8 @@ import kotlinx.coroutines.launch
 class RelayFrameTransport(
     private val peerUid: String,
     private val localUid: String,
-    private val client: RelayClient,
+    private val client: RelayBinarySender,
+    ioDispatcher: CoroutineContext = Dispatchers.IO,
 ) : FrameTransport {
     override val label: String = PathLabels.CLOUD
 
@@ -24,7 +27,7 @@ class RelayFrameTransport(
     @Volatile private var open = true
     @Volatile private var handshakeDone = false
     @Volatile private var helloSent = false
-    private val ioScope = CoroutineScope(Dispatchers.IO)
+    private val ioScope = CoroutineScope(ioDispatcher)
     private var handshakeJob: Job? = null
 
     fun attach(link: PeerLink) {
@@ -42,18 +45,20 @@ class RelayFrameTransport(
     fun startHandshake(link: PeerLink) {
         peerLink = link
         open = true
-        if (handshakeDone) return
+        handshakeDone = false
+        helloSent = false
         handshakeJob?.cancel()
         handshakeJob = ioScope.launch { sendHello() }
     }
 
     fun onRemoteFrame(frame: LanFrame) {
         val link = peerLink
+        if (frame is LanFrame.Hello && frame.uid == peerUid) {
+            if (!helloSent) sendHello()
+            completeHandshake(link, frame.lastContiguousSeq)
+            return
+        }
         if (!handshakeDone) {
-            if (frame is LanFrame.Hello && frame.uid == peerUid) {
-                if (!helloSent) sendHello()
-                completeHandshake(link, frame.lastContiguousSeq)
-            }
             return
         }
         if (link != null) link.onFrameReceived(this, frame)
@@ -67,7 +72,18 @@ class RelayFrameTransport(
     }
 
     override fun sendFrame(frame: LanFrame) {
-        if (!open || !handshakeDone) return
+        if (!open) return
+        if (!handshakeDone) {
+            // Connected Cloud icon must not outlive a writable relay pipe.
+            val link = peerLink
+            if (link != null &&
+                link.isActiveTransport(this) &&
+                link.state.value is PeerLink.LinkState.Connected
+            ) {
+                link.onDisconnected(this, peerUid)
+            }
+            return
+        }
         client.sendBinary(peerUid, frame)
     }
 

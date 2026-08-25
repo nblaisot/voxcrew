@@ -24,10 +24,11 @@ object OverlayFailoverPolicy {
     )
 
     /**
-     * @param lanDialFailed true after at least one failed dial to the LAN target while
-     *   a better failover (overlay and/or cloud) is known.
+     * @param lanDialFailed retained for call-site compatibility; ignored for path choice —
+     *   path lock always prefers Local while a LAN beacon exists (failover is Local death).
      * @param hasCloudEndpoint true when relay settings are up and our control WSS is hello_ok.
      */
+    @Suppress("UNUSED_PARAMETER")
     fun decide(
         lanSighting: LanPeer?,
         hasOverlayEndpoint: Boolean,
@@ -52,19 +53,17 @@ object OverlayFailoverPolicy {
         }
 
         val lan = lanSighting?.takeUnless { it.viaOverlay }
-        val failoverAvailable = hasOverlayEndpoint || hasCloudEndpoint
-        if (lan != null && !(lanDialFailed && failoverAvailable)) {
+        // Seeking is sequential: while a LAN beacon exists, dial Local only — never
+        // start Cloud/VPN in parallel (path lock; icon/media stay on one pipe).
+        if (lan != null) {
             return Decision(PathAction.USE_LAN)
         }
-        // Off-LAN (or LAN dial failed): Cloud before overlay when relay is ready.
+        // Off-LAN: Cloud before overlay when relay is ready.
         if (hasCloudEndpoint) {
             return Decision(PathAction.USE_CLOUD)
         }
         if (hasOverlayEndpoint) {
             return Decision(PathAction.USE_OVERLAY)
-        }
-        if (lan != null) {
-            return Decision(PathAction.USE_LAN)
         }
         if (sessionHealthy && activeVia != null) {
             return Decision(PathAction.KEEP_SESSION)

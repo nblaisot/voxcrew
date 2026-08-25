@@ -285,7 +285,23 @@ class LanTcpClient(
     }
 
     override fun sendFrame(frame: LanFrame) {
-        session?.takeIf { !it.closed }?.sendFrame(frame)
+        val live = session?.takeIf { !it.closed }
+        if (live != null) {
+            live.sendFrame(frame)
+            return
+        }
+        // Connected icon must not outlive a writable TCP session.
+        if (peerLink.isActiveTransport(this) &&
+            peerLink.state.value is PeerLink.LinkState.Connected
+        ) {
+            val uid = peerUid
+            if (uid.isNotEmpty()) {
+                runCatching {
+                    Log.w(TAG, "sendFrame with no session while Connected; demoting peer=$uid")
+                }
+                peerLink.onDisconnected(this, uid)
+            }
+        }
     }
 
     override fun dropAndRetry() {

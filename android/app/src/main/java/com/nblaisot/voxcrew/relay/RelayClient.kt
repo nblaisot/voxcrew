@@ -42,13 +42,17 @@ import javax.net.ssl.X509TrustManager
  * upgrade Cloud → direct VPN without roster persistence, and session-scoped mutual
  * roster interest so the Mini can nudge Cloud dials without a public presence API.
  */
+interface RelayBinarySender {
+    fun sendBinary(peerUid: String, frame: LanFrame)
+}
+
 class RelayClient(
     private val scope: CoroutineScope,
     private val localUid: String,
     private val displayNameProvider: () -> String,
     private val settingsRepository: RelaySettingsRepository,
     private val overlayEndpointProvider: () -> Pair<String, Int>? = { null },
-) {
+) : RelayBinarySender {
     private val _ready = MutableStateFlow(false)
     val ready: StateFlow<Boolean> = _ready.asStateFlow()
 
@@ -168,7 +172,7 @@ class RelayClient(
         webSocket?.send(json.toString())
     }
 
-    internal fun sendBinary(peerUid: String, frame: LanFrame) {
+    override fun sendBinary(peerUid: String, frame: LanFrame) {
         val payload = encodeEnvelope(peerUid, LanProtocol.encodeFrame(frame))
         webSocket?.send(payload.toByteString())
     }

@@ -28,7 +28,7 @@ class OverlayFailoverPolicyTest {
     }
 
     @Test
-    fun `decide uses overlay when LAN dial failed even if LAN beacon still present`() {
+    fun `decide keeps trying Local when LAN dial failed even if overlay known`() {
         val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = lan,
@@ -37,11 +37,11 @@ class OverlayFailoverPolicyTest {
             sessionHealthy = false,
             lanDialFailed = true,
         )
-        assertEquals(OverlayFailoverPolicy.PathAction.USE_OVERLAY, decision.action)
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_LAN, decision.action)
     }
 
     @Test
-    fun `decide uses cloud over overlay when LAN dial failed and relay ready`() {
+    fun `decide keeps Local over Cloud when LAN dial failed and relay ready`() {
         val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = lan,
@@ -51,7 +51,7 @@ class OverlayFailoverPolicyTest {
             lanDialFailed = true,
             hasCloudEndpoint = true,
         )
-        assertEquals(OverlayFailoverPolicy.PathAction.USE_CLOUD, decision.action)
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_LAN, decision.action)
     }
 
     @Test
@@ -171,7 +171,7 @@ class OverlayFailoverPolicyTest {
     }
 
     @Test
-    fun `decide uses cloud after LAN dial failed when no overlay`() {
+    fun `decide keeps Local when LAN dial failed even with cloud and no overlay`() {
         val lan = LanPeer("a", "A", "192.168.1.2", 1, 9_500L, viaOverlay = false)
         val decision = OverlayFailoverPolicy.decide(
             lanSighting = lan,
@@ -181,7 +181,7 @@ class OverlayFailoverPolicyTest {
             lanDialFailed = true,
             hasCloudEndpoint = true,
         )
-        assertEquals(OverlayFailoverPolicy.PathAction.USE_CLOUD, decision.action)
+        assertEquals(OverlayFailoverPolicy.PathAction.USE_LAN, decision.action)
     }
 
     @Test
