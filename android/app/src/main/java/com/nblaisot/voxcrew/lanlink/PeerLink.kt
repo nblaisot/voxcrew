@@ -1,5 +1,6 @@
 package com.nblaisot.voxcrew.lanlink
 
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -19,9 +20,27 @@ import java.util.TreeMap
 import kotlin.coroutines.CoroutineContext
 
 sealed interface IncomingMediaEvent {
-    data class Audio(val payload: ByteArray) : IncomingMediaEvent
-    data class Activity(val active: Boolean) : IncomingMediaEvent
+    data class Audio(
+        val sequence: Long,
+        val payload: ByteArray,
+        val receivedAtNs: Long,
+    ) : IncomingMediaEvent
+
+    data class Activity(
+        val sequence: Long,
+        val active: Boolean,
+        val receivedAtNs: Long,
+    ) : IncomingMediaEvent
+
+    data class Gap(
+        val fromSequence: Long,
+        val untilSequence: Long,
+        val receivedAtNs: Long,
+    ) : IncomingMediaEvent
 }
+
+internal fun IncomingMediaEvent.Gap.missingSequenceCount(): Int =
+    (untilSequence - fromSequence + 1L).coerceIn(1L, 1_500L).toInt()
 
 /**
  * Transport-agnostic core of the intercom link with one peer: owns the
@@ -42,6 +61,7 @@ sealed interface IncomingMediaEvent {
 class PeerLink(
     private val scope: CoroutineScope,
     private val healthDispatcher: CoroutineContext = Dispatchers.IO,
+    private val clockNs: () -> Long = System::nanoTime,
     private val clockMs: () -> Long = System::currentTimeMillis,
 ) {
     sealed class LinkState {
@@ -56,7 +76,8 @@ class PeerLink(
 
     private val _incomingAudio = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
     val incomingAudio: SharedFlow<ByteArray> = _incomingAudio.asSharedFlow()
-    private val _incomingMedia = MutableSharedFlow<IncomingMediaEvent>(extraBufferCapacity = 256)
+    /** 30 s of 20 ms audio plus talk boundaries, matching SendBuffer's replay window. */
+    private val _incomingMedia = MutableSharedFlow<IncomingMediaEvent>(extraBufferCapacity = 2_048)
     val incomingMedia: SharedFlow<IncomingMediaEvent> = _incomingMedia.asSharedFlow()
 
     private val _rttMs = MutableStateFlow<Long?>(null)
@@ -80,12 +101,14 @@ class PeerLink(
     @Volatile private var lastContiguousInSeq = -1L
     /** Highest sequence the peer has confirmed (Hello resume or Ack). Drives [maybeSendSkip]. */
     @Volatile private var peerAckedSeq = -1L
-    private val pendingInbound = TreeMap<Long, LanFrame>()
+    private data class TimedInboundFrame(val frame: LanFrame, val receivedAtNs: Long)
+    private val pendingInbound = TreeMap<Long, TimedInboundFrame>()
     @Volatile private var lastActivityMs = clockMs()
     @Volatile private var lastPingSentMs = 0L
     @Volatile private var awaitingPongSinceMs: Long? = null
     @Volatile private var lastAckSentSeq = -1L
     @Volatile private var lastAckSentMs = Long.MIN_VALUE
+    private var droppedIncomingMedia = 0L
 
     val selectedPeerUid: String? get() = currentPeerUid
 
@@ -450,7 +473,7 @@ class PeerLink(
         if (pendingInbound.size >= MAX_PENDING_INBOUND_FRAMES) return
         val previousContiguous = lastContiguousInSeq
         val ackWasPending = previousContiguous > lastAckSentSeq
-        pendingInbound[seq] = frame
+        pendingInbound[seq] = TimedInboundFrame(frame, clockNs())
         drainContiguousLocked()
         if (!ackWasPending && lastContiguousInSeq > previousContiguous) healthSignal.trySend(Unit)
     }
@@ -463,8 +486,10 @@ class PeerLink(
     private fun acceptSkip(untilSeq: Long) {
         if (untilSeq <= lastContiguousInSeq) return
         val ackWasPending = lastContiguousInSeq > lastAckSentSeq
+        val firstMissingSeq = lastContiguousInSeq + 1L
         lastContiguousInSeq = untilSeq
         pendingInbound.headMap(untilSeq, true).clear()
+        emitIncomingMedia(IncomingMediaEvent.Gap(firstMissingSeq, untilSeq, clockNs()))
         drainContiguousLocked()
         if (!ackWasPending) healthSignal.trySend(Unit)
     }
@@ -484,21 +509,43 @@ class PeerLink(
     private fun drainContiguousLocked() {
         while (true) {
             val nextSeq = lastContiguousInSeq + 1
-            val next = pendingInbound.remove(nextSeq) ?: break
+            val timed = pendingInbound.remove(nextSeq) ?: break
+            val next = timed.frame
             lastContiguousInSeq = nextSeq
             when (next) {
                 is LanFrame.Audio -> {
-                    _incomingAudio.tryEmit(next.payload)
-                    _incomingMedia.tryEmit(IncomingMediaEvent.Audio(next.payload))
+                    emitIncomingAudio(next.payload)
+                    emitIncomingMedia(IncomingMediaEvent.Audio(next.seq, next.payload, timed.receivedAtNs))
                 }
                 is LanFrame.MediaActivity ->
-                    _incomingMedia.tryEmit(IncomingMediaEvent.Activity(next.active))
+                    emitIncomingMedia(IncomingMediaEvent.Activity(next.seq, next.active, timed.receivedAtNs))
                 else -> Unit
             }
         }
     }
 
+    private fun emitIncomingAudio(payload: ByteArray) {
+        if (!_incomingAudio.tryEmit(payload)) {
+            recordIncomingMediaDrop()
+        }
+    }
+
+    private fun emitIncomingMedia(event: IncomingMediaEvent) {
+        if (!_incomingMedia.tryEmit(event)) {
+            recordIncomingMediaDrop()
+        }
+    }
+
+    private fun recordIncomingMediaDrop() {
+        droppedIncomingMedia++
+        if (droppedIncomingMedia % INCOMING_MEDIA_DROP_LOG_INTERVAL == 0L) {
+            Log.w(TAG, "incomingMedia drop count=$droppedIncomingMedia peer=$currentPeerUid")
+        }
+    }
+
     companion object {
+        private const val TAG = "PeerLink"
+        private const val INCOMING_MEDIA_DROP_LOG_INTERVAL = 50L
         private const val ACK_INTERVAL_MS = 250L
         private const val PING_INTERVAL_MS = 2_000L
         private const val PONG_TIMEOUT_MS = 3_000L

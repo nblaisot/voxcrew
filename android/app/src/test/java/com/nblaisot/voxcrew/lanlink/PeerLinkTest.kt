@@ -78,7 +78,8 @@ class PeerLinkTest {
 
     @Test
     fun `incoming talk boundaries and audio are emitted in sequence order`() = runTest {
-        val peerLink = PeerLink(this)
+        var monotonicNs = 100L
+        val peerLink = PeerLink(this, clockNs = { monotonicNs })
         peerLink.resetFor("peer-b")
         val transport = FakeTransport("A")
         peerLink.onHandshakeComplete(transport, "peer-b", -1)
@@ -88,13 +89,24 @@ class PeerLinkTest {
         }
 
         peerLink.onFrameReceived(transport, LanFrame.Audio(1, byteArrayOf(9)))
+        monotonicNs = 200L
         peerLink.onFrameReceived(transport, LanFrame.MediaActivity(0, true))
+        monotonicNs = 300L
         peerLink.onFrameReceived(transport, LanFrame.MediaActivity(2, false))
         collectJob.join()
 
-        assertEquals(IncomingMediaEvent.Activity(true), events[0])
-        assertTrue(events[1] is IncomingMediaEvent.Audio)
-        assertEquals(IncomingMediaEvent.Activity(false), events[2])
+        val started = events[0] as IncomingMediaEvent.Activity
+        val audio = events[1] as IncomingMediaEvent.Audio
+        val stopped = events[2] as IncomingMediaEvent.Activity
+        assertEquals(0L, started.sequence)
+        assertTrue(started.active)
+        assertEquals(1L, audio.sequence)
+        assertEquals(9, audio.payload.single().toInt())
+        assertEquals(2L, stopped.sequence)
+        assertFalse(stopped.active)
+        assertEquals(200L, started.receivedAtNs)
+        assertEquals(100L, audio.receivedAtNs)
+        assertEquals(300L, stopped.receivedAtNs)
         peerLink.clear()
     }
 

@@ -48,6 +48,13 @@ object OpusCodec {
             val decodedSamples = decoder.decode(opus, 0, opus.size, pcmOut, 0, FRAME_SAMPLES, false)
             return shortsToBytes(pcmOut, decodedSamples)
         }
+
+        /** Advances decoder state with Opus packet-loss concealment for one 20 ms frame. */
+        fun decodeLost(): ByteArray {
+            val pcmOut = ShortArray(FRAME_SAMPLES)
+            val decodedSamples = decoder.decode(null, 0, 0, pcmOut, 0, FRAME_SAMPLES, false)
+            return shortsToBytes(pcmOut, decodedSamples)
+        }
     }
 
     private fun bytesToShorts(bytes: ByteArray): ShortArray {

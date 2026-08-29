@@ -19,6 +19,7 @@ import com.nblaisot.voxcrew.ui.main.MainViewModel
 import com.nblaisot.voxcrew.ui.navigation.Routes
 import com.nblaisot.voxcrew.ui.profile.ProfileScreen
 import com.nblaisot.voxcrew.ui.profile.ProfileViewModel
+import com.nblaisot.voxcrew.ui.audio.AudioSettingsScreen
 import com.nblaisot.voxcrew.ui.relay.RelaySettingsScreen
 
 @Composable
@@ -70,6 +71,7 @@ fun VoxCrewNavHost(
                 onConnectTailscale = tailscaleLauncher::connectOrInstall,
                 onNavigateToAbout = { navController.navigate(Routes.ABOUT) },
                 onNavigateToRelay = { navController.navigate(Routes.RELAY) },
+                onNavigateToAudio = { navController.navigate(Routes.AUDIO) },
                 onSignOut = {
                     navController.navigate(Routes.PROFILE) { popUpTo(0) }
                 },
@@ -87,6 +89,12 @@ fun VoxCrewNavHost(
             RelaySettingsScreen(
                 repository = container.relaySettingsRepository,
                 relayReady = ready,
+                onBack = { navController.popBackStack() },
+            )
+        }
+        composable(Routes.AUDIO) {
+            AudioSettingsScreen(
+                lanEngine = container.lanIntercomEngine,
                 onBack = { navController.popBackStack() },
             )
         }

@@ -5,4 +5,5 @@ object Routes {
     const val MAIN = "main"
     const val ABOUT = "about"
     const val RELAY = "relay"
+    const val AUDIO = "audio"
 }

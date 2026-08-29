@@ -59,6 +59,18 @@ class OpusCodecTest {
     }
 
     @Test
+    fun `declared loss produces one frame of plc and preserves decoder continuity`() {
+        val encoder = OpusCodec.Encoder()
+        val decoder = OpusCodec.Decoder()
+        val first = encoder.encode(sineWavePcm(300.0))
+        val afterLoss = encoder.encode(sineWavePcm(320.0))
+
+        assertEquals(AudioCapture.FRAME_BYTES, decoder.decode(first).size)
+        assertEquals(AudioCapture.FRAME_BYTES, decoder.decodeLost().size)
+        assertEquals(AudioCapture.FRAME_BYTES, decoder.decode(afterLoss).size)
+    }
+
+    @Test
     fun `silence encodes to a very small packet`() {
         val encoder = OpusCodec.Encoder()
         val silence = ByteArray(OpusCodec.FRAME_SAMPLES * 2)

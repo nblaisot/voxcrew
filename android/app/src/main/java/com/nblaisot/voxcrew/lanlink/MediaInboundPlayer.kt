@@ -7,6 +7,7 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -31,10 +32,34 @@ class MediaInboundPlayer(
     private val lock = Any()
     private var track: AudioTrack? = null
     private var trackGeneration = 0L
-    private var idleJob: Job? = null
+    @Volatile private var idleJob: Job? = null
     private var focusRequest: AudioFocusRequest? = null
     private var hasFocus = false
-    private val decoder = OpusCodec.Decoder()
+    @Volatile private var idleDeadlineMs = 0L
+    private var submittedPcmFrames = 0L
+    private var writtenQuanta = 0L
+    private var requestedMaxBufferMs = JitterBufferSettings.DEFAULT_MAX_ADAPTIVE_DELAY_MS
+    private val playout = AdaptiveInboundPlayout(
+        decoderFactory = {
+            val decoder = OpusCodec.Decoder()
+            object : InboundFrameDecoder {
+                override fun decode(payload: ByteArray): ByteArray? =
+                    runCatching { decoder.decode(payload) }
+                        .onFailure { Log.w(TAG, "Opus decode failed: ${it.message}") }
+                        .getOrNull()
+
+                override fun decodeLost(): ByteArray? =
+                    runCatching { decoder.decodeLost() }
+                        .onFailure { Log.w(TAG, "Opus PLC failed: ${it.message}") }
+                        .getOrNull()
+            }
+        },
+        writeDecodedPcm = { pcm -> writePcmToTrack(pcm) },
+        bufferedPcmMs = ::bufferedPcmMs,
+        audioTrackUnderruns = ::audioTrackUnderruns,
+        actualTrackBufferMs = ::actualTrackBufferMs,
+        tag = TAG,
+    )
     private val focusChangeListener = AudioManager.OnAudioFocusChangeListener { change ->
         when (change) {
             AudioManager.AUDIOFOCUS_LOSS,
@@ -50,11 +75,34 @@ class MediaInboundPlayer(
     private val _isReceiving = MutableStateFlow(false)
     val isReceiving: StateFlow<Boolean> = _isReceiving.asStateFlow()
 
-    /** Decode and play one Opus frame. Lazily opens the track and takes audio focus. */
-    fun play(payload: ByteArray): Boolean {
-        val pcm = runCatching { decoder.decode(payload) }
-            .onFailure { Log.w(TAG, "Opus decode failed: ${it.message}") }
-            .getOrNull() ?: return false
+    /** Queue one Opus frame for paced playout. Lazily opens the track and takes audio focus. */
+    fun play(peerUid: String, event: IncomingMediaEvent.Audio): Boolean {
+        playout.start()
+        playout.enqueue(peerUid, event.sequence, event.payload, event.receivedAtNs)
+        _isReceiving.value = true
+        scheduleIdleRelease()
+        return true
+    }
+
+    fun onMediaActivity(peerUid: String, event: IncomingMediaEvent.Activity) {
+        playout.start()
+        playout.onMediaActivity(peerUid, event.sequence, event.active, event.receivedAtNs)
+    }
+
+    fun onPermanentLoss(peerUid: String, event: IncomingMediaEvent.Gap) =
+        playout.onPermanentLoss(peerUid, event.missingSequenceCount())
+
+    fun setJitterBaseDelayMs(ms: Int) = playout.setBaseDelayMs(ms)
+
+    fun setJitterMaxAdaptiveDelayMs(ms: Int) {
+        requestedMaxBufferMs = JitterBufferSettings.coerceMaxAdaptiveDelayMs(ms, 20)
+        playout.setMaxAdaptiveDelayMs(ms)
+        synchronized(lock) { track?.let { resizeTrackBuffer(it, requestedMaxBufferMs) } }
+    }
+
+    fun setJitterAdaptiveEnabled(enabled: Boolean) = playout.setAdaptiveEnabled(enabled)
+
+    private fun writePcmToTrack(pcm: ByteArray): Boolean {
         if (!ensureReady()) return false
         val (activeTrack, generation) = synchronized(lock) {
             val current = track ?: return false
@@ -73,7 +121,22 @@ class MediaInboundPlayer(
             Log.e(TAG, "AudioTrack.write failed: ${writeResult.exceptionOrNull()?.message}")
             return false
         }
-        _isReceiving.value = true
+        synchronized(lock) {
+            if (track === activeTrack && trackGeneration == generation) {
+                submittedPcmFrames += pcm.size / BYTES_PER_PCM_FRAME
+            }
+        }
+        writtenQuanta++
+        if (writtenQuanta == 1L || writtenQuanta % DIAGNOSTIC_QUANTUM_INTERVAL == 0L) {
+            val stats = playout.stats.value
+            Log.i(
+                TAG,
+                "media playout quanta=$writtenQuanta encodedDepth=${stats.encodedDepth} " +
+                    "decodedDepth=${stats.decodedDepth} buffered=${bufferedPcmMs()}ms " +
+                    "target=${stats.targetDelayMs}ms trackBuffer=${actualTrackBufferMs()}ms " +
+                    "underruns=${audioTrackUnderruns()} expansions=${stats.pcmExpansions}",
+            )
+        }
         scheduleIdleRelease()
         return true
     }
@@ -83,6 +146,7 @@ class MediaInboundPlayer(
         idleJob = null
         _isReceiving.value = false
         synchronized(lock) { releaseTrackLocked() }
+        playout.stop()
         abandonFocus()
     }
 
@@ -123,6 +187,7 @@ class MediaInboundPlayer(
                     newTrack.release()
                     return false
                 }
+                resizeTrackBuffer(newTrack, requestedMaxBufferMs)
                 try {
                     newTrack.play()
                 } catch (error: Exception) {
@@ -132,6 +197,7 @@ class MediaInboundPlayer(
                 }
                 track = newTrack
                 trackGeneration++
+                submittedPcmFrames = 0L
                 Log.i(TAG, "media inbound AudioTrack started usage=MEDIA")
             }
         }
@@ -142,13 +208,21 @@ class MediaInboundPlayer(
         return true
     }
 
+    @Synchronized
     private fun scheduleIdleRelease() {
-        idleJob?.cancel()
+        idleDeadlineMs = SystemClock.elapsedRealtime() + idleTimeoutMs
+        if (idleJob?.isActive == true) return
         idleJob = scope.launch {
-            delay(idleTimeoutMs)
+            while (true) {
+                val remainingMs = idleDeadlineMs - SystemClock.elapsedRealtime()
+                if (remainingMs <= 0L) break
+                delay(remainingMs)
+            }
             _isReceiving.value = false
+            playout.reset()
             synchronized(lock) { releaseTrackLocked() }
             abandonFocus()
+            idleJob = null
         }
     }
 
@@ -203,11 +277,33 @@ class MediaInboundPlayer(
             active.release()
         }
         track = null
+        submittedPcmFrames = 0L
+    }
+
+    private fun bufferedPcmMs(): Int = synchronized(lock) {
+        val active = track ?: return 0
+        val played = Integer.toUnsignedLong(active.playbackHeadPosition)
+        val bufferedFrames = (submittedPcmFrames - played).coerceAtLeast(0L)
+        (bufferedFrames * 1_000L / SAMPLE_RATE).toInt()
+    }
+
+    private fun audioTrackUnderruns(): Int = synchronized(lock) { track?.underrunCount ?: 0 }
+
+    private fun actualTrackBufferMs(): Int = synchronized(lock) {
+        track?.let { it.bufferSizeInFrames * 1_000 / SAMPLE_RATE } ?: 0
+    }
+
+    private fun resizeTrackBuffer(activeTrack: AudioTrack, maxMs: Int) {
+        val requestedFrames = SAMPLE_RATE * maxMs / 1_000
+        val actual = runCatching { activeTrack.setBufferSizeInFrames(requestedFrames) }.getOrDefault(0)
+        if (actual <= 0) Log.w(TAG, "could not set AudioTrack buffer to ${maxMs}ms result=$actual")
     }
 
     companion object {
         private const val TAG = "MediaInboundPlayer"
         private const val SAMPLE_RATE = AudioCapture.SAMPLE_RATE
+        private const val BYTES_PER_PCM_FRAME = 2
+        private const val DIAGNOSTIC_QUANTUM_INTERVAL = 200L
         const val IDLE_TIMEOUT_MS = 700L
     }
 }

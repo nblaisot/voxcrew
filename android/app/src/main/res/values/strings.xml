@@ -13,6 +13,7 @@
     <!-- Menu / About -->
     <string name="menu_about">About</string>
     <string name="menu_relay">Gateway Settings</string>
+    <string name="menu_audio">Audio settings</string>
     <string name="menu_connect_tailscale">Connect Tailscale</string>
     <string name="menu_quit">QUIT</string>
     <string name="menu_change_name">Change name</string>
@@ -73,6 +74,14 @@
     <string name="vox_sensitivity_3">Medium</string>
     <string name="vox_sensitivity_4">High</string>
     <string name="vox_sensitivity_5">Maximum</string>
+
+    <string name="audio_settings_title">Audio settings</string>
+    <string name="audio_settings_intro">Tune the total receive reserve across decoded PCM and the audio device. The default keeps 40 ms ready and can expand to 80 ms.</string>
+    <string name="audio_settings_jitter_base">Base playout reserve</string>
+    <string name="audio_settings_jitter_max">Max playout reserve</string>
+    <string name="audio_settings_jitter_adaptive">Adaptive buffering</string>
+    <string name="audio_settings_jitter_adaptive_hint">Adds short, smooth headroom when arrival jitter or a near-underrun is detected.</string>
+    <string name="audio_settings_delay_ms">%1$d ms</string>
 
     <!-- Audio routes / path labels (canonical tokens stay English in logic) -->
     <string name="audio_route_this_device">This device</string>

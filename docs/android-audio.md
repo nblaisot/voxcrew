@@ -20,10 +20,38 @@ AudioRecord → OpusCodec (Concentus, 20 ms frames) → PeerLink.send
                                                          ↓
                                               FrameTransport (LAN / UDP / relay)
                                                          ↓
-PeerLink.incomingAudio → AudioPlayback (Opus decode)
+PeerLink.incomingMedia → LanIntercomEngine → files Opus par pair
+                                                         ↓
+                                   décodage 20 ms → quanta PCM 10 ms → mixage
+                                                         ↓
+                               worker dédié → AudioTrack (horloge de lecture)
 ```
 
-Implémenté dans `lanlink/` : `AudioCapture`, `AudioPlayback`, `OpusCodec`, `PeerLink`.
+Implémenté dans `lanlink/` : `AudioCapture`, `AudioPlayback`, `AdaptiveInboundPlayout`,
+`OpusCodec`, `PeerLink`.
+
+### Tampon de jitter réception (playout)
+
+Les frames Opus entrantes sont mises en file par pair avec leur séquence et leur instant
+d'arrivée monotone. Un décodeur Opus distinct par pair produit des quanta PCM de **10 ms**,
+ensuite mixés dans un flux unique. Un worker de priorité audio alimente `AudioTrack` en
+écriture bloquante : l'horloge de la sortie audio cadence donc la lecture, sans boucle
+`delay(20)`.
+
+- **Réserve totale de base** (20–80 ms, défaut 40 ms) : PCM décodé plus PCM déjà confié
+  à `AudioTrack`, sans double comptage.
+- **Plafond adaptatif** (40–160 ms, défaut 80 ms) : cible calculée avec un estimateur
+  d'inter-arrivée lissé ; un manque imminent l'augmente par pas de 10 ms.
+- **Concealment court** : une expansion PCM par corrélation/overlap-add prolonge la fin
+  de parole puis décroît vers le silence en 60 ms. Le paquet Opus retardé n'est ni consommé
+  ni jeté et reste joué une fois à son arrivée.
+- **Retour à la base** : uniquement pendant une frontière de talkspurt inactive et stable,
+  jamais en supprimant de la parole active.
+
+Les préférences `jitter_base_ms`, `jitter_max_ms` et `jitter_adaptive_enabled` sont
+configurables dans **Menu → Audio settings**. La migration v2 réinitialise les anciennes
+valeurs, dont la sémantique était celle d'une file Opus séparée.
+
 
 ## Interface TransmissionPolicy
 
@@ -332,15 +360,19 @@ Elle ne change ni le routage ni le PTT.
 
 ## Diagnostics et validation physique
 
-Logcat (`IntercomTelecomSession`, `AudioCapture`, `AudioPlayback`, `LanIntercomEngine`)
-expose sans données audio : endpoint confirmé, périphériques observés, RMS brut/nivelé,
-taille Opus, livraison/file transport, frames reçues/décodées et résultat d'écriture.
+Logcat (`IntercomTelecomSession`, `AudioCapture`, `AudioPlayback`, `AdaptiveInboundPlayout`,
+`LanIntercomEngine`, `PeerLink`) expose sans données audio : endpoint confirmé,
+périphériques observés, RMS brut/nivelé, taille Opus, livraison/file transport, profondeur
+Opus/PCM, réserve totale, taille réelle du buffer `AudioTrack`, underruns, expansions,
+drops, frames reçues/décodées et résultat d'écriture.
 
 Matrice à valider sur appareils physiques, dans les deux sens : téléphones nus, Fold avec
-Galaxy Buds, écouteurs USB avec micro sur chaque téléphone, connexion/déconnexion pendant
-la session, Bluetooth+USB simultanés, puis déconnexion/recréation Telecom entre deux PTT. Vérifier que
+Galaxy Buds (réception fluide après churn BT initial — tampon adaptatif, pas de staccato),
+écouteurs USB avec micro sur chaque téléphone, connexion/déconnexion pendant la session,
+Bluetooth+USB simultanés, puis déconnexion/recréation Telecom entre deux PTT. Vérifier que
 PTT ne reste jamais bloqué, que le téléphone nu utilise le haut-parleur, que les routes
 accessoires sont duplex, que le PCM parlé est non silencieux et que les écritures réussissent.
+Tester aussi **Menu → Audio settings** : base 40 ms par défaut, montée adaptative sous jitter.
 
 ## Diagnostics (UI principale)
 

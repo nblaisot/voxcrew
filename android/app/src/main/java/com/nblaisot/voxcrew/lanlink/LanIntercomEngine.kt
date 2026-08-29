@@ -57,6 +57,8 @@ class LanIntercomEngine(
     private val appContext = context.applicationContext
     private val telecomSession = telecomSession ?: IntercomTelecomSession(appContext, scope)
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    @Suppress("unused")
+    private val jitterPrefsMigrated = migrateJitterPreferences()
     private val beacon = LanBeacon(scope)
     private val lanServer = LanTcpServer(scope)
     private var relayClient: RelayClient? = null
@@ -123,6 +125,26 @@ class LanIntercomEngine(
     )
     val voxSensitivity: StateFlow<VoxSensitivity> = _voxSensitivity.asStateFlow()
 
+    private val _jitterBaseMs = MutableStateFlow(
+        JitterBufferSettings.coerceBaseDelayMs(
+            prefs.getInt(KEY_JITTER_BASE_MS, JitterBufferSettings.DEFAULT_BASE_DELAY_MS),
+        ),
+    )
+    val jitterBaseMs: StateFlow<Int> = _jitterBaseMs.asStateFlow()
+
+    private val _jitterMaxMs = MutableStateFlow(
+        JitterBufferSettings.coerceMaxAdaptiveDelayMs(
+            prefs.getInt(KEY_JITTER_MAX_MS, JitterBufferSettings.DEFAULT_MAX_ADAPTIVE_DELAY_MS),
+            _jitterBaseMs.value,
+        ),
+    )
+    val jitterMaxMs: StateFlow<Int> = _jitterMaxMs.asStateFlow()
+
+    private val _jitterAdaptiveEnabled = MutableStateFlow(
+        prefs.getBoolean(KEY_JITTER_ADAPTIVE, JitterBufferSettings.DEFAULT_ADAPTIVE_ENABLED),
+    )
+    val jitterAdaptiveEnabled: StateFlow<Boolean> = _jitterAdaptiveEnabled.asStateFlow()
+
     private val _isTransmitting = MutableStateFlow(false)
     val isTransmitting: StateFlow<Boolean> = _isTransmitting.asStateFlow()
 
@@ -166,7 +188,7 @@ class LanIntercomEngine(
     private val incomingMediaMutex = Mutex()
     private val pendingIncomingMedia = mutableMapOf<String, ArrayDeque<IncomingMediaEvent>>()
     /** Frames arriving while Telecom teardown still holds [IntercomTelecomSession.hasCall]. */
-    private val pendingMediaPlayback = mutableMapOf<String, ArrayDeque<ByteArray>>()
+    private val pendingMediaPlayback = mutableMapOf<String, ArrayDeque<IncomingMediaEvent.Audio>>()
     private var audioPrepared = false
     private var lastFanOutDiagMs = 0L
     /** Pipeline Failed disconnects Telecom; block auto-reactivate until [retryAudioPipeline]. */
@@ -191,6 +213,7 @@ class LanIntercomEngine(
         )
         capture.onRoutedDeviceChanged = { kind -> onObservedRoutingChanged("capture", kind) }
         playback.onRoutedDeviceChanged = { kind -> onObservedRoutingChanged("playback", kind) }
+        applyJitterSettingsToPlayers()
     }
 
     private var routingMismatchJob: Job? = null
@@ -509,6 +532,50 @@ class LanIntercomEngine(
             audioPrepared = false
             prepareAudioPath()
         }
+    }
+
+    fun setJitterBaseMs(ms: Int) {
+        val coerced = JitterBufferSettings.coerceBaseDelayMs(ms)
+        _jitterBaseMs.value = coerced
+        _jitterMaxMs.value = JitterBufferSettings.coerceMaxAdaptiveDelayMs(_jitterMaxMs.value, coerced)
+        prefs.edit().putInt(KEY_JITTER_BASE_MS, coerced).apply()
+        applyJitterSettingsToPlayers()
+    }
+
+    fun setJitterMaxMs(ms: Int) {
+        val coerced = JitterBufferSettings.coerceMaxAdaptiveDelayMs(ms, _jitterBaseMs.value)
+        _jitterMaxMs.value = coerced
+        prefs.edit().putInt(KEY_JITTER_MAX_MS, coerced).apply()
+        applyJitterSettingsToPlayers()
+    }
+
+    fun setJitterAdaptiveEnabled(enabled: Boolean) {
+        _jitterAdaptiveEnabled.value = enabled
+        prefs.edit().putBoolean(KEY_JITTER_ADAPTIVE, enabled).apply()
+        applyJitterSettingsToPlayers()
+    }
+
+    private fun applyJitterSettingsToPlayers() {
+        val base = _jitterBaseMs.value
+        val max = _jitterMaxMs.value
+        val adaptive = _jitterAdaptiveEnabled.value
+        playback.setJitterBaseDelayMs(base)
+        playback.setJitterMaxAdaptiveDelayMs(max)
+        playback.setJitterAdaptiveEnabled(adaptive)
+        mediaInboundPlayer.setJitterBaseDelayMs(base)
+        mediaInboundPlayer.setJitterMaxAdaptiveDelayMs(max)
+        mediaInboundPlayer.setJitterAdaptiveEnabled(adaptive)
+    }
+
+    private fun migrateJitterPreferences(): Boolean {
+        if (prefs.getInt(KEY_JITTER_SETTINGS_VERSION, 0) >= JITTER_SETTINGS_VERSION) return false
+        prefs.edit()
+            .putInt(KEY_JITTER_BASE_MS, JitterBufferSettings.DEFAULT_BASE_DELAY_MS)
+            .putInt(KEY_JITTER_MAX_MS, JitterBufferSettings.DEFAULT_MAX_ADAPTIVE_DELAY_MS)
+            .putBoolean(KEY_JITTER_ADAPTIVE, JitterBufferSettings.DEFAULT_ADAPTIVE_ENABLED)
+            .putInt(KEY_JITTER_SETTINGS_VERSION, JITTER_SETTINGS_VERSION)
+            .apply()
+        return true
     }
 
     fun pttPress() {
@@ -1028,8 +1095,18 @@ class LanIntercomEngine(
                             enqueueIncomingLocked(peerUid, event)
                         } else {
                             setRemoteTelecomDemand(peerUid, true)
+                            if (isConfirmedDuplexReady(
+                                    telecomSession.currentState,
+                                    _audioPipelineState.value,
+                                )
+                            ) {
+                                playback.onMediaActivity(peerUid, event)
+                            } else {
+                                enqueueIncomingLocked(peerUid, event)
+                            }
                         }
                     } else if (pendingIncomingMedia[peerUid].isNullOrEmpty()) {
+                        playback.onMediaActivity(peerUid, event)
                         setRemoteTelecomDemand(peerUid, false)
                     } else {
                         enqueueIncomingLocked(peerUid, event)
@@ -1044,9 +1121,16 @@ class LanIntercomEngine(
                         )
                     ) {
                         setRemoteTelecomDemand(peerUid, true)
-                        playIncomingTelecomLocked(peerUid, event.payload)
+                        playIncomingTelecomLocked(peerUid, event)
                     } else {
                         setRemoteTelecomDemand(peerUid, true)
+                        enqueueIncomingLocked(peerUid, event)
+                    }
+                }
+                is IncomingMediaEvent.Gap -> {
+                    if (isConfirmedDuplexReady(telecomSession.currentState, _audioPipelineState.value)) {
+                        playback.onPermanentLoss(peerUid, event)
+                    } else {
                         enqueueIncomingLocked(peerUid, event)
                     }
                 }
@@ -1064,6 +1148,7 @@ class LanIntercomEngine(
         refreshPendingLatencyMediaLocked()
         when (event) {
             is IncomingMediaEvent.Activity -> {
+                mediaInboundPlayer.onMediaActivity(peerUid, event)
                 if (!event.active) {
                     receivingUntilMs.remove(peerUid)
                     refreshReceivingUids()
@@ -1072,8 +1157,9 @@ class LanIntercomEngine(
                 // Do not call setRemoteTelecomDemand — remote peers must not reopen Telecom.
             }
             is IncomingMediaEvent.Audio -> {
-                playIncomingMediaLocked(peerUid, event.payload)
+                playIncomingMediaLocked(peerUid, event)
             }
+            is IncomingMediaEvent.Gap -> mediaInboundPlayer.onPermanentLoss(peerUid, event)
         }
     }
 
@@ -1099,10 +1185,13 @@ class LanIntercomEngine(
                         when (val event = queue.removeFirst()) {
                             is IncomingMediaEvent.Audio -> {
                                 setRemoteTelecomDemand(peerUid, true)
-                                if (!playIncomingTelecomLocked(peerUid, event.payload)) break
+                                if (!playIncomingTelecomLocked(peerUid, event)) break
                             }
-                            is IncomingMediaEvent.Activity ->
+                            is IncomingMediaEvent.Activity -> {
+                                playback.onMediaActivity(peerUid, event)
                                 setRemoteTelecomDemand(peerUid, event.active)
+                            }
+                            is IncomingMediaEvent.Gap -> playback.onPermanentLoss(peerUid, event)
                         }
                     }
                     if (queue.isEmpty()) pendingIncomingMedia.remove(peerUid)
@@ -1112,8 +1201,8 @@ class LanIntercomEngine(
         }
     }
 
-    private fun playIncomingTelecomLocked(peerUid: String, payload: ByteArray): Boolean {
-        if (!playback.play(payload)) {
+    private fun playIncomingTelecomLocked(peerUid: String, event: IncomingMediaEvent.Audio): Boolean {
+        if (!playback.play(peerUid, event)) {
             if (_audioPipelineState.value is AudioPipelineState.Ready) {
                 onAudioPipelineFailure("AudioTrack could not play a received frame")
             }
@@ -1123,18 +1212,18 @@ class LanIntercomEngine(
         return true
     }
 
-    private fun playIncomingMediaLocked(peerUid: String, payload: ByteArray): Boolean {
+    private fun playIncomingMediaLocked(peerUid: String, event: IncomingMediaEvent.Audio): Boolean {
         // Gate MEDIA focus until Telecom call is fully gone (FG→BG serialization).
         // Buffer the speech onset instead of dropping it; callTornDown flushes it.
         if (telecomSession.hasCall) {
             val queue = pendingMediaPlayback.getOrPut(peerUid) { ArrayDeque() }
             while (queue.size >= MAX_PENDING_MEDIA_FRAMES) queue.removeFirst()
-            queue.addLast(payload)
+            queue.addLast(event)
             refreshPendingLatencyMediaLocked()
             return false
         }
         flushPendingMediaPlaybackLocked(peerUid)
-        if (!mediaInboundPlayer.play(payload)) return false
+        if (!mediaInboundPlayer.play(peerUid, event)) return false
         markReceiving(peerUid)
         return true
     }
@@ -1156,8 +1245,8 @@ class LanIntercomEngine(
         val queue = pendingMediaPlayback.remove(peerUid) ?: return
         refreshPendingLatencyMediaLocked()
         var played = false
-        queue.forEach { payload ->
-            if (mediaInboundPlayer.play(payload)) played = true
+        queue.forEach { event ->
+            if (mediaInboundPlayer.play(peerUid, event)) played = true
         }
         if (played) markReceiving(peerUid)
     }
@@ -1561,13 +1650,18 @@ class LanIntercomEngine(
         private const val RECEIVING_IDLE_MS = 500L
         /** Grace before treating a BT routing mismatch as pipeline failure (SCO warm-up). */
         private const val ROUTING_SETTLE_MS = 1_500L
-        private const val MAX_PENDING_INCOMING_EVENTS = 250
-        /** ~2 s of 20 ms Opus frames buffered across the Telecom teardown gap. */
-        private const val MAX_PENDING_MEDIA_FRAMES = 100
+        /** 30 s of 20 ms frames plus talk boundaries, matching SendBuffer. */
+        private const val MAX_PENDING_INCOMING_EVENTS = 1_550
+        private const val MAX_PENDING_MEDIA_FRAMES = 1_500
         private const val PREFS_NAME = "voxcrew_lanlink"
         private const val KEY_LEGACY_ACTIVE_RECIPIENTS = "active_recipient_uids"
         private const val KEY_VOX_ENABLED = "vox_enabled"
         private const val KEY_VOX_SENSITIVITY = "vox_sensitivity"
+        private const val KEY_JITTER_BASE_MS = "jitter_base_ms"
+        private const val KEY_JITTER_MAX_MS = "jitter_max_ms"
+        private const val KEY_JITTER_ADAPTIVE = "jitter_adaptive_enabled"
+        private const val KEY_JITTER_SETTINGS_VERSION = "jitter_settings_version"
+        private const val JITTER_SETTINGS_VERSION = 2
     }
 }
 

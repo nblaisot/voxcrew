@@ -121,6 +121,7 @@ fun MainScreen(
     onConnectTailscale: () -> TailscaleLaunchResult,
     onNavigateToAbout: () -> Unit,
     onNavigateToRelay: () -> Unit,
+    onNavigateToAudio: () -> Unit,
     onSignOut: () -> Unit,
     onQuitApplication: () -> Unit,
 ) {
@@ -296,6 +297,14 @@ fun MainScreen(
                                 }
                             },
                             modifier = Modifier.testTag("menu_connect_tailscale"),
+                        )
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.menu_audio)) },
+                            onClick = {
+                                menuExpanded = false
+                                onNavigateToAudio()
+                            },
+                            modifier = Modifier.testTag("menu_audio"),
                         )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_relay)) },

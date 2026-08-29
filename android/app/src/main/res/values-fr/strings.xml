@@ -13,6 +13,7 @@
     <!-- Menu / About -->
     <string name="menu_about">À propos</string>
     <string name="menu_relay">Paramètres Gateway</string>
+    <string name="menu_audio">Paramètres audio</string>
     <string name="menu_connect_tailscale">Connecter Tailscale</string>
     <string name="menu_quit">QUITTER</string>
     <string name="menu_change_name">Changer de nom</string>
@@ -73,6 +74,14 @@
     <string name="vox_sensitivity_3">Moyenne</string>
     <string name="vox_sensitivity_4">Élevée</string>
     <string name="vox_sensitivity_5">Maximale</string>
+
+    <string name="audio_settings_title">Paramètres audio</string>
+    <string name="audio_settings_intro">Ajustez la réserve totale de réception entre le PCM décodé et la sortie audio. Par défaut, 40 ms sont prêtes et la réserve peut monter à 80 ms.</string>
+    <string name="audio_settings_jitter_base">Réserve de lecture de base</string>
+    <string name="audio_settings_jitter_max">Réserve de lecture max</string>
+    <string name="audio_settings_jitter_adaptive">Tampon adaptatif</string>
+    <string name="audio_settings_jitter_adaptive_hint">Ajoute une marge courte et progressive en cas de jitter d’arrivée ou de sous-alimentation imminente.</string>
+    <string name="audio_settings_delay_ms">%1$d ms</string>
 
     <!-- Audio routes / path labels -->
     <string name="audio_route_this_device">Cet appareil</string>
