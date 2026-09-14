@@ -185,6 +185,37 @@ function opsLog(event, fields = {}) {
   console.log(`[relay] ${event}${parts.length ? ` ${parts.join(' ')}` : ''}`);
 }
 
+export function enableTcpNoDelay(socket) {
+  if (socket && typeof socket.setNoDelay === 'function') {
+    socket.setNoDelay(true);
+    return true;
+  }
+  return false;
+}
+
+function forwardBinary(peer, fromUid, frame) {
+  const payload = encodeBinaryEnvelope(fromUid, frame);
+  const startedAt = performance.now();
+  peer.ws.send(payload, { binary: true }, (error) => {
+    const completionMs = Math.round(performance.now() - startedAt);
+    if (error || completionMs >= 100) {
+      opsLog('binary_send_complete', {
+        to: peer.uid,
+        bytes: payload.length,
+        completionMs,
+        error: error?.message,
+      });
+    }
+  });
+  if (peer.ws.bufferedAmount >= 64 * 1024) {
+    opsLog('binary_backlog', {
+      to: peer.uid,
+      bufferedAmount: peer.ws.bufferedAmount,
+      frameBytes: payload.length,
+    });
+  }
+}
+
 /** @param {unknown} msg */
 export function parseOverlayEndpoint(msg) {
   if (!msg || typeof msg !== 'object') return null;
@@ -317,7 +348,7 @@ export function attachClient(ws, expectedSecret) {
       const peer = clients.get(env.peerUid);
       if (!peer || !client.bridges.has(env.peerUid)) return;
       // Forward as if from this uid toward the peer.
-      peer.ws.send(encodeBinaryEnvelope(client.uid, env.frame), { binary: true });
+      forwardBinary(peer, client.uid, env.frame);
       return;
     }
 
@@ -422,7 +453,10 @@ export function createRelayServer({
   }
 
   const wss = new WebSocketServer({ server });
-  wss.on('connection', (ws) => attachClient(ws, secret));
+  wss.on('connection', (ws, request) => {
+    enableTcpNoDelay(request.socket);
+    attachClient(ws, secret);
+  });
 
   return {
     server,

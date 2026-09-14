@@ -1,5 +1,6 @@
 package com.nblaisot.voxcrew.lanlink
 
+import android.annotation.SuppressLint
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -8,6 +9,7 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import com.nblaisot.voxcrew.audio.IntercomTelecomSession
@@ -18,14 +20,16 @@ import com.nblaisot.voxcrew.audio.VoxEchoGuard
 import com.nblaisot.voxcrew.audio.VoxGate
 import com.nblaisot.voxcrew.audio.VoiceDetector
 import com.nblaisot.voxcrew.audio.observedDeviceKind
+import com.nblaisot.voxcrew.diagnostics.AudioDiagnostics
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.util.concurrent.Executors
 
 /** One continuously open capture pipeline shared by PTT/open-mic and VOX policies. */
 class AudioCapture(
@@ -36,6 +40,10 @@ class AudioCapture(
     @Volatile private var activeRecorder: AudioRecord? = null
     @Volatile private var captureGeneration = 0
     private val lock = Any()
+    /** AudioRecord and all immediate frame work are isolated from the shared IO pool. */
+    private val captureDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "VoxCrewAudioCapture").apply { isDaemon = true }
+    }.asCoroutineDispatcher()
 
     /** Fired when the platform re-routes the live recorder (e.g. SCO drops to builtin). */
     @Volatile var onRoutedDeviceChanged: ((ObservedAudioDeviceKind) -> Unit)? = null
@@ -60,7 +68,8 @@ class AudioCapture(
             releaseRecorder(opened.recorder)
             return CaptureStartResult.Failure("AudioRecord start was superseded")
         }
-        val job = scope.launch(Dispatchers.IO) {
+        val job = scope.launch(captureDispatcher) {
+            setAudioThreadPriority()
             pttCaptureLoop(
                 generation,
                 opened,
@@ -89,7 +98,8 @@ class AudioCapture(
             releaseRecorder(opened.recorder)
             return CaptureStartResult.Failure("AudioRecord start was superseded")
         }
-        val job = scope.launch(Dispatchers.IO) {
+        val job = scope.launch(captureDispatcher) {
+            setAudioThreadPriority()
             val voiceDetector = runCatching { voiceDetectorFactory() }.getOrElse { error ->
                 releaseRecorder(opened.recorder)
                 clearRecorder(generation, opened.recorder)
@@ -173,13 +183,29 @@ class AudioCapture(
         val leveler = PcmSpeechLeveler()
         var fullFrames = 0
         var encodedFrames = 0L
+        var lastCaptureAtMs = 0L
+        var longestCaptureGapMs = 0L
         var wasTransmitting = false
         try {
             val frame = ByteArray(FRAME_BYTES)
             while (currentCoroutineContext().isActive && generation == captureGeneration) {
+                val readStartedNs = SystemClock.elapsedRealtimeNanos()
                 readCompleteFrame(recorder, frame)
+                val readDurationMs = elapsedMs(readStartedNs)
                 fullFrames++
                 logInitialFrame(fullFrames, frame, opened, recorder)
+                val nowMs = SystemClock.elapsedRealtime()
+                val captureGapMs = if (lastCaptureAtMs == 0L) 0L else nowMs - lastCaptureAtMs
+                lastCaptureAtMs = nowMs
+                longestCaptureGapMs = maxOf(longestCaptureGapMs, captureGapMs)
+                if (captureGapMs >= CAPTURE_GAP_WARNING_MS) {
+                    AudioDiagnostics.event(
+                        "capture", "gap",
+                        "mode" to "policy", "gapMs" to captureGapMs,
+                        "readMs" to readDurationMs, "frame" to fullFrames,
+                        "route" to observedDeviceKind(routedDevice(recorder)?.type),
+                    )
+                }
                 val transmitting = shouldTransmit.value
                 if (!transmitting) {
                     if (wasTransmitting) onTransmissionStopped()
@@ -188,8 +214,10 @@ class AudioCapture(
                 }
                 if (!wasTransmitting) leveler.reset()
                 wasTransmitting = true
+                val processingStartedNs = SystemClock.elapsedRealtimeNanos()
                 val leveled = leveler.process(frame)
                 val encoded = encoder.encode(leveled.bytes)
+                val encodeDurationMs = elapsedMs(processingStartedNs)
                 encodedFrames++
                 if (encodedFrames == 1L || encodedFrames % DIAGNOSTIC_FRAME_INTERVAL == 0L) {
                     Log.i(
@@ -198,7 +226,19 @@ class AudioCapture(
                             "outputRms=${leveled.outputRms} gain=${"%.2f".format(leveled.gain)}",
                     )
                 }
+                val fanOutStartedNs = SystemClock.elapsedRealtimeNanos()
                 onFrame(encoded)
+                val fanOutDurationMs = elapsedMs(fanOutStartedNs)
+                if (encodedFrames % DIAGNOSTIC_FRAME_INTERVAL == 0L) {
+                    AudioDiagnostics.event(
+                        "capture", "summary",
+                        "mode" to "policy", "frames" to fullFrames,
+                        "encoded" to encodedFrames, "longestGapMs" to longestCaptureGapMs,
+                        "readMs" to readDurationMs, "encodeMs" to encodeDurationMs,
+                        "fanOutMs" to fanOutDurationMs,
+                        "route" to observedDeviceKind(routedDevice(recorder)?.type),
+                    )
+                }
             }
         } catch (error: CaptureReadException) {
             if (generation == captureGeneration && currentCoroutineContext().isActive) {
@@ -234,10 +274,17 @@ class AudioCapture(
         val detectorSamples = ShortArray(FRAME_BYTES / BYTES_PER_SAMPLE)
         var fullFrames = 0
         var encodedFrames = 0L
+        var lastCaptureAtMs = 0L
+        var longestCaptureGapMs = 0L
+        var observedRoute: ObservedAudioDeviceKind? = null
+        var wasTransmitting = false
+        var talkspurtOpenedAtMs = 0L
         try {
             fun sendLeveled(rawPcm: ByteArray) {
+                val encodeStartedNs = SystemClock.elapsedRealtimeNanos()
                 val leveled = leveler.process(rawPcm)
                 val encoded = encoder.encode(leveled.bytes)
+                val encodeDurationMs = elapsedMs(encodeStartedNs)
                 encodedFrames++
                 if (encodedFrames == 1L || encodedFrames % DIAGNOSTIC_FRAME_INTERVAL == 0L) {
                     Log.i(
@@ -247,20 +294,100 @@ class AudioCapture(
                             "gain=${"%.2f".format(leveled.gain)}",
                     )
                 }
+                val fanOutStartedNs = SystemClock.elapsedRealtimeNanos()
                 onFrame(encoded)
+                val fanOutDurationMs = elapsedMs(fanOutStartedNs)
+                if (encodedFrames % DIAGNOSTIC_FRAME_INTERVAL == 0L) {
+                    AudioDiagnostics.event(
+                        "capture", "summary",
+                        "mode" to "vox", "frames" to fullFrames,
+                        "encoded" to encodedFrames, "longestGapMs" to longestCaptureGapMs,
+                        "encodeMs" to encodeDurationMs, "fanOutMs" to fanOutDurationMs,
+                        "route" to observedRoute,
+                    )
+                }
             }
             val frame = ByteArray(FRAME_BYTES)
             while (currentCoroutineContext().isActive && generation == captureGeneration) {
+                val readStartedNs = SystemClock.elapsedRealtimeNanos()
                 readCompleteFrame(recorder, frame)
+                val readDurationMs = elapsedMs(readStartedNs)
                 fullFrames++
                 logInitialFrame(fullFrames, frame, opened, recorder)
 
                 val nowMs = SystemClock.elapsedRealtime()
+                if (lastCaptureAtMs > 0L) {
+                    val captureGapMs = nowMs - lastCaptureAtMs
+                    longestCaptureGapMs = maxOf(longestCaptureGapMs, captureGapMs)
+                    if (captureGapMs >= CAPTURE_GAP_WARNING_MS) {
+                        AudioDiagnostics.event(
+                            "capture", "gap",
+                            "mode" to "vox", "gapMs" to captureGapMs,
+                            "readMs" to readDurationMs, "frame" to fullFrames,
+                            "route" to observedDeviceKind(routedDevice(recorder)?.type),
+                        )
+                    }
+                }
+                lastCaptureAtMs = nowMs
+                val route = observedDeviceKind(routedDevice(recorder)?.type)
+                if (route != observedRoute) {
+                    observedRoute = route
+                    val hangoverMs = voxHangoverMs(route)
+                    gate.setHangoverMs(hangoverMs)
+                    Log.i(TAG, "VOX input route=$route hangover=${hangoverMs}ms")
+                    AudioDiagnostics.event(
+                        "capture", "route_changed",
+                        "mode" to "vox", "route" to route, "hangoverMs" to hangoverMs,
+                    )
+                }
                 echoGuard.onReceivingChanged(isReceiving(), nowMs)
                 pcm16LeToShorts(frame, detectorSamples)
+                val detectorStartedNs = SystemClock.elapsedRealtimeNanos()
                 val decision = voiceDetector.accept(detectorSamples)
+                val detectorDurationMs = elapsedMs(detectorStartedNs)
                 val result = gate.update(echoGuard.filterSpeechDecision(decision, nowMs), nowMs)
                 onTransmittingChanged(result.transmitting)
+
+                if (result.transmitting && !wasTransmitting) {
+                    talkspurtOpenedAtMs = nowMs
+                    Log.i(TAG, "VOX opened route=$route hangover=${gate.currentHangoverMs()}ms")
+                    AudioDiagnostics.event(
+                        "capture", "talkspurt_opened",
+                        "mode" to "vox", "route" to route,
+                        "hangoverMs" to gate.currentHangoverMs(),
+                    )
+                } else if (!result.transmitting && wasTransmitting) {
+                    Log.i(
+                        TAG,
+                        "VOX closed duration=${nowMs - talkspurtOpenedAtMs}ms route=$route " +
+                            "hangover=${gate.currentHangoverMs()}ms captureFrames=$fullFrames " +
+                            "longestCaptureGap=${longestCaptureGapMs}ms encoded=$encodedFrames",
+                    )
+                    AudioDiagnostics.event(
+                        "capture", "talkspurt_closed",
+                        "mode" to "vox", "route" to route,
+                        "durationMs" to nowMs - talkspurtOpenedAtMs,
+                        "captureFrames" to fullFrames,
+                        "encodedFrames" to encodedFrames,
+                        "longestGapMs" to longestCaptureGapMs,
+                    )
+                    longestCaptureGapMs = 0L
+                }
+                wasTransmitting = result.transmitting
+                if (fullFrames % DIAGNOSTIC_FRAME_INTERVAL.toInt() == 0) {
+                    Log.i(
+                        TAG,
+                        "VOX capture cadence frames=$fullFrames longestGap=${longestCaptureGapMs}ms " +
+                            "route=$route transmitting=${result.transmitting} hangover=${gate.currentHangoverMs()}ms",
+                    )
+                    AudioDiagnostics.event(
+                        "capture", "cadence",
+                        "mode" to "vox", "frames" to fullFrames,
+                        "longestGapMs" to longestCaptureGapMs,
+                        "readMs" to readDurationMs, "vadMs" to detectorDurationMs,
+                        "transmitting" to result.transmitting, "route" to route,
+                    )
+                }
 
                 if (result.transmitting) {
                     if (result.onset) {
@@ -291,6 +418,7 @@ class AudioCapture(
         }
     }
 
+    @SuppressLint("MissingPermission") // Callers open the pipeline only after RECORD_AUDIO is granted.
     private fun openAndStartRecorder(): OpenedRecorder? {
         val callState = telecomSession?.currentState
         if (callState != null && !callState.mediaActive) {
@@ -337,6 +465,12 @@ class AudioCapture(
                 "endpoint=${callState?.currentEndpoint?.name} endpointType=${callState?.currentEndpoint?.type} " +
                 "sessionId=${recorder.audioSessionId} routedType=${routedDevice(recorder)?.type}",
         )
+        AudioDiagnostics.event(
+            "capture", "recorder_started",
+            "endpointType" to callState?.currentEndpoint?.type,
+            "sessionId" to recorder.audioSessionId,
+            "routeType" to routedDevice(recorder)?.type,
+        )
         return opened
     }
 
@@ -354,7 +488,20 @@ class AudioCapture(
         runCatching { recorder.removeOnRoutingChangedListener(routingListener) }
         runCatching { recorder.stop() }
         recorder.release()
+        AudioDiagnostics.event("capture", "recorder_released")
     }
+
+    private fun setAudioThreadPriority() {
+        runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
+        AudioDiagnostics.event(
+            "capture", "thread_started",
+            "thread" to Thread.currentThread().name,
+            "priority" to runCatching { Process.getThreadPriority(Process.myTid()) }.getOrNull(),
+        )
+    }
+
+    private fun elapsedMs(startedNs: Long): Long =
+        ((SystemClock.elapsedRealtimeNanos() - startedNs) / 1_000_000L).coerceAtLeast(0L)
 
     private fun logInitialFrame(
         frameNumber: Int,
@@ -390,11 +537,15 @@ class AudioCapture(
         private const val INITIAL_CAPTURE_DIAGNOSTIC_FRAMES = 5
         private const val DIAGNOSTIC_FRAME_INTERVAL = 100L
         private const val PRE_ROLL_FRAMES = 10
+        private const val CAPTURE_GAP_WARNING_MS = 60L
     }
 
     private data class OpenedRecorder(val recorder: AudioRecord, val callState: TelecomCallState)
     private class CaptureReadException(message: String) : IllegalStateException(message)
 }
+
+internal fun voxHangoverMs(kind: ObservedAudioDeviceKind): Long =
+    if (kind == ObservedAudioDeviceKind.BLUETOOTH) 1_200L else VoxGate.DEFAULT_HANGOVER_MS
 
 /** Converts PCM16 little-endian bytes into a caller-owned primitive buffer. */
 internal fun pcm16LeToShorts(bytes: ByteArray, destination: ShortArray) {

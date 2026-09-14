@@ -31,8 +31,7 @@ class AudioPlayback(
     private var idleJob: Job? = null
     private var decodedFrames = 0L
     private var writtenFrames = 0L
-    private var submittedPcmFrames = 0L
-    private var requestedMaxBufferMs = JitterBufferSettings.DEFAULT_MAX_ADAPTIVE_DELAY_MS
+    private val sinkTracker = AudioTrackSinkTracker(TAG)
     private val playout = AdaptiveInboundPlayout(
         decoderFactory = {
             val decoder = OpusCodec.Decoder()
@@ -48,10 +47,8 @@ class AudioPlayback(
                         .getOrNull()
             }
         },
-        writeDecodedPcm = { pcm -> writePcmToTrack(pcm) },
-        bufferedPcmMs = ::bufferedPcmMs,
-        audioTrackUnderruns = ::audioTrackUnderruns,
-        actualTrackBufferMs = ::actualTrackBufferMs,
+        writeDecodedPcm = ::writePcmToTrack,
+        audioSinkState = ::audioSinkState,
         tag = TAG,
     )
 
@@ -105,7 +102,7 @@ class AudioPlayback(
                 newTrack.release()
                 return PlaybackStartResult.Failure("AudioTrack was not initialized")
             }
-            resizeTrackBuffer(newTrack, requestedMaxBufferMs)
+            val playoutConfiguration = configureAudioTrackForPlayout(newTrack)
             try {
                 newTrack.play()
             } catch (error: Exception) {
@@ -114,7 +111,7 @@ class AudioPlayback(
             }
             track = newTrack
             trackGeneration++
-            submittedPcmFrames = 0L
+            sinkTracker.reset(playoutConfiguration)
             playout.reset()
             playout.start()
             runCatching { newTrack.addOnRoutingChangedListener(routingListener, routingHandler) }
@@ -123,7 +120,9 @@ class AudioPlayback(
                 TAG,
                 "AudioTrack started stream=${AudioManager.STREAM_VOICE_CALL} " +
                     "endpoint=${callState.currentEndpoint?.name} endpointType=${callState.currentEndpoint?.type} " +
-                    "routedType=$routedType",
+                    "routedType=$routedType capacityFrames=${playoutConfiguration.capacityFrames} " +
+                    "bufferFrames=${playoutConfiguration.bufferSizeFrames} " +
+                    "startThresholdFrames=${playoutConfiguration.startupThresholdFrames}",
             )
             return PlaybackStartResult.Success(observedDeviceKind(routedType))
         }
@@ -151,15 +150,14 @@ class AudioPlayback(
     fun setJitterBaseDelayMs(ms: Int) = playout.setBaseDelayMs(ms)
 
     fun setJitterMaxAdaptiveDelayMs(ms: Int) {
-        requestedMaxBufferMs = JitterBufferSettings.coerceMaxAdaptiveDelayMs(ms, 20)
         playout.setMaxAdaptiveDelayMs(ms)
-        synchronized(lock) { track?.let { resizeTrackBuffer(it, requestedMaxBufferMs) } }
     }
 
     fun setJitterAdaptiveEnabled(enabled: Boolean) = playout.setAdaptiveEnabled(enabled)
 
-    private fun writePcmToTrack(pcm: ByteArray): Boolean {
-        decodedFrames++
+    private fun writePcmToTrack(quantum: PlayoutQuantum): Boolean {
+        val pcm = quantum.pcm
+        if (quantum.kind == PlayoutQuantumKind.AUDIO) decodedFrames++
         val (activeTrack, generation) = synchronized(lock) {
             val current = track ?: return false
             current to trackGeneration
@@ -183,20 +181,26 @@ class AudioPlayback(
         }
         synchronized(lock) {
             if (track === activeTrack && trackGeneration == generation) {
-                submittedPcmFrames += pcm.size / BYTES_PER_PCM_FRAME
+                sinkTracker.recordSubmittedFrames(pcm.size / BYTES_PER_PCM_FRAME)
             }
         }
         writtenFrames++
         if (writtenFrames == 1L || writtenFrames % DIAGNOSTIC_FRAME_INTERVAL == 0L) {
             val stats = playout.stats.value
+            val sink = audioSinkState()
             Log.i(
                 TAG,
                 "playback frame decoded=$decodedFrames written=$writtenFrames pcmBytes=${pcm.size} " +
                     "writeResult=${writeResult.getOrThrow()} routedType=${routedDevice(activeTrack)?.type} " +
                     "encodedDepth=${stats.encodedDepth} decodedDepth=${stats.decodedDepth} " +
-                    "buffered=${bufferedPcmMs()}ms target=${stats.targetDelayMs}ms " +
-                    "trackBuffer=${actualTrackBufferMs()}ms underruns=${audioTrackUnderruns()} " +
-                    "expansions=${stats.pcmExpansions}",
+                    "buffered=${sink.bufferedPcmMs}ms target=${stats.targetDelayMs}ms " +
+                    "trackBuffer=${sink.actualBufferMs}ms startThreshold=${sink.startupThresholdMs}ms " +
+                    "priming=${sink.requiresPriming} underruns=${sink.underruns} " +
+                    "activeUnderruns=${stats.activeSpeechUnderruns} " +
+                    "concealmentUnderruns=${stats.concealmentUnderruns} " +
+                    "idleUnderruns=${stats.intentionalIdleUnderruns} expansions=${stats.pcmExpansions} " +
+                    "silence=${stats.silentKeepaliveQuanta} longestGap=${stats.longestInboundGapMs}ms " +
+                    "maxBurst=${stats.maximumArrivalBurstFrames}",
             )
         }
         return true
@@ -217,26 +221,11 @@ class AudioPlayback(
             active.release()
         }
         track = null
-        submittedPcmFrames = 0L
+        sinkTracker.clear()
     }
 
-    private fun bufferedPcmMs(): Int = synchronized(lock) {
-        val active = track ?: return 0
-        val played = Integer.toUnsignedLong(active.playbackHeadPosition)
-        val bufferedFrames = (submittedPcmFrames - played).coerceAtLeast(0L)
-        (bufferedFrames * 1_000L / SAMPLE_RATE).toInt()
-    }
-
-    private fun audioTrackUnderruns(): Int = synchronized(lock) { track?.underrunCount ?: 0 }
-
-    private fun actualTrackBufferMs(): Int = synchronized(lock) {
-        track?.let { it.bufferSizeInFrames * 1_000 / SAMPLE_RATE } ?: 0
-    }
-
-    private fun resizeTrackBuffer(activeTrack: AudioTrack, maxMs: Int) {
-        val requestedFrames = SAMPLE_RATE * maxMs / 1_000
-        val actual = runCatching { activeTrack.setBufferSizeInFrames(requestedFrames) }.getOrDefault(0)
-        if (actual <= 0) Log.w(TAG, "could not set AudioTrack buffer to ${maxMs}ms result=$actual")
+    private fun audioSinkState(): AudioSinkState = synchronized(lock) {
+        track?.let(sinkTracker::snapshot) ?: AudioSinkState()
     }
 
     private fun routedDevice(track: AudioTrack): AudioDeviceInfo? =

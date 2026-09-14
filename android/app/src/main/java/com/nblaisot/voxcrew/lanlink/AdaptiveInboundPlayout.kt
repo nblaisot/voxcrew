@@ -2,6 +2,7 @@ package com.nblaisot.voxcrew.lanlink
 
 import android.os.Process
 import android.util.Log
+import com.nblaisot.voxcrew.diagnostics.AudioDiagnostics
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -15,6 +16,19 @@ interface InboundFrameDecoder {
     fun decodeLost(): ByteArray?
 }
 
+enum class PlayoutQuantumKind { AUDIO, CONCEALMENT, SILENCE }
+
+data class PlayoutQuantum(val pcm: ByteArray, val kind: PlayoutQuantumKind)
+
+/** Snapshot of the real PCM sink used to pace playout. */
+data class AudioSinkState(
+    val bufferedPcmMs: Int = 0,
+    val requiresPriming: Boolean = false,
+    val startupThresholdMs: Int = 0,
+    val actualBufferMs: Int = 0,
+    val underruns: Int = 0,
+)
+
 /**
  * Sink-driven inbound playout.
  *
@@ -26,10 +40,8 @@ interface InboundFrameDecoder {
  */
 class AdaptiveInboundPlayout(
     private val decoderFactory: () -> InboundFrameDecoder,
-    private val writeDecodedPcm: (ByteArray) -> Boolean,
-    private val bufferedPcmMs: () -> Int = { 0 },
-    private val audioTrackUnderruns: () -> Int = { 0 },
-    private val actualTrackBufferMs: () -> Int = { 0 },
+    private val writeDecodedPcm: (PlayoutQuantum) -> Boolean,
+    private val audioSinkState: () -> AudioSinkState = { AudioSinkState() },
     private val nowNs: () -> Long = System::nanoTime,
     private val startWorker: Boolean = true,
     private val tag: String = TAG,
@@ -39,15 +51,26 @@ class AdaptiveInboundPlayout(
 
     @Volatile private var running = false
     private var worker: Thread? = null
+    private var workerGeneration = 0L
     private var baseDelayMs = JitterBufferSettings.DEFAULT_BASE_DELAY_MS
     private var maxAdaptiveDelayMs = JitterBufferSettings.DEFAULT_MAX_ADAPTIVE_DELAY_MS
     private var adaptiveEnabled = JitterBufferSettings.DEFAULT_ADAPTIVE_ENABLED
     private var writtenQuanta = 0L
     private var pcmExpansions = 0L
     private var permanentLossConcealments = 0L
+    private var silentKeepaliveQuanta = 0L
+    private var activeSpeechUnderruns = 0L
+    private var concealmentUnderruns = 0L
+    private var intentionalIdleUnderruns = 0L
+    private var previousUnderrunCount = 0
+    private var lastOutputKind = PlayoutQuantumKind.SILENCE
+    private var longestInboundGapMs = 0L
+    private var maximumArrivalBurstFrames = 0
     @Volatile private var cachedSinkBufferedMs = 0
     @Volatile private var cachedAudioTrackUnderruns = 0
     @Volatile private var cachedActualTrackBufferMs = 0
+    @Volatile private var cachedStartupThresholdMs = 0
+    @Volatile private var cachedSinkRequiresPriming = false
 
     private val _stats = MutableStateFlow(PlayoutStats())
     val stats: StateFlow<PlayoutStats> = _stats.asStateFlow()
@@ -82,8 +105,10 @@ class AdaptiveInboundPlayout(
         synchronized(lock) {
             if (running) return
             running = true
+            workerGeneration++
+            val generation = workerGeneration
             if (!startWorker) return
-            worker = Thread(::workerLoop, "VoxCrewInboundPlayout").apply {
+            worker = Thread({ workerLoop(generation) }, "VoxCrewInboundPlayout").apply {
                 isDaemon = true
                 start()
             }
@@ -104,7 +129,9 @@ class AdaptiveInboundPlayout(
             } else {
                 source.active = false
                 source.inputEnded = true
+                source.endFadePending = source.started || !source.isDrained()
                 source.endedAtNs = receivedAtNs
+                logTalkspurtSummaryLocked(peerUid, source)
             }
             source.lastActivitySequence = sequence
             publishStatsLocked()
@@ -121,11 +148,26 @@ class AdaptiveInboundPlayout(
             source.active = true
             source.inputEnded = false
             source.recordArrival(sequence, receivedAtNs, baseDelayMs, maxAdaptiveDelayMs, adaptiveEnabled)
+            longestInboundGapMs = maxOf(longestInboundGapMs, source.longestGapMs)
+            maximumArrivalBurstFrames = maxOf(maximumArrivalBurstFrames, source.maximumBurstFrames)
             if (source.frames.size >= MAX_BUFFERED_AUDIO_FRAMES) {
                 source.frames.removeFirst()
                 source.droppedFrames++
             }
             source.frames.addLast(QueuedFrame.Audio(sequence, opusPayload.copyOf(), receivedAtNs))
+            val oldestAgeMs = source.frames.firstNotNullOfOrNull {
+                (it as? QueuedFrame.Audio)?.receivedAtNs
+            }?.let { ((receivedAtNs - it) / 1_000_000L).coerceAtLeast(0L) } ?: 0L
+            if (oldestAgeMs >= BACKLOG_WARNING_MS &&
+                (source.lastBacklogWarningNs == Long.MIN_VALUE ||
+                    receivedAtNs - source.lastBacklogWarningNs >= BACKLOG_WARNING_INTERVAL_NS)
+            ) {
+                source.lastBacklogWarningNs = receivedAtNs
+                logW(
+                    "inbound backlog peer=${AudioDiagnostics.peerToken(peerUid)} " +
+                        "oldest=${oldestAgeMs}ms ${diagnosticSummaryLocked()}",
+                )
+            }
             publishStatsLocked()
             lock.notifyAll()
         }
@@ -155,10 +197,12 @@ class AdaptiveInboundPlayout(
     fun stop() {
         val thread = synchronized(lock) {
             running = false
+            workerGeneration++
             lock.notifyAll()
             worker.also { worker = null }
         }
         thread?.interrupt()
+        runCatching { thread?.join(WORKER_JOIN_TIMEOUT_MS) }
         synchronized(lock) {
             sources.clear()
             publishStatsLocked()
@@ -166,56 +210,79 @@ class AdaptiveInboundPlayout(
     }
 
     /** Deterministic entry point for JVM tests; production uses [workerLoop]. */
-    internal fun processOneQuantumForTest(): Boolean {
-        val pcm = synchronized(lock) { planQuantumLocked(sinkBufferedMs = 0) } ?: return false
-        val written = writeDecodedPcm(pcm)
+    internal fun processOneQuantumForTest(keepAlive: Boolean = false): Boolean {
+        val quantum = synchronized(lock) { planQuantumLocked(sinkBufferedMs = 0, keepAlive) } ?: return false
+        return writeQuantum(quantum)
+    }
+
+    /** Deterministic worker step for a sink whose playback head may not have started yet. */
+    internal fun processOneSinkQuantumForTest(state: AudioSinkState): Boolean {
+        val quantum = synchronized(lock) { planSinkQuantumLocked(state) } ?: return false
+        return writeQuantum(quantum)
+    }
+
+    private fun workerLoop(generation: Long) {
+        runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
+        while (isCurrentWorker(generation)) {
+            val sink = audioSinkState().sanitized()
+            val quantum = synchronized(lock) {
+                if (!isCurrentWorkerLocked(generation)) return
+                removeExpiredIdleSourcesLocked()
+                cacheSinkStateLocked(sink)
+                planSinkQuantumLocked(sink)
+            } ?: continue
+
+            if (!writeQuantum(quantum)) {
+                logW("AudioTrack rejected PCM quantum")
+                synchronized(lock) { waitLocked(WORKER_RETRY_MS) }
+            }
+        }
+    }
+
+    private fun isCurrentWorker(generation: Long): Boolean = synchronized(lock) {
+        isCurrentWorkerLocked(generation)
+    }
+
+    private fun isCurrentWorkerLocked(generation: Long): Boolean =
+        running && workerGeneration == generation
+
+    private fun writeQuantum(quantum: PlayoutQuantum): Boolean {
+        val written = writeDecodedPcm(quantum)
         synchronized(lock) {
-            if (written) writtenQuanta++
+            if (written) recordWrittenQuantumLocked(quantum.kind)
             publishStatsLocked()
         }
         return written
     }
 
-    private fun workerLoop() {
-        runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
-        while (running) {
-            val sinkMs = bufferedPcmMs().coerceAtLeast(0)
-            cachedSinkBufferedMs = sinkMs
-            cachedAudioTrackUnderruns = audioTrackUnderruns().coerceAtLeast(0)
-            cachedActualTrackBufferMs = actualTrackBufferMs().coerceAtLeast(0)
-            val pcm = synchronized(lock) {
-                if (!running) return
-                removeExpiredIdleSourcesLocked()
-                val target = activeTargetDelayLocked()
-                if (sinkMs >= target || !hasReadyOrPlayingSourceLocked()) {
-                    waitLocked(waitDurationMs(sinkMs, target))
-                    null
-                } else {
-                    planQuantumLocked(sinkMs)
-                }
-            } ?: continue
-
-            if (!writeDecodedPcm(pcm)) {
-                logW("AudioTrack rejected PCM quantum")
-                synchronized(lock) { waitLocked(WORKER_RETRY_MS) }
-            } else {
-                synchronized(lock) {
-                    writtenQuanta++
-                    publishStatsLocked()
-                }
-            }
+    private fun planSinkQuantumLocked(sink: AudioSinkState): PlayoutQuantum? {
+        val primingInProgress = sink.requiresPriming && sink.bufferedPcmMs > 0
+        if (!hasReadyOrPlayingSourceLocked() && !primingInProgress) {
+            waitLocked(WORKER_POLL_MS.toLong())
+            return null
         }
+        val fillTargetMs = sinkFillTargetMs(sink)
+        if (sink.bufferedPcmMs >= fillTargetMs) {
+            waitLocked(waitDurationMs(sink.bufferedPcmMs, fillTargetMs))
+            return null
+        }
+        return planQuantumLocked(
+            sinkBufferedMs = sink.bufferedPcmMs,
+            keepAlive = primingInProgress || sources.values.any { it.active || it.started },
+        )
     }
 
-    private fun planQuantumLocked(sinkBufferedMs: Int): ByteArray? {
+    private fun planQuantumLocked(sinkBufferedMs: Int, keepAlive: Boolean): PlayoutQuantum? {
         val contributions = ArrayList<ByteArray>(sources.size)
         var hasRealAudio = false
-        var hasPlayingSource = false
+        var hasConcealment = false
 
         sources.values.forEach { source ->
             source.ensureDecodedQuantum()
             if (!source.started) {
-                if (source.queuedAudioMs() >= source.targetDelayMs ||
+                val sourceReserveNeededMs = (source.targetDelayMs - sinkBufferedMs)
+                    .coerceAtLeast(QUANTUM_MS)
+                if (source.queuedAudioMs() >= sourceReserveNeededMs ||
                     (source.inputEnded && source.queuedAudioMs() > 0)
                 ) {
                     source.started = true
@@ -224,47 +291,64 @@ class AdaptiveInboundPlayout(
                 }
             }
 
-            hasPlayingSource = true
             val actual = source.decoded.removeFirstOrNull()
                 ?: source.ensureDecodedQuantum().let { source.decoded.removeFirstOrNull() }
             if (actual != null) {
                 contributions += source.smoother.acceptActual(actual)
                 source.expansionMs = 0
+                source.gapSilenced = false
                 hasRealAudio = true
-            } else if (source.active &&
-                source.expansionMs < MAX_TEMPORARY_EXPANSION_MS &&
-                sinkBufferedMs <= LOW_WATER_MS
-            ) {
-                contributions += source.smoother.expand()
-                source.expansionMs += QUANTUM_MS
-                pcmExpansions++
+            } else if (source.active && !source.gapSilenced && sinkBufferedMs <= LOW_WATER_MS) {
+                // A late frame is not a lost frame. Fade once, then clock silence until it
+                // arrives; never fabricate/repeat speech merely to hide transport latency.
+                contributions += source.smoother.fadeOut()
+                source.gapSilenced = true
+                hasConcealment = true
                 bumpTargetLocked(source)
+            } else if (source.active) {
+                contributions += source.smoother.silence()
+            } else if (source.endFadePending && source.isDrained()) {
+                contributions += source.smoother.fadeOut()
+                source.endFadePending = false
+                source.started = false
+                hasConcealment = true
             }
 
-            if (source.inputEnded && source.isDrained()) {
+            if (source.inputEnded && source.isDrained() && !source.endFadePending && !hasRealAudio) {
                 source.started = false
-                source.smoother.reset()
             }
         }
 
         removeExpiredIdleSourcesLocked()
         if (contributions.isEmpty()) {
-            if (hasPlayingSource && sinkBufferedMs > LOW_WATER_MS) waitLocked(WORKER_POLL_MS.toLong())
-            return null
+            return if (keepAlive) PlayoutQuantum(ByteArray(QUANTUM_BYTES), PlayoutQuantumKind.SILENCE) else null
         }
-        if (!hasRealAudio && sinkBufferedMs > LOW_WATER_MS) return null
-        return mixPcm(contributions)
-    }
-
-    private fun hasReadyOrPlayingSourceLocked(): Boolean = sources.values.any { source ->
-        source.started || source.queuedAudioMs() >= source.targetDelayMs ||
-            (source.inputEnded && source.queuedAudioMs() > 0)
+        val kind = when {
+            hasRealAudio -> PlayoutQuantumKind.AUDIO
+            hasConcealment -> PlayoutQuantumKind.CONCEALMENT
+            else -> PlayoutQuantumKind.SILENCE
+        }
+        return PlayoutQuantum(mixPcm(contributions), kind)
     }
 
     private fun activeTargetDelayLocked(): Int = sources.values
         .filter { it.active || it.started || !it.isDrained() }
         .maxOfOrNull { it.targetDelayMs }
         ?: baseDelayMs
+
+    private fun hasReadyOrPlayingSourceLocked(): Boolean = sources.values.any { source ->
+        source.started || source.queuedAudioMs() >= source.targetDelayMs ||
+            (source.inputEnded && source.queuedAudioMs() > 0)
+    }
+
+    private fun sinkFillTargetMs(sink: AudioSinkState): Int {
+        val target = if (sink.requiresPriming) {
+            maxOf(HARDWARE_SINK_TARGET_MS, sink.startupThresholdMs)
+        } else {
+            HARDWARE_SINK_TARGET_MS
+        }
+        return ((target + QUANTUM_MS - 1) / QUANTUM_MS * QUANTUM_MS).coerceAtLeast(QUANTUM_MS)
+    }
 
     private fun waitDurationMs(sinkMs: Int, targetMs: Int): Long = when {
         sinkMs <= LOW_WATER_MS -> WORKER_RETRY_MS
@@ -273,7 +357,7 @@ class AdaptiveInboundPlayout(
     }
 
     private fun waitLocked(ms: Long) {
-        if (!running && startWorker) return
+        if (!running) return
         try {
             lock.wait(ms)
         } catch (_: InterruptedException) {
@@ -287,6 +371,37 @@ class AdaptiveInboundPlayout(
         source.lastExpansionNs = nowNs()
     }
 
+    private fun recordWrittenQuantumLocked(kind: PlayoutQuantumKind) {
+        writtenQuanta++
+        lastOutputKind = kind
+        if (kind == PlayoutQuantumKind.SILENCE) silentKeepaliveQuanta++
+    }
+
+    private fun recordUnderrunsLocked(current: Int) {
+        if (current < previousUnderrunCount) previousUnderrunCount = current
+        val delta = (current - previousUnderrunCount).coerceAtLeast(0)
+        if (delta > 0) {
+            when {
+                lastOutputKind == PlayoutQuantumKind.AUDIO -> activeSpeechUnderruns += delta
+                sources.values.any { it.active } -> concealmentUnderruns += delta
+                else -> intentionalIdleUnderruns += delta
+            }
+            if (sources.values.any { it.active }) {
+                logW("AudioTrack underrun delta=$delta kind=$lastOutputKind ${diagnosticSummaryLocked()}")
+            }
+        }
+        previousUnderrunCount = current
+        cachedAudioTrackUnderruns = current
+    }
+
+    private fun cacheSinkStateLocked(sink: AudioSinkState) {
+        cachedSinkBufferedMs = sink.bufferedPcmMs
+        cachedActualTrackBufferMs = sink.actualBufferMs
+        cachedStartupThresholdMs = sink.startupThresholdMs
+        cachedSinkRequiresPriming = sink.requiresPriming
+        recordUnderrunsLocked(sink.underruns)
+    }
+
     private fun removeExpiredIdleSourcesLocked() {
         val now = nowNs()
         val iterator = sources.iterator()
@@ -296,7 +411,11 @@ class AdaptiveInboundPlayout(
                 if (adaptiveEnabled && now - source.lastExpansionNs >= STABLE_DECAY_NS) {
                     source.targetDelayMs = baseDelayMs
                 }
-                if (source.endedAtNs > 0L && now - source.endedAtNs >= SOURCE_RETENTION_NS) iterator.remove()
+                if (!source.endFadePending && source.endedAtNs > 0L &&
+                    now - source.endedAtNs >= SOURCE_RETENTION_NS
+                ) {
+                    iterator.remove()
+                }
             }
         }
     }
@@ -321,17 +440,53 @@ class AdaptiveInboundPlayout(
             targetDelayMs = activeTargetDelayLocked(),
             oldestBacklogAgeMs = oldest?.let { ((nowNs() - it) / 1_000_000L).coerceAtLeast(0L) } ?: 0L,
             audioTrackUnderruns = cachedAudioTrackUnderruns,
+            activeSpeechUnderruns = activeSpeechUnderruns,
+            concealmentUnderruns = concealmentUnderruns,
+            intentionalIdleUnderruns = intentionalIdleUnderruns,
             pcmExpansions = pcmExpansions,
+            silentKeepaliveQuanta = silentKeepaliveQuanta,
+            longestInboundGapMs = longestInboundGapMs,
+            maximumArrivalBurstFrames = maximumArrivalBurstFrames,
             permanentLossConcealments = permanentLossConcealments,
             droppedFrames = sources.values.sumOf { it.droppedFrames },
             writtenQuanta = writtenQuanta,
             actualTrackBufferMs = cachedActualTrackBufferMs,
+            startupThresholdMs = cachedStartupThresholdMs,
+            sinkRequiresPriming = cachedSinkRequiresPriming,
         )
     }
 
     private fun logW(message: String) {
         runCatching { Log.w(tag, message) }
+        AudioDiagnostics.event("playout", "warning", "tag" to tag, "message" to message)
     }
+
+    private fun logTalkspurtSummaryLocked(peerUid: String, source: Source) {
+        runCatching {
+            Log.i(
+                tag,
+                "talkspurt peer=$peerUid target=${source.targetDelayMs}ms " +
+                    "jitter=${"%.1f".format(source.jitterMs)}ms longestGap=${source.longestGapMs}ms " +
+                    "maxBurst=${source.maximumBurstFrames} ${diagnosticSummaryLocked()}",
+            )
+        }
+        AudioDiagnostics.event(
+            "playout", "talkspurt",
+            "peer" to AudioDiagnostics.peerToken(peerUid),
+            "targetMs" to source.targetDelayMs,
+            "jitterMs" to source.jitterMs.toInt(),
+            "longestGapMs" to source.longestGapMs,
+            "maxBurst" to source.maximumBurstFrames,
+            "activeUnderruns" to activeSpeechUnderruns,
+            "concealmentUnderruns" to concealmentUnderruns,
+            "idleUnderruns" to intentionalIdleUnderruns,
+        )
+    }
+
+    private fun diagnosticSummaryLocked(): String =
+        "encoded=${sources.values.sumOf { it.frames.size }} decoded=${sources.values.sumOf { it.decoded.size }} " +
+            "oldest=${_stats.value.oldestBacklogAgeMs}ms activeUnderruns=$activeSpeechUnderruns " +
+            "concealmentUnderruns=$concealmentUnderruns idleUnderruns=$intentionalIdleUnderruns"
 
     private sealed interface QueuedFrame {
         data class Audio(
@@ -354,6 +509,8 @@ class AdaptiveInboundPlayout(
         var inputEnded = false
         var started = false
         var expansionMs = 0
+        var gapSilenced = false
+        var endFadePending = false
         var lastArrivalNs = 0L
         var lastAudioSequence = Long.MIN_VALUE
         var lastActivitySequence = Long.MIN_VALUE
@@ -361,6 +518,10 @@ class AdaptiveInboundPlayout(
         var lastExpansionNs = Long.MIN_VALUE
         var endedAtNs = 0L
         var droppedFrames = 0L
+        var longestGapMs = 0L
+        var currentBurstFrames = 1
+        var maximumBurstFrames = 1
+        var lastBacklogWarningNs = Long.MIN_VALUE
 
         fun recordArrival(
             sequence: Long,
@@ -371,10 +532,18 @@ class AdaptiveInboundPlayout(
         ) {
             if (lastArrivalNs > 0L && lastAudioSequence != Long.MIN_VALUE && sequence == lastAudioSequence + 1L) {
                 val arrivalDeltaMs = (receivedAtNs - lastArrivalNs) / 1_000_000.0
+                longestGapMs = maxOf(longestGapMs, arrivalDeltaMs.toLong().coerceAtLeast(0L))
+                currentBurstFrames = if (arrivalDeltaMs <= BURST_ARRIVAL_MS) currentBurstFrames + 1 else 1
+                maximumBurstFrames = maxOf(maximumBurstFrames, currentBurstFrames)
                 val deviation = kotlin.math.abs(arrivalDeltaMs - AudioCapture.FRAME_MS)
                 jitterMs += (deviation - jitterMs) / RFC_JITTER_SMOOTHING
                 if (adaptive) {
-                    val estimated = baseDelayMs + (2.0 * jitterMs)
+                    // EWMA is deliberately stable, but a single large stall must affect
+                    // the very next reserve target rather than several packets later.
+                    val estimated = maxOf(
+                        baseDelayMs + (2.0 * jitterMs),
+                        arrivalDeltaMs + QUANTUM_MS,
+                    )
                     val candidate = (ceil(estimated / QUANTUM_MS) * QUANTUM_MS)
                         .toInt()
                         .coerceIn(baseDelayMs, maxDelayMs)
@@ -419,12 +588,17 @@ class AdaptiveInboundPlayout(
             inputEnded = false
             started = false
             expansionMs = 0
+            gapSilenced = false
+            endFadePending = false
             lastArrivalNs = 0L
             lastAudioSequence = Long.MIN_VALUE
             lastActivitySequence = Long.MIN_VALUE
             jitterMs = 0.0
             targetDelayMs = nextDelayMs
             endedAtNs = 0L
+            longestGapMs = 0L
+            currentBurstFrames = 1
+            maximumBurstFrames = 1
             smoother.reset()
         }
     }
@@ -435,12 +609,16 @@ class AdaptiveInboundPlayout(
         const val QUANTUM_SAMPLES = AudioCapture.SAMPLE_RATE / 1000 * QUANTUM_MS
         const val QUANTUM_BYTES = QUANTUM_SAMPLES * 2
         private const val LOW_WATER_MS = 10
+        const val HARDWARE_SINK_TARGET_MS = 40
         private const val WORKER_POLL_MS = 5
         private const val WORKER_RETRY_MS = 2L
+        private const val WORKER_JOIN_TIMEOUT_MS = 250L
         private const val RFC_JITTER_SMOOTHING = 16.0
+        private const val BURST_ARRIVAL_MS = 5.0
+        private const val BACKLOG_WARNING_MS = 500L
+        private const val BACKLOG_WARNING_INTERVAL_NS = 1_000_000_000L
         private const val MAX_BUFFERED_AUDIO_FRAMES = 1_500
         private const val MAX_PERMANENT_LOSS_CONCEALMENT_FRAMES = 3
-        private const val MAX_TEMPORARY_EXPANSION_MS = 60
         private const val STABLE_DECAY_NS = 10_000_000_000L
         private const val SOURCE_RETENTION_NS = STABLE_DECAY_NS
 
@@ -462,6 +640,13 @@ class AdaptiveInboundPlayout(
         }
     }
 }
+
+private fun AudioSinkState.sanitized(): AudioSinkState = copy(
+    bufferedPcmMs = bufferedPcmMs.coerceAtLeast(0),
+    startupThresholdMs = startupThresholdMs.coerceAtLeast(0),
+    actualBufferMs = actualBufferMs.coerceAtLeast(0),
+    underruns = underruns.coerceAtLeast(0),
+)
 
 /** Short, bounded overlap/add concealment. It never changes Opus decoder state. */
 internal class PcmTailSmoother {
@@ -504,6 +689,25 @@ internal class PcmTailSmoother {
         expansionCount++
         appendHistory(output)
         lastOutput = output.copyOf()
+        return shortsToPcm(output)
+    }
+
+    /** Marks a fully silent quantum while retaining the resume-crossfade state. */
+    fun silence(): ByteArray {
+        lastOutput.fill(0)
+        expansionCount = maxOf(expansionCount, 1)
+        return ByteArray(AdaptiveInboundPlayout.QUANTUM_BYTES)
+    }
+
+    /** One 10 ms ramp from the most recent output to zero at a clean talkspurt end. */
+    fun fadeOut(): ByteArray {
+        val output = ShortArray(lastOutput.size)
+        for (i in output.indices) {
+            val gain = 1.0 - (i + 1).toDouble() / output.size
+            output[i] = (lastOutput[i] * gain).toInt().toShort()
+        }
+        lastOutput.fill(0)
+        expansionCount = maxOf(expansionCount, 1)
         return shortsToPcm(output)
     }
 
@@ -565,7 +769,7 @@ internal class PcmTailSmoother {
 
     companion object {
         private const val HISTORY_SAMPLES = AudioCapture.SAMPLE_RATE * 30 / 1_000
-        private const val OVERLAP_SAMPLES = AudioCapture.SAMPLE_RATE * 5 / 1_000
+        private const val OVERLAP_SAMPLES = AdaptiveInboundPlayout.QUANTUM_SAMPLES
         private const val CORRELATION_SAMPLES = OVERLAP_SAMPLES
         private const val MIN_LAG = AudioCapture.SAMPLE_RATE * 25 / 10_000
         private const val MAX_LAG = AudioCapture.SAMPLE_RATE * 125 / 10_000

@@ -7,6 +7,7 @@ import {
   buildInviteHtml,
   createRelayServer,
   decodeBinaryEnvelope,
+  enableTcpNoDelay,
   encodeBinaryEnvelope,
   parseOverlayEndpoint,
   timingSafeEqualString,
@@ -23,6 +24,14 @@ test('binary envelope round-trips', () => {
   const decoded = decodeBinaryEnvelope(packed);
   assert.equal(decoded.peerUid, 'peer-a');
   assert.deepEqual(Buffer.from(decoded.frame), frame);
+});
+
+test('accepted relay sockets explicitly enable TCP no-delay', () => {
+  let enabled = null;
+  const socket = { setNoDelay(value) { enabled = value; } };
+  assert.equal(enableTcpNoDelay(socket), true);
+  assert.equal(enabled, true);
+  assert.equal(enableTcpNoDelay({}), false);
 });
 
 test('invite html includes deep link button', () => {

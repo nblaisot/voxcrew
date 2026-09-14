@@ -66,13 +66,13 @@ class AdaptiveInboundPlayoutTest {
     fun rfcStyleArrivalJitterRaisesTargetButKeepsItBounded() {
         val playout = createPlayout(mutableListOf())
         playout.setBaseDelayMs(40)
-        playout.setMaxAdaptiveDelayMs(80)
+        playout.setMaxAdaptiveDelayMs(160)
         playout.onMediaActivity(PEER_A, 0, true, 1)
         playout.enqueue(PEER_A, 1, pcmFrame(1_000), 1)
         playout.enqueue(PEER_A, 2, pcmFrame(1_000), 20_000_001)
         playout.enqueue(PEER_A, 3, pcmFrame(1_000), 80_000_001)
 
-        assertTrue(playout.stats.value.targetDelayMs in 50..80)
+        assertTrue(playout.stats.value.targetDelayMs in 50..160)
     }
 
     @Test
@@ -80,7 +80,7 @@ class AdaptiveInboundPlayoutTest {
         val output = mutableListOf<ByteArray>()
         val playout = createPlayout(output)
         playout.setBaseDelayMs(40)
-        playout.setMaxAdaptiveDelayMs(80)
+        playout.setMaxAdaptiveDelayMs(160)
         playout.onMediaActivity(PEER_A, 0, true, 1)
         playout.enqueue(PEER_A, 1, pcmFrame(1_000), 1)
         playout.enqueue(PEER_A, 2, pcmFrame(1_000), 80_000_001)
@@ -96,7 +96,7 @@ class AdaptiveInboundPlayoutTest {
     }
 
     @Test
-    fun temporaryGapExpandsPcmWithoutConsumingTheDelayedPacket() {
+    fun temporaryGapFadesToSilenceWithoutConsumingTheDelayedPacket() {
         val output = mutableListOf<ByteArray>()
         val playout = createPlayout(output)
         playout.setAdaptiveEnabled(false)
@@ -106,7 +106,8 @@ class AdaptiveInboundPlayoutTest {
         repeat(4) { assertTrue(playout.processOneQuantumForTest()) }
 
         assertTrue(playout.processOneQuantumForTest())
-        assertEquals(1, playout.stats.value.pcmExpansions)
+        assertEquals(0, lastSample(output.last()).toInt())
+        assertEquals(0, playout.stats.value.pcmExpansions)
 
         playout.enqueue(PEER_A, 3, pcmFrame(3_000), 70_000_001)
         assertTrue(playout.processOneQuantumForTest())
@@ -116,7 +117,7 @@ class AdaptiveInboundPlayoutTest {
     }
 
     @Test
-    fun repeatedExpansionFadesToSilenceBySixtyMilliseconds() {
+    fun boundedExpansionUtilityFadesToSilenceBySixtyMilliseconds() {
         val smoother = PcmTailSmoother()
         smoother.acceptActual(pcmQuantum(5_000))
 
@@ -136,7 +137,135 @@ class AdaptiveInboundPlayoutTest {
 
         assertTrue(playout.processOneQuantumForTest())
         assertTrue(playout.processOneQuantumForTest())
+        assertTrue(playout.processOneQuantumForTest())
+        assertEquals(0, lastSample(output.last()).toInt())
         assertFalse(playout.processOneQuantumForTest())
+    }
+
+    @Test
+    fun startupPrimingContinuesPastJitterTargetUntilHardwareThreshold() {
+        val kinds = mutableListOf<PlayoutQuantumKind>()
+        val sink = ThresholdSink(startupThresholdMs = 80)
+        val playout = AdaptiveInboundPlayout(
+            decoderFactory = { fakeDecoder { it } },
+            writeDecodedPcm = { quantum ->
+                kinds += quantum.kind
+                sink.writeQuantum()
+                true
+            },
+            startWorker = false,
+        )
+        playout.setBaseDelayMs(40)
+        playout.setAdaptiveEnabled(false)
+        playout.onMediaActivity(PEER_A, 0, true, 1)
+        playout.enqueue(PEER_A, 1, pcmFrame(1_000), 1)
+        playout.enqueue(PEER_A, 2, pcmFrame(2_000), 20_000_001)
+        playout.onMediaActivity(PEER_A, 3, false, 40_000_001)
+
+        repeat(8) { assertTrue(playout.processOneSinkQuantumForTest(sink.state())) }
+
+        assertTrue(sink.started)
+        assertEquals(80, sink.bufferedMs)
+        assertEquals(List(4) { PlayoutQuantumKind.AUDIO }, kinds.take(4))
+        assertEquals(PlayoutQuantumKind.CONCEALMENT, kinds[4])
+        assertTrue(kinds.drop(5).all { it == PlayoutQuantumKind.SILENCE })
+        assertFalse(playout.processOneSinkQuantumForTest(sink.state()))
+    }
+
+    @Test
+    fun hardwareSinkIsNotPrimedWithSilenceBeforeSpeechIsReady() {
+        val output = mutableListOf<PlayoutQuantum>()
+        val playout = AdaptiveInboundPlayout(
+            decoderFactory = { fakeDecoder { it } },
+            writeDecodedPcm = { quantum -> output += quantum; true },
+            startWorker = false,
+        )
+        playout.onMediaActivity(PEER_A, 0, true, 1)
+
+        assertFalse(
+            playout.processOneSinkQuantumForTest(
+                AudioSinkState(requiresPriming = true, startupThresholdMs = 80, actualBufferMs = 80),
+            ),
+        )
+        assertTrue(output.isEmpty())
+    }
+
+    @Test
+    fun adaptiveReserveDoesNotInflateTheRunningHardwareQueue() {
+        val playout = createPlayout(mutableListOf())
+        playout.setBaseDelayMs(80)
+        playout.onMediaActivity(PEER_A, 0, true, 1)
+        repeat(4) { index ->
+            playout.enqueue(PEER_A, index + 1L, pcmFrame(1_000), index * 20_000_000L + 1)
+        }
+
+        assertFalse(
+            playout.processOneSinkQuantumForTest(
+                AudioSinkState(
+                    bufferedPcmMs = AdaptiveInboundPlayout.HARDWARE_SINK_TARGET_MS,
+                    requiresPriming = false,
+                    startupThresholdMs = 160,
+                    actualBufferMs = 160,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun longGapKeepsBluetoothSinkClockedWithSilentQuanta() {
+        val kinds = mutableListOf<PlayoutQuantumKind>()
+        val playout = AdaptiveInboundPlayout(
+            decoderFactory = { fakeDecoder { it } },
+            writeDecodedPcm = { quantum -> kinds += quantum.kind; true },
+            startWorker = false,
+        )
+        playout.setAdaptiveEnabled(false)
+        playout.onMediaActivity(PEER_A, 0, true, 1)
+        playout.enqueue(PEER_A, 1, pcmFrame(4_000), 1)
+        playout.enqueue(PEER_A, 2, pcmFrame(4_000), 20_000_001)
+        repeat(4) { assertTrue(playout.processOneQuantumForTest(keepAlive = true)) }
+
+        repeat(200) { assertTrue(playout.processOneQuantumForTest(keepAlive = true)) }
+
+        assertEquals(1, kinds.count { it == PlayoutQuantumKind.CONCEALMENT })
+        assertTrue(kinds.count { it == PlayoutQuantumKind.SILENCE } >= 199)
+        assertTrue(playout.stats.value.silentKeepaliveQuanta >= 199)
+    }
+
+    @Test
+    fun delayedPacketAfterSilentKeepaliveIsStillDecodedExactlyOnce() {
+        var decoded = 0
+        val kinds = mutableListOf<PlayoutQuantumKind>()
+        val playout = AdaptiveInboundPlayout(
+            decoderFactory = { fakeDecoder { decoded++; it } },
+            writeDecodedPcm = { quantum -> kinds += quantum.kind; true },
+            startWorker = false,
+        )
+        playout.setBaseDelayMs(20)
+        playout.setAdaptiveEnabled(false)
+        playout.onMediaActivity(PEER_A, 0, true, 1)
+        playout.enqueue(PEER_A, 1, pcmFrame(2_000), 1)
+        repeat(2) { playout.processOneQuantumForTest(keepAlive = true) }
+        repeat(100) { playout.processOneQuantumForTest(keepAlive = true) }
+
+        playout.enqueue(PEER_A, 2, pcmFrame(3_000), 1_020_000_001)
+        repeat(2) { playout.processOneQuantumForTest(keepAlive = true) }
+
+        assertEquals(2, decoded)
+        assertEquals(PlayoutQuantumKind.AUDIO, kinds.last())
+    }
+
+    @Test
+    fun resumeCrossfadeRunsAcrossTheWholeTenMillisecondQuantum() {
+        val smoother = PcmTailSmoother()
+        smoother.acceptActual(pcmQuantum(5_000))
+        repeat(6) { smoother.expand() }
+        smoother.silence()
+
+        val resumed = smoother.acceptActual(pcmQuantum(8_000))
+
+        assertTrue(firstSample(resumed).toInt() < 100)
+        assertTrue(lastSample(resumed).toInt() > 7_900)
     }
 
     @Test
@@ -148,7 +277,7 @@ class AdaptiveInboundPlayoutTest {
                 decodersCreated++
                 fakeDecoder { payload -> payload }
             },
-            writeDecodedPcm = { pcm -> output += pcm.copyOf(); true },
+            writeDecodedPcm = { quantum -> output += quantum.pcm.copyOf(); true },
             startWorker = false,
         )
         playout.onMediaActivity(PEER_A, 0, true, 1)
@@ -182,7 +311,7 @@ class AdaptiveInboundPlayoutTest {
                     }
                 }
             },
-            writeDecodedPcm = { pcm -> output += pcm.copyOf(); true },
+            writeDecodedPcm = { quantum -> output += quantum.pcm.copyOf(); true },
             startWorker = false,
         )
         playout.setBaseDelayMs(20)
@@ -216,7 +345,7 @@ class AdaptiveInboundPlayoutTest {
         decode: (ByteArray) -> ByteArray? = { it },
     ): AdaptiveInboundPlayout = AdaptiveInboundPlayout(
         decoderFactory = { fakeDecoder(decode) },
-        writeDecodedPcm = { pcm -> output += pcm.copyOf(); true },
+        writeDecodedPcm = { quantum -> output += quantum.pcm.copyOf(); true },
         startWorker = false,
     )
 
@@ -237,6 +366,9 @@ class AdaptiveInboundPlayoutTest {
     private fun firstSample(pcm: ByteArray): Short =
         ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN).short
 
+    private fun lastSample(pcm: ByteArray): Short =
+        ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN).getShort(pcm.size - 2)
+
     private fun rms(pcm: ByteArray): Int {
         val samples = ShortArray(pcm.size / 2)
         ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(samples)
@@ -248,6 +380,23 @@ class AdaptiveInboundPlayoutTest {
             override fun decode(payload: ByteArray): ByteArray? = decode.invoke(payload)
             override fun decodeLost(): ByteArray = pcmFrame(0)
         }
+
+    private class ThresholdSink(private val startupThresholdMs: Int) {
+        var bufferedMs = 0
+            private set
+        val started: Boolean get() = bufferedMs >= startupThresholdMs
+
+        fun writeQuantum() {
+            bufferedMs += AdaptiveInboundPlayout.QUANTUM_MS
+        }
+
+        fun state(): AudioSinkState = AudioSinkState(
+            bufferedPcmMs = bufferedMs,
+            requiresPriming = !started,
+            startupThresholdMs = startupThresholdMs,
+            actualBufferMs = startupThresholdMs,
+        )
+    }
 
     companion object {
         private const val PEER_A = "peer-a"

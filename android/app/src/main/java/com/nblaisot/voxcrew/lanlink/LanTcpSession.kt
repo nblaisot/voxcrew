@@ -1,6 +1,7 @@
 package com.nblaisot.voxcrew.lanlink
 
 import android.util.Log
+import com.nblaisot.voxcrew.diagnostics.AudioDiagnostics
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -36,6 +37,18 @@ internal class LanTcpSession(
         onFailure = { error ->
             Log.d(TAG, "session with $peerUid write error: ${error.message}")
             close()
+        },
+        onMetrics = { metrics ->
+            AudioDiagnostics.event(
+                "transport", "tcp_writer",
+                "peer" to AudioDiagnostics.peerToken(peerUid),
+                "queued" to metrics.queuedFrames,
+                "highWater" to metrics.highWaterFrames,
+                "ageMs" to metrics.oldestCompletedAgeMs,
+                "writeMs" to metrics.writeDurationMs,
+                "written" to metrics.writtenFrames,
+                "rejected" to metrics.rejected,
+            )
         },
     )
     @Volatile var closed = false

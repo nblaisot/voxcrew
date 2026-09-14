@@ -40,17 +40,33 @@ ensuite mixés dans un flux unique. Un worker de priorité audio alimente `Audio
 
 - **Réserve totale de base** (20–80 ms, défaut 40 ms) : PCM décodé plus PCM déjà confié
   à `AudioTrack`, sans double comptage.
-- **Plafond adaptatif** (40–160 ms, défaut 80 ms) : cible calculée avec un estimateur
-  d'inter-arrivée lissé ; un manque imminent l'augmente par pas de 10 ms.
-- **Concealment court** : une expansion PCM par corrélation/overlap-add prolonge la fin
-  de parole puis décroît vers le silence en 60 ms. Le paquet Opus retardé n'est ni consommé
-  ni jeté et reste joué une fois à son arrivée.
+- **File matérielle distincte** (40 ms initialement) : le plafond adaptatif reste dans les files
+  logicielles par pair et ne redimensionne plus le seuil de démarrage d'`AudioTrack`.
+  À partir d'Android 12, ce seuil est fixé explicitement à 40 ms ; sur les versions
+  antérieures, la taille effective de la file sert de seuil conservateur. Un underrun
+  augmente la file matérielle par pas de 20 ms, jusqu'à 100 ms, puis réamorce proprement
+  la piste : la stabilité prime alors sur quelques dizaines de millisecondes de latence.
+- **Plafond adaptatif** (40–160 ms, défaut 160 ms) : cible calculée avec un estimateur
+  d'inter-arrivée lissé. Un grand trou ponctuel relève immédiatement la cible d'après sa
+  durée observée, au lieu d'attendre que l'estimateur lent converge.
+- **Retard sans perte** : lorsqu'une frame attendue est simplement en retard, la dernière
+  sortie est fondue une seule fois vers le silence. Aucune parole n'est répétée, accélérée
+  ou supprimée ; la frame Opus reste en attente et est jouée exactement une fois à son arrivée.
+- **Horloge continue** : des quanta PCM silencieux continuent d'alimenter la sortie jusqu'à
+  la reprise, avec un fondu de 10 ms. Ceci évite les arrêts/redémarrages
+  du flux matériel Bluetooth SCO sans compter le silence comme parole reçue. La piste
+  n'est toutefois jamais préremplie de silence avant que de la parole soit prête ; pour
+  un talkspurt très court, le complément d'amorçage est ajouté après la parole.
 - **Retour à la base** : uniquement pendant une frontière de talkspurt inactive et stable,
   jamais en supprimant de la parole active.
 
 Les préférences `jitter_base_ms`, `jitter_max_ms` et `jitter_adaptive_enabled` sont
-configurables dans **Menu → Audio settings**. La migration v2 réinitialise les anciennes
-valeurs, dont la sémantique était celle d'une file Opus séparée.
+configurables dans **Menu → Audio settings**. La migration v3 applique le nouveau plafond
+par défaut de 160 ms ; les anciennes valeurs venaient d'une réserve aux autres sémantiques.
+
+En VOX, le hangover applicatif reste à 600 ms sur les micros intégré, filaire et USB. Il
+passe dynamiquement à 1,2 s lorsque l'entrée réellement observée est Bluetooth, tout en
+conservant les 200 ms de pré-roll.
 
 
 ## Interface TransmissionPolicy
@@ -365,6 +381,15 @@ Logcat (`IntercomTelecomSession`, `AudioCapture`, `AudioPlayback`, `AdaptiveInbo
 périphériques observés, RMS brut/nivelé, taille Opus, livraison/file transport, profondeur
 Opus/PCM, réserve totale, taille réelle du buffer `AudioTrack`, underruns, expansions,
 drops, frames reçues/décodées et résultat d'écriture.
+
+Un journal circulaire indépendant de logcat est conservé dans
+`noBackupFilesDir/audio-diagnostics` : huit fichiers JSONL de 1 Mo maximum. Il contient
+uniquement les horodatages, types de route, durées et compteurs (jamais PCM ni payload
+Opus). Les UUID des pairs y sont hachés. Il persiste les trous de capture, le temps VAD/
+encodage/fan-out, la profondeur et l'âge de la file TCP, les reprises, expirations à 30 s,
+underruns, redimensionnements et résumés de talkspurts. Sur un build debug, il est extractible
+sans dépendre de la rétention logcat avec `adb exec-out run-as com.nblaisot.voxcrew tar -C
+no_backup -cf - audio-diagnostics`.
 
 Matrice à valider sur appareils physiques, dans les deux sens : téléphones nus, Fold avec
 Galaxy Buds (réception fluide après churn BT initial — tampon adaptatif, pas de staccato),

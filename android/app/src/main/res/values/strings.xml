@@ -76,7 +76,7 @@
     <string name="vox_sensitivity_5">Maximum</string>
 
     <string name="audio_settings_title">Audio settings</string>
-    <string name="audio_settings_intro">Tune the total receive reserve across decoded PCM and the audio device. The default keeps 40 ms ready and can expand to 80 ms.</string>
+    <string name="audio_settings_intro">Tune the total receive reserve across decoded PCM and the audio device. The default keeps 40 ms ready and can adapt up to 160 ms.</string>
     <string name="audio_settings_jitter_base">Base playout reserve</string>
     <string name="audio_settings_jitter_max">Max playout reserve</string>
     <string name="audio_settings_jitter_adaptive">Adaptive buffering</string>

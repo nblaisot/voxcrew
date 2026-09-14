@@ -11,7 +11,8 @@ package com.nblaisot.voxcrew.audio
  * Pure and clock-injected (via [update]'s `nowMs`) so it can be unit-tested without any
  * real audio or coroutines.
  */
-class VoxGate(private val hangoverMs: Long = DEFAULT_HANGOVER_MS) {
+class VoxGate(hangoverMs: Long = DEFAULT_HANGOVER_MS) {
+    @Volatile private var hangoverMs: Long = hangoverMs.coerceAtLeast(0L)
     private var lastSpeechAtMs: Long? = null
     private var transmitting = false
 
@@ -28,6 +29,13 @@ class VoxGate(private val hangoverMs: Long = DEFAULT_HANGOVER_MS) {
         transmitting = withinHangover
         return VoxGateResult(transmitting = transmitting, onset = transmitting && !wasTransmitting)
     }
+
+    /** Changes the hold time without resetting an open talkspurt. */
+    fun setHangoverMs(value: Long) {
+        hangoverMs = value.coerceAtLeast(0L)
+    }
+
+    internal fun currentHangoverMs(): Long = hangoverMs
 
     /** Resets to idle, e.g. when VOX is toggled off and back on. */
     fun reset() {

@@ -1,6 +1,7 @@
 package com.nblaisot.voxcrew.lanlink
 
 import android.util.Log
+import com.nblaisot.voxcrew.diagnostics.AudioDiagnostics
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -238,7 +239,16 @@ class PeerLink(
         // Expiry/eviction while apart may have created a hole after the peer's cursor:
         // declare it before replaying so the receiver's contiguity can advance.
         maybeSendSkip(transport)
-        sendBuffer.replayFrom(peerAnnouncedLastContiguousSeq).forEach {
+        val replay = sendBuffer.replayFrom(peerAnnouncedLastContiguousSeq)
+        AudioDiagnostics.event(
+            "transport", "handshake",
+            "peer" to AudioDiagnostics.peerToken(peerUid),
+            "via" to transport.label,
+            "resumeSeq" to peerAnnouncedLastContiguousSeq,
+            "replayFrames" to replay.size,
+            "oldestUnackedMs" to oldestUnackedAgeMs(),
+        )
+        replay.forEach {
             transport.sendFrame(it.toFrame())
         }
         ensureHealthLoop()
@@ -325,6 +335,7 @@ class PeerLink(
         if (dropped > 0) {
             updateBacklog()
             _bufferExpired.tryEmit(dropped)
+            recordExpired(dropped)
         }
     }
 
@@ -460,7 +471,18 @@ class PeerLink(
         if (dropped > 0) {
             updateBacklog()
             _bufferExpired.tryEmit(dropped)
+            recordExpired(dropped)
         }
+    }
+
+    private fun recordExpired(count: Int) {
+        AudioDiagnostics.event(
+            "transport", "expired_30s",
+            "peer" to currentPeerUid?.let(AudioDiagnostics::peerToken),
+            "count" to count,
+            "backlogFrames" to sendBuffer.audioFrameCount(),
+            "backlogBytes" to sendBuffer.byteSize(),
+        )
     }
 
     private fun updateBacklog() {

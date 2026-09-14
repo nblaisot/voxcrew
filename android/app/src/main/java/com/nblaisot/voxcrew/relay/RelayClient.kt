@@ -64,6 +64,8 @@ class RelayClient(
     private var settingsWatchJob: Job? = null
     private val sessions = ConcurrentHashMap<String, RelayFrameTransport>()
     private val dialWaiters = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+    private val inboundCadence = ConcurrentHashMap<String, RelayArrivalCadence>()
+    private var outboundAudioFrames = 0L
     private val mutex = Mutex()
     private var lastPublishedInterest: Set<String> = emptySet()
 
@@ -174,7 +176,20 @@ class RelayClient(
 
     override fun sendBinary(peerUid: String, frame: LanFrame) {
         val payload = encodeEnvelope(peerUid, LanProtocol.encodeFrame(frame))
-        webSocket?.send(payload.toByteString())
+        val socket = webSocket ?: return
+        val accepted = socket.send(payload.toByteString())
+        if (frame is LanFrame.Audio) {
+            outboundAudioFrames++
+            val queuedBytes = socket.queueSize()
+            if (!accepted || queuedBytes >= RELAY_QUEUE_WARNING_BYTES ||
+                outboundAudioFrames % RELAY_DIAGNOSTIC_FRAME_INTERVAL == 0L
+            ) {
+                Log.i(
+                    TAG,
+                    "relay outbound peer=$peerUid frames=$outboundAudioFrames accepted=$accepted queuedBytes=$queuedBytes",
+                )
+            }
+        }
     }
 
     private suspend fun reconnect() = mutex.withLock {
@@ -340,6 +355,18 @@ class RelayClient(
     private fun handleBinary(bytes: ByteArray) {
         val env = decodeEnvelope(bytes) ?: return
         val frame = LanProtocol.decodeFrame(env.frame) ?: return
+        if (frame is LanFrame.Audio) {
+            val cadence = inboundCadence.getOrPut(env.peerUid) { RelayArrivalCadence() }
+            val snapshot = cadence.record(System.nanoTime())
+            if (snapshot.frames % RELAY_DIAGNOSTIC_FRAME_INTERVAL == 0L || snapshot.lastGapMs >= 500L) {
+                Log.i(
+                    TAG,
+                    "relay inbound peer=${env.peerUid} frames=${snapshot.frames} " +
+                        "lastGap=${snapshot.lastGapMs}ms longestGap=${snapshot.longestGapMs}ms " +
+                        "burst=${snapshot.currentBurst} maxBurst=${snapshot.maximumBurst}",
+                )
+            }
+        }
         val transport = sessions[env.peerUid]
         if (transport != null) {
             transport.onRemoteFrame(frame)
@@ -405,6 +432,8 @@ class RelayClient(
         private const val MAX_RECONNECT_SHIFT = 4
         private const val MAX_RECONNECT_ATTEMPT = 8
         private const val DIAL_TIMEOUT_MS = 5_000L
+        private const val RELAY_QUEUE_WARNING_BYTES = 64L * 1_024L
+        private const val RELAY_DIAGNOSTIC_FRAME_INTERVAL = 200L
 
         /**
          * Outbound dialers hold a [dialWaiters] entry; inbound [dial_ok] does not.
@@ -443,4 +472,33 @@ class RelayClient(
 
         data class Envelope(val peerUid: String, val frame: ByteArray)
     }
+
+    private class RelayArrivalCadence {
+        private var frames = 0L
+        private var lastAtNs = 0L
+        private var longestGapMs = 0L
+        private var currentBurst = 1
+        private var maximumBurst = 1
+
+        @Synchronized
+        fun record(nowNs: Long): RelayCadenceSnapshot {
+            frames++
+            val gapMs = if (lastAtNs == 0L) 0L else ((nowNs - lastAtNs) / 1_000_000L).coerceAtLeast(0L)
+            if (lastAtNs != 0L) {
+                longestGapMs = maxOf(longestGapMs, gapMs)
+                currentBurst = if (gapMs <= 5L) currentBurst + 1 else 1
+                maximumBurst = maxOf(maximumBurst, currentBurst)
+            }
+            lastAtNs = nowNs
+            return RelayCadenceSnapshot(frames, gapMs, longestGapMs, currentBurst, maximumBurst)
+        }
+    }
+
+    private data class RelayCadenceSnapshot(
+        val frames: Long,
+        val lastGapMs: Long,
+        val longestGapMs: Long,
+        val currentBurst: Int,
+        val maximumBurst: Int,
+    )
 }

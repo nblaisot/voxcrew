@@ -1,10 +1,24 @@
 package com.nblaisot.voxcrew.lanlink
 
+import com.nblaisot.voxcrew.audio.ObservedAudioDeviceKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class AudioFrameIoTest {
+    @Test
+    fun hardwareSinkTargetConvertsToExactPcmFrames() {
+        assertEquals(640, framesForMs(AdaptiveInboundPlayout.HARDWARE_SINK_TARGET_MS, 16_000))
+    }
+
+    @Test
+    fun voxHangoverFollowsObservedInputRoute() {
+        assertEquals(1_200L, voxHangoverMs(ObservedAudioDeviceKind.BLUETOOTH))
+        assertEquals(600L, voxHangoverMs(ObservedAudioDeviceKind.BUILTIN))
+        assertEquals(600L, voxHangoverMs(ObservedAudioDeviceKind.WIRED))
+        assertEquals(600L, voxHangoverMs(ObservedAudioDeviceKind.USB))
+    }
+
     @Test
     fun partialReadsAssembleOneExactFrame() {
         val frame = ByteArray(640)

@@ -79,4 +79,26 @@ class VoxGateTest {
 
         assertFalse(afterReset.transmitting)
     }
+
+    @Test
+    fun bluetoothHangoverBridgesElevenHundredMillisecondGap() {
+        val gate = VoxGate()
+        gate.setHangoverMs(1_200)
+        gate.update(speech = true, nowMs = 0)
+
+        assertTrue(gate.update(speech = false, nowMs = 1_100).transmitting)
+        assertFalse(gate.update(speech = false, nowMs = 1_201).transmitting)
+    }
+
+    @Test
+    fun routeChangeImmediatelyRestoresBuiltinHangover() {
+        val gate = VoxGate()
+        gate.setHangoverMs(1_200)
+        gate.update(speech = true, nowMs = 0)
+        assertTrue(gate.update(speech = false, nowMs = 700).transmitting)
+
+        gate.setHangoverMs(600)
+
+        assertFalse(gate.update(speech = false, nowMs = 700).transmitting)
+    }
 }

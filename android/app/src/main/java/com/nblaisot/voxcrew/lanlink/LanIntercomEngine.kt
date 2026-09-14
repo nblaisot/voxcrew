@@ -1661,7 +1661,7 @@ class LanIntercomEngine(
         private const val KEY_JITTER_MAX_MS = "jitter_max_ms"
         private const val KEY_JITTER_ADAPTIVE = "jitter_adaptive_enabled"
         private const val KEY_JITTER_SETTINGS_VERSION = "jitter_settings_version"
-        private const val JITTER_SETTINGS_VERSION = 2
+        private const val JITTER_SETTINGS_VERSION = 3
     }
 }
 

@@ -8,7 +8,7 @@ object JitterBufferSettings {
 
     const val MIN_MAX_ADAPTIVE_DELAY_MS = 40
     const val MAX_MAX_ADAPTIVE_DELAY_MS = 160
-    const val DEFAULT_MAX_ADAPTIVE_DELAY_MS = 80
+    const val DEFAULT_MAX_ADAPTIVE_DELAY_MS = 160
 
     const val DEFAULT_ADAPTIVE_ENABLED = true
 
@@ -36,9 +36,17 @@ data class PlayoutStats(
     val targetDelayMs: Int = JitterBufferSettings.DEFAULT_BASE_DELAY_MS,
     val oldestBacklogAgeMs: Long = 0,
     val audioTrackUnderruns: Int = 0,
+    val activeSpeechUnderruns: Long = 0,
+    val concealmentUnderruns: Long = 0,
+    val intentionalIdleUnderruns: Long = 0,
     val pcmExpansions: Long = 0,
+    val silentKeepaliveQuanta: Long = 0,
+    val longestInboundGapMs: Long = 0,
+    val maximumArrivalBurstFrames: Int = 0,
     val permanentLossConcealments: Long = 0,
     val droppedFrames: Long = 0,
     val writtenQuanta: Long = 0,
     val actualTrackBufferMs: Int = 0,
+    val startupThresholdMs: Int = 0,
+    val sinkRequiresPriming: Boolean = false,
 )

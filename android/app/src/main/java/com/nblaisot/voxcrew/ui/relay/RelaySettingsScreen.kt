@@ -73,6 +73,7 @@ fun RelaySettingsScreen(
     val savedMessage = stringResource(R.string.relay_saved)
     val needFieldsMessage = stringResource(R.string.relay_need_url_secret)
     val pasteFailedMessage = stringResource(R.string.relay_paste_failed)
+    val shareTitle = stringResource(R.string.relay_share)
 
     LaunchedEffect(stored) {
         // First paint + external applies (deep link): adopt stored values.
@@ -140,7 +141,7 @@ fun RelaySettingsScreen(
                                 putExtra(Intent.EXTRA_TEXT, share)
                             }
                             context.startActivity(
-                                Intent.createChooser(send, context.getString(R.string.relay_share)),
+                                Intent.createChooser(send, shareTitle),
                             )
                         },
                         modifier = Modifier.testTag("relay_share"),

@@ -46,6 +46,8 @@ fun AboutScreen(
 ) {
     val libraries by produceLibraries(R.raw.aboutlibraries)
     val context = LocalContext.current
+    val demoEnabledMessage = stringResource(R.string.demo_mode_enabled)
+    val demoDisabledMessage = stringResource(R.string.demo_mode_disabled)
     var tapCount by remember { mutableIntStateOf(0) }
     var windowStartMs by remember { mutableLongStateOf(0L) }
 
@@ -107,11 +109,7 @@ fun AboutScreen(
                                         val enabled = toggle()
                                         Toast.makeText(
                                             context,
-                                            if (enabled) {
-                                                context.getString(R.string.demo_mode_enabled)
-                                            } else {
-                                                context.getString(R.string.demo_mode_disabled)
-                                            },
+                                            if (enabled) demoEnabledMessage else demoDisabledMessage,
                                             Toast.LENGTH_SHORT,
                                         ).show()
                                     }

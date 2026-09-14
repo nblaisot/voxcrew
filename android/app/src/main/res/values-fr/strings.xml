@@ -76,7 +76,7 @@
     <string name="vox_sensitivity_5">Maximale</string>
 
     <string name="audio_settings_title">Paramètres audio</string>
-    <string name="audio_settings_intro">Ajustez la réserve totale de réception entre le PCM décodé et la sortie audio. Par défaut, 40 ms sont prêtes et la réserve peut monter à 80 ms.</string>
+    <string name="audio_settings_intro">Ajustez la réserve totale de réception entre le PCM décodé et la sortie audio. Par défaut, 40 ms sont prêtes et la réserve peut s’adapter jusqu’à 160 ms.</string>
     <string name="audio_settings_jitter_base">Réserve de lecture de base</string>
     <string name="audio_settings_jitter_max">Réserve de lecture max</string>
     <string name="audio_settings_jitter_adaptive">Tampon adaptatif</string>
